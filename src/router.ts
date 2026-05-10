@@ -4,7 +4,10 @@
  */
 
 import { Router } from 'express';
+import swaggerUi from 'swagger-ui-express';
+
 import { authRouter } from './modules/auth/auth.routes.js';
+import { openApiSpec } from './lib/openapi.js';
 
 const v1Router = Router();
 
@@ -18,6 +21,25 @@ v1Router.get('/health', (_req, res) => {
     },
   });
 });
+
+// OpenAPI 3.1 spec — served as JSON for tooling (Postman, codegen, etc.)
+v1Router.get('/openapi.json', (_req, res) => {
+  res.status(200).json(openApiSpec);
+});
+
+// Swagger UI — interactive docs at /api/v1/docs
+v1Router.use(
+  '/docs',
+  swaggerUi.serve,
+  swaggerUi.setup(openApiSpec, {
+    customSiteTitle: 'Nexora HRMS API — docs',
+    swaggerOptions: {
+      persistAuthorization: true,
+      docExpansion: 'list',
+      defaultModelsExpandDepth: 0,
+    },
+  }),
+);
 
 // Auth module (Phase 0)
 v1Router.use('/auth', authRouter);
