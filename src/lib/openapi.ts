@@ -142,6 +142,37 @@ import {
   UpdateTaxSettingsResponseSchema,
   RunAlreadyFinalisedDetailsSchema,
 } from '@nexora/contracts/payroll';
+import {
+  CycleStatusSchema,
+  GoalOutcomeSchema,
+  GoalSchema,
+  PerformanceCycleSchema,
+  PerformanceCycleSummarySchema,
+  PerformanceReviewSchema,
+  PerformanceReviewSummarySchema,
+  CreateCycleRequestSchema,
+  CreateCycleResponseSchema,
+  CloseCycleRequestSchema,
+  CloseCycleResponseSchema,
+  CycleListQuerySchema,
+  CycleListResponseSchema,
+  CycleDetailResponseSchema,
+  ReviewListQuerySchema,
+  ReviewListResponseSchema,
+  ReviewDetailResponseSchema,
+  CreateGoalRequestSchema,
+  CreateGoalResponseSchema,
+  ProposeGoalRequestSchema,
+  ProposeGoalResponseSchema,
+  SelfRatingRequestSchema,
+  SelfRatingResponseSchema,
+  ManagerRatingRequestSchema,
+  ManagerRatingResponseSchema,
+  DistributionBucketSchema,
+  DistributionReportResponseSchema,
+  MissingReviewItemSchema,
+  MissingReviewsResponseSchema,
+} from '@nexora/contracts/performance';
 
 // Augment the local `z` with .openapi() — required before any registry call.
 extendZodWithOpenApi(z);
@@ -1504,6 +1535,320 @@ registry.registerPath({
     ...errorResponse(400, 'VALIDATION_FAILED.'),
     ...errorResponse(401, 'UNAUTHENTICATED.'),
     ...errorResponse(403, 'FORBIDDEN — Admin only.'),
+  },
+});
+
+// ── Phase 5 — Performance Reviews ───────────────────────────────────────────
+
+registry.register('CycleStatus', CycleStatusSchema);
+registry.register('GoalOutcome', GoalOutcomeSchema);
+registry.register('Goal', GoalSchema);
+registry.register('PerformanceCycle', PerformanceCycleSchema);
+registry.register('PerformanceCycleSummary', PerformanceCycleSummarySchema);
+registry.register('PerformanceReview', PerformanceReviewSchema);
+registry.register('PerformanceReviewSummary', PerformanceReviewSummarySchema);
+registry.register('CreateCycleRequest', CreateCycleRequestSchema);
+registry.register('CreateCycleResponse', CreateCycleResponseSchema);
+registry.register('CloseCycleRequest', CloseCycleRequestSchema);
+registry.register('CloseCycleResponse', CloseCycleResponseSchema);
+registry.register('CycleListQuery', CycleListQuerySchema);
+registry.register('CycleListResponse', CycleListResponseSchema);
+registry.register('CycleDetailResponse', CycleDetailResponseSchema);
+registry.register('ReviewListQuery', ReviewListQuerySchema);
+registry.register('ReviewListResponse', ReviewListResponseSchema);
+registry.register('ReviewDetailResponse', ReviewDetailResponseSchema);
+registry.register('CreateGoalRequest', CreateGoalRequestSchema);
+registry.register('CreateGoalResponse', CreateGoalResponseSchema);
+registry.register('ProposeGoalRequest', ProposeGoalRequestSchema);
+registry.register('ProposeGoalResponse', ProposeGoalResponseSchema);
+registry.register('SelfRatingRequest', SelfRatingRequestSchema);
+registry.register('SelfRatingResponse', SelfRatingResponseSchema);
+registry.register('ManagerRatingRequest', ManagerRatingRequestSchema);
+registry.register('ManagerRatingResponse', ManagerRatingResponseSchema);
+registry.register('DistributionBucket', DistributionBucketSchema);
+registry.register('DistributionReportResponse', DistributionReportResponseSchema);
+registry.register('MissingReviewItem', MissingReviewItemSchema);
+registry.register('MissingReviewsResponse', MissingReviewsResponseSchema);
+
+registry.registerPath({
+  method: 'post',
+  path: '/performance/cycles',
+  tags: ['Performance'],
+  summary: 'Create a performance cycle (Admin)',
+  description:
+    'Creates a new fiscal-half cycle in Open status. Identifies participants ' +
+    '(Active employees with joinDate <= fyStart). Mid-cycle joiners get ' +
+    'isMidCycleJoiner=true. Option B: adminPeerReviewers map pairs each Admin ' +
+    'with a peer-Admin reviewer.',
+  security: [{ sessionCookie: [] }],
+  request: {
+    body: {
+      required: true,
+      content: { 'application/json': { schema: CreateCycleRequestSchema } },
+    },
+  },
+  responses: {
+    201: {
+      description: 'Cycle created.',
+      content: { 'application/json': { schema: CreateCycleResponseSchema } },
+    },
+    ...errorResponse(400, 'VALIDATION_FAILED or INVALID_DATE_RANGE.'),
+    ...errorResponse(401, 'UNAUTHENTICATED.'),
+    ...errorResponse(403, 'FORBIDDEN — not Admin.'),
+    ...errorResponse(409, 'Cycle code already exists.'),
+  },
+});
+
+registry.registerPath({
+  method: 'get',
+  path: '/performance/cycles',
+  tags: ['Performance'],
+  summary: 'List performance cycles',
+  description: 'Paginated list of cycles. All authenticated users may query.',
+  security: [{ sessionCookie: [] }],
+  request: {
+    query: CycleListQuerySchema,
+  },
+  responses: {
+    200: {
+      description: 'Cycle list.',
+      content: { 'application/json': { schema: CycleListResponseSchema } },
+    },
+    ...errorResponse(401, 'UNAUTHENTICATED.'),
+  },
+});
+
+registry.registerPath({
+  method: 'get',
+  path: '/performance/cycles/{id}',
+  tags: ['Performance'],
+  summary: 'Get cycle detail',
+  description:
+    'Returns cycle + scoped reviews. Admin sees all; Manager sees team; Employee sees own.',
+  security: [{ sessionCookie: [] }],
+  request: {
+    params: z.object({ id: z.string() }),
+  },
+  responses: {
+    200: {
+      description: 'Cycle detail.',
+      content: { 'application/json': { schema: CycleDetailResponseSchema } },
+    },
+    ...errorResponse(401, 'UNAUTHENTICATED.'),
+    ...errorResponse(404, 'NOT_FOUND.'),
+  },
+});
+
+registry.registerPath({
+  method: 'post',
+  path: '/performance/cycles/{id}/close',
+  tags: ['Performance'],
+  summary: 'Close a performance cycle (Admin)',
+  description:
+    'Two-step destructive confirm (body must contain confirm: "CLOSE"). ' +
+    'Locks all final ratings (BL-041). Returns 409 CYCLE_CLOSED if already closed.',
+  security: [{ sessionCookie: [] }],
+  request: {
+    params: z.object({ id: z.string() }),
+    body: {
+      required: true,
+      content: { 'application/json': { schema: CloseCycleRequestSchema } },
+    },
+  },
+  responses: {
+    200: {
+      description: 'Cycle closed.',
+      content: { 'application/json': { schema: CloseCycleResponseSchema } },
+    },
+    ...errorResponse(401, 'UNAUTHENTICATED.'),
+    ...errorResponse(403, 'FORBIDDEN.'),
+    ...errorResponse(404, 'NOT_FOUND.'),
+    ...errorResponse(409, 'CYCLE_CLOSED or VERSION_MISMATCH.'),
+  },
+});
+
+registry.registerPath({
+  method: 'get',
+  path: '/performance/cycles/{id}/reports/distribution',
+  tags: ['Performance'],
+  summary: 'Rating distribution report (A-22)',
+  description: 'Rating distribution bucketed by department × rating 1–5 + notRated. Admin only.',
+  security: [{ sessionCookie: [] }],
+  request: { params: z.object({ id: z.string() }) },
+  responses: {
+    200: {
+      description: 'Distribution report.',
+      content: { 'application/json': { schema: DistributionReportResponseSchema } },
+    },
+    ...errorResponse(401, 'UNAUTHENTICATED.'),
+    ...errorResponse(403, 'FORBIDDEN.'),
+    ...errorResponse(404, 'NOT_FOUND.'),
+  },
+});
+
+registry.registerPath({
+  method: 'get',
+  path: '/performance/cycles/{id}/reports/missing',
+  tags: ['Performance'],
+  summary: 'Missing reviews report (A-23)',
+  description: 'Employees with no submitted manager rating in this cycle. Admin only.',
+  security: [{ sessionCookie: [] }],
+  request: { params: z.object({ id: z.string() }) },
+  responses: {
+    200: {
+      description: 'Missing reviews.',
+      content: { 'application/json': { schema: MissingReviewsResponseSchema } },
+    },
+    ...errorResponse(401, 'UNAUTHENTICATED.'),
+    ...errorResponse(403, 'FORBIDDEN.'),
+    ...errorResponse(404, 'NOT_FOUND.'),
+  },
+});
+
+registry.registerPath({
+  method: 'get',
+  path: '/performance/reviews',
+  tags: ['Performance'],
+  summary: 'List performance reviews',
+  description:
+    'Scoped: Admin → all; Manager → own-managed or subordinates; Employee → own only.',
+  security: [{ sessionCookie: [] }],
+  request: { query: ReviewListQuerySchema },
+  responses: {
+    200: {
+      description: 'Review list.',
+      content: { 'application/json': { schema: ReviewListResponseSchema } },
+    },
+    ...errorResponse(401, 'UNAUTHENTICATED.'),
+  },
+});
+
+registry.registerPath({
+  method: 'get',
+  path: '/performance/reviews/{id}',
+  tags: ['Performance'],
+  summary: 'Get review detail',
+  security: [{ sessionCookie: [] }],
+  request: { params: z.object({ id: z.string() }) },
+  responses: {
+    200: {
+      description: 'Review detail.',
+      content: { 'application/json': { schema: ReviewDetailResponseSchema } },
+    },
+    ...errorResponse(401, 'UNAUTHENTICATED.'),
+    ...errorResponse(404, 'NOT_FOUND — or not visible to caller.'),
+  },
+});
+
+registry.registerPath({
+  method: 'post',
+  path: '/performance/reviews/{id}/goals',
+  tags: ['Performance'],
+  summary: 'Create a goal (Manager or Admin)',
+  description:
+    'Manager (assigned) or Admin adds a goal to a review. Cycle must not be Closed. ' +
+    'Hard cap: 20 goals per review.',
+  security: [{ sessionCookie: [] }],
+  request: {
+    params: z.object({ id: z.string() }),
+    body: {
+      required: true,
+      content: { 'application/json': { schema: CreateGoalRequestSchema } },
+    },
+  },
+  responses: {
+    201: {
+      description: 'Goal created.',
+      content: { 'application/json': { schema: CreateGoalResponseSchema } },
+    },
+    ...errorResponse(401, 'UNAUTHENTICATED.'),
+    ...errorResponse(403, 'FORBIDDEN — not assigned manager or Admin.'),
+    ...errorResponse(404, 'NOT_FOUND.'),
+    ...errorResponse(409, 'CYCLE_CLOSED or CYCLE_PHASE (mid-cycle joiner).'),
+  },
+});
+
+registry.registerPath({
+  method: 'post',
+  path: '/performance/reviews/{id}/goals/propose',
+  tags: ['Performance'],
+  summary: 'Propose a goal (Employee)',
+  description:
+    'Employee may propose additional goals during the self-review window (BL-038). ' +
+    'Outcome stays Pending until the manager rates it.',
+  security: [{ sessionCookie: [] }],
+  request: {
+    params: z.object({ id: z.string() }),
+    body: {
+      required: true,
+      content: { 'application/json': { schema: ProposeGoalRequestSchema } },
+    },
+  },
+  responses: {
+    201: {
+      description: 'Goal proposed.',
+      content: { 'application/json': { schema: ProposeGoalResponseSchema } },
+    },
+    ...errorResponse(401, 'UNAUTHENTICATED.'),
+    ...errorResponse(403, 'FORBIDDEN — not the review owner.'),
+    ...errorResponse(404, 'NOT_FOUND.'),
+    ...errorResponse(409, 'CYCLE_CLOSED or CYCLE_PHASE (outside self-review window).'),
+  },
+});
+
+registry.registerPath({
+  method: 'patch',
+  path: '/performance/reviews/{id}/self-rating',
+  tags: ['Performance'],
+  summary: 'Submit self-rating (Employee)',
+  description:
+    'Employee submits / updates self-rating and note. Editable until selfReviewDeadline (BL-039).',
+  security: [{ sessionCookie: [] }],
+  request: {
+    params: z.object({ id: z.string() }),
+    body: {
+      required: true,
+      content: { 'application/json': { schema: SelfRatingRequestSchema } },
+    },
+  },
+  responses: {
+    200: {
+      description: 'Self-rating saved.',
+      content: { 'application/json': { schema: SelfRatingResponseSchema } },
+    },
+    ...errorResponse(401, 'UNAUTHENTICATED.'),
+    ...errorResponse(403, 'FORBIDDEN — not the review owner.'),
+    ...errorResponse(404, 'NOT_FOUND.'),
+    ...errorResponse(409, 'CYCLE_CLOSED, CYCLE_PHASE (outside deadline), or VERSION_MISMATCH.'),
+  },
+});
+
+registry.registerPath({
+  method: 'post',
+  path: '/performance/reviews/{id}/manager-rating',
+  tags: ['Performance'],
+  summary: 'Submit manager rating (Manager or Admin)',
+  description:
+    'Manager (assigned) or Admin submits the manager rating and per-goal outcomes. ' +
+    'Sets managerOverrodeSelf when rating differs from selfRating (BL-040). ' +
+    'Editable until managerReviewDeadline.',
+  security: [{ sessionCookie: [] }],
+  request: {
+    params: z.object({ id: z.string() }),
+    body: {
+      required: true,
+      content: { 'application/json': { schema: ManagerRatingRequestSchema } },
+    },
+  },
+  responses: {
+    200: {
+      description: 'Manager rating saved.',
+      content: { 'application/json': { schema: ManagerRatingResponseSchema } },
+    },
+    ...errorResponse(401, 'UNAUTHENTICATED.'),
+    ...errorResponse(403, 'FORBIDDEN — not assigned manager or Admin.'),
+    ...errorResponse(404, 'NOT_FOUND.'),
+    ...errorResponse(409, 'CYCLE_CLOSED, CYCLE_PHASE (outside deadline), or VERSION_MISMATCH.'),
   },
 });
 

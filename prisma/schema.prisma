@@ -105,6 +105,12 @@ model Employee {
   payrollRunsReversed     PayrollRun[]           @relation("PayrollReverser")
   payslips                Payslip[]              @relation("EmployeePayslips")
   idempotencyKeys         IdempotencyKey[]       @relation("EmployeeIdempotencyKeys")
+  // Phase 5 — Performance Reviews
+  performanceCyclesCreated  PerformanceCycle[]   @relation("CycleCreatedBy")
+  performanceCyclesClosed   PerformanceCycle[]   @relation("CycleClosedBy")
+  reviewsAsEmployee         PerformanceReview[]  @relation("ReviewEmployee")
+  reviewsAsManager          PerformanceReview[]  @relation("ReviewManager")
+  reviewsAsPreviousManager  PerformanceReview[]  @relation("ReviewPreviousManager")
 
   @@index([email])
   @@index([reportingManagerId])
@@ -670,4 +676,113 @@ model IdempotencyKey {
   @@unique([userId, key])
   @@index([userId, key])
   @@map("idempotency_keys")
+}
+
+// ── Phase 5 — Performance Reviews ────────────────────────────────────────────
+
+/// BL-041: lifecycle of a performance cycle.
+/// Enum values match the DB storage (no hyphens); mapped to contract enum at boundary.
+enum CycleStatusDb {
+  Open
+  SelfReview
+  ManagerReview
+  Closed
+}
+
+/// Goal outcome — set by Manager (BL-038). Pending until rated.
+enum GoalOutcomeDb {
+  Met
+  Partial
+  Missed
+  Pending
+}
+
+/// Performance cycle. One per fiscal half (H1 = Apr–Sep, H2 = Oct–Mar).
+/// Code format: C-YYYY-H1 or C-YYYY-H2 (unique, derived from fyStart).
+model PerformanceCycle {
+  id                   String         @id @default(cuid())
+  /// C-YYYY-H1 or C-YYYY-H2 — unique per fiscal half year
+  code                 String         @unique
+  fyStart              DateTime       @db.Date
+  fyEnd                DateTime       @db.Date
+  status               CycleStatusDb  @default(Open)
+  selfReviewDeadline   DateTime       @db.Date
+  managerReviewDeadline DateTime      @db.Date
+  closedAt             DateTime?
+  closedBy             String?
+  closedByEmployee     Employee?      @relation("CycleClosedBy", fields: [closedBy], references: [id], onDelete: SetNull)
+  createdBy            String
+  createdByEmployee    Employee       @relation("CycleCreatedBy", fields: [createdBy], references: [id])
+  /// Count of participants (excludes mid-cycle joiners — BL-037)
+  participants         Int            @default(0)
+  createdAt            DateTime       @default(now())
+  updatedAt            DateTime       @updatedAt
+  /// Optimistic concurrency token (BL-034)
+  version              Int            @default(0)
+
+  reviews              PerformanceReview[]
+
+  @@index([status])
+  @@index([fyStart])
+  @@map("performance_cycles")
+}
+
+/// Performance review. One per employee per cycle.
+/// BL-042: when a manager is reassigned mid-cycle, previousManagerId captures the
+/// old manager so the audit retains both.
+model PerformanceReview {
+  id                   String         @id @default(cuid())
+  cycleId              String
+  cycle                PerformanceCycle @relation(fields: [cycleId], references: [id], onDelete: Cascade)
+  employeeId           String
+  employee             Employee       @relation("ReviewEmployee", fields: [employeeId], references: [id], onDelete: Cascade)
+  /// BL-042: current manager; may change mid-cycle via reassign-manager endpoint.
+  managerId            String?
+  manager              Employee?      @relation("ReviewManager", fields: [managerId], references: [id], onDelete: SetNull)
+  /// BL-042: previous manager captured on reassignment so both appear in the audit.
+  previousManagerId    String?
+  previousManager      Employee?      @relation("ReviewPreviousManager", fields: [previousManagerId], references: [id], onDelete: SetNull)
+  /// 1–5; editable until selfReviewDeadline (BL-039)
+  selfRating           Int?
+  selfNote             String?        @db.Text
+  selfSubmittedAt      DateTime?
+  /// 1–5; sets managerOverrodeSelf if differs from selfRating (BL-040)
+  managerRating        Int?
+  managerNote          String?        @db.Text
+  managerSubmittedAt   DateTime?
+  /// BL-040: true when managerRating != selfRating
+  managerOverrodeSelf  Boolean        @default(false)
+  /// = managerRating once cycle Closes (BL-041)
+  finalRating          Int?
+  lockedAt             DateTime?
+  /// BL-037: true for employees who joined after fyStart
+  isMidCycleJoiner     Boolean        @default(false)
+  createdAt            DateTime       @default(now())
+  updatedAt            DateTime       @updatedAt
+  /// Optimistic concurrency token
+  version              Int            @default(0)
+
+  goals                Goal[]
+
+  @@unique([cycleId, employeeId])
+  @@index([cycleId, managerId])
+  @@index([employeeId])
+  @@map("performance_reviews")
+}
+
+/// Goal within a review. Manager creates; Employee may propose (BL-038).
+model Goal {
+  id                   String         @id @default(cuid())
+  reviewId             String
+  review               PerformanceReview @relation(fields: [reviewId], references: [id], onDelete: Cascade)
+  text                 String         @db.Text
+  outcome              GoalOutcomeDb  @default(Pending)
+  /// BL-038: true when proposed by the Employee during self-review window
+  proposedByEmployee   Boolean        @default(false)
+  createdAt            DateTime       @default(now())
+  /// Optimistic concurrency token
+  version              Int            @default(0)
+
+  @@index([reviewId])
+  @@map("goals")
 }

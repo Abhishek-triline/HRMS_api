@@ -53,6 +53,7 @@ import {
   wouldCreateCycle,
   getPastTeamMembers,
 } from './hierarchy.js';
+import { handleManagerChange } from '../performance/performance.service.js';
 
 const router = Router();
 
@@ -995,6 +996,9 @@ router.post(
             salaryStructures: { orderBy: { effectiveFrom: 'desc' }, take: 1 },
           },
         });
+
+        // BL-042: propagate manager change to every open PerformanceReview for this employee
+        await handleManagerChange(id, oldManagerId ?? null, body.newManagerId ?? null, actor.id, actor.role, ip, tx);
 
         await audit({
           tx,
