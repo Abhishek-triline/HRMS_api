@@ -98,7 +98,8 @@ const globalLimiter = rateLimit({
 const app = express();
 
 // Security headers
-// SEC-010: enable HSTS preload alongside the helmet defaults.
+// SEC-010: HSTS preload. SEC-005-P1: X-Frame-Options DENY (the API never
+// expects to be rendered in a frame).
 app.use(
   helmet({
     hsts: {
@@ -106,6 +107,7 @@ app.use(
       includeSubDomains: true,
       preload: true,
     },
+    frameguard: { action: 'deny' },
   }),
 );
 

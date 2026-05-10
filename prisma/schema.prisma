@@ -20,6 +20,21 @@ enum Role {
   Admin
 }
 
+/// BL-022: employment type drives leave quotas and proration rules.
+enum EmploymentType {
+  Permanent
+  Contract
+  Intern
+  Probation
+}
+
+/// Reason stored on ReportingManagerHistory rows when a row is closed.
+enum HistoryReason {
+  Initial
+  Reassigned
+  Exited
+}
+
 /// BL-006: Active / OnNotice / Exited are Admin-controlled.
 /// OnLeave is system-set on leave approval start, reverted on end.
 /// Inactive is the pre-first-login state.
@@ -49,11 +64,15 @@ model Employee {
   passwordHash      String
   role              Role
   status            EmployeeStatus @default(Inactive)
+  /// Employment type drives leave quotas and proration (BL-022a)
+  employmentType    EmploymentType @default(Permanent)
   department        String?
   designation       String?
   reportingManagerId String?
   reportingManager  Employee?      @relation("EmployeeManager", fields: [reportingManagerId], references: [id])
   reports           Employee[]     @relation("EmployeeManager")
+  /// The most recent prior manager id — fast lookup for past-team queries (BL-022a)
+  previousReportingManagerId String?
   joinDate          DateTime       @db.Date
   exitDate          DateTime?      @db.Date
   /// UC-FL-01: forces password reset on first login
@@ -67,10 +86,50 @@ model Employee {
   passwordResetTokens   PasswordResetToken[]
   loginAttempts         LoginAttempt[]
   auditActorEntries     AuditLog[]           @relation("AuditActor")
+  salaryStructures      SalaryStructure[]
+  reportingManagerHistory ReportingManagerHistory[] @relation("EmployeeHistory")
+  managedHistories        ReportingManagerHistory[] @relation("ManagerHistory")
 
   @@index([email])
   @@index([reportingManagerId])
+  @@index([previousReportingManagerId])
   @@map("employees")
+}
+
+/// Salary structure history. One row per change; active = latest effectiveFrom <= today.
+/// BL-030: salary edits apply from the next payroll run only; old payslips are immutable.
+model SalaryStructure {
+  id              String   @id @default(cuid())
+  employeeId      String
+  employee        Employee @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  basicPaise      Int      /// stored as integer paise to avoid float drift
+  allowancesPaise Int      /// sum of HRA + special + transport, etc.
+  effectiveFrom   DateTime @db.Date
+  createdAt       DateTime @default(now())
+  /// Optimistic concurrency token
+  version         Int      @default(0)
+
+  @@index([employeeId, effectiveFrom(sort: Desc)])
+  @@map("salary_structures")
+}
+
+/// Audit trail for reporting-manager assignments. BL-007: never deleted.
+/// Insert Initial on employee creation; close row and insert new row on reassign.
+model ReportingManagerHistory {
+  id         String        @id @default(cuid())
+  employeeId String
+  employee   Employee      @relation("EmployeeHistory", fields: [employeeId], references: [id], onDelete: Cascade)
+  managerId  String?
+  manager    Employee?     @relation("ManagerHistory", fields: [managerId], references: [id], onDelete: SetNull)
+  fromDate   DateTime      @db.Date
+  /// null means currently open (this is the active assignment)
+  toDate     DateTime?     @db.Date
+  reason     HistoryReason
+  createdAt  DateTime      @default(now())
+
+  @@index([employeeId, fromDate(sort: Desc)])
+  @@index([managerId, toDate])
+  @@map("reporting_manager_history")
 }
 
 /// Session row. iron-session data maps to this.

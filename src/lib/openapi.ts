@@ -40,6 +40,25 @@ import {
   EmploymentTypeSchema,
   RoleSchema,
 } from '@nexora/contracts/common';
+import {
+  CreateEmployeeRequestSchema,
+  CreateEmployeeResponseSchema,
+  EmployeeDetailSchema,
+  EmployeeDetailResponseSchema,
+  EmployeeListQuerySchema,
+  EmployeeListResponseSchema,
+  UpdateEmployeeRequestSchema,
+  UpdateEmployeeResponseSchema,
+  UpdateSalaryRequestSchema,
+  UpdateSalaryResponseSchema,
+  ChangeStatusRequestSchema,
+  ChangeStatusResponseSchema,
+  ReassignManagerRequestSchema,
+  ReassignManagerResponseSchema,
+  TeamResponseSchema,
+  ProfileResponseSchema,
+  SalaryStructureSchema,
+} from '@nexora/contracts/employees';
 
 // Augment the local `z` with .openapi() — required before any registry call.
 extendZodWithOpenApi(z);
@@ -243,6 +262,256 @@ registry.registerPath({
       content: { 'application/json': { schema: AuthMeResponseSchema } },
     },
     ...errorResponse(401, 'UNAUTHENTICATED — no active session.'),
+  },
+});
+
+// ── Phase 1 — Employees & Hierarchy ─────────────────────────────────────────
+
+registry.register('SalaryStructure', SalaryStructureSchema);
+registry.register('EmployeeDetail', EmployeeDetailSchema);
+registry.register('CreateEmployeeRequest', CreateEmployeeRequestSchema);
+registry.register('CreateEmployeeResponse', CreateEmployeeResponseSchema);
+registry.register('EmployeeListQuery', EmployeeListQuerySchema);
+registry.register('EmployeeListResponse', EmployeeListResponseSchema);
+registry.register('EmployeeDetailResponse', EmployeeDetailResponseSchema);
+registry.register('UpdateEmployeeRequest', UpdateEmployeeRequestSchema);
+registry.register('UpdateEmployeeResponse', UpdateEmployeeResponseSchema);
+registry.register('UpdateSalaryRequest', UpdateSalaryRequestSchema);
+registry.register('UpdateSalaryResponse', UpdateSalaryResponseSchema);
+registry.register('ChangeStatusRequest', ChangeStatusRequestSchema);
+registry.register('ChangeStatusResponse', ChangeStatusResponseSchema);
+registry.register('ReassignManagerRequest', ReassignManagerRequestSchema);
+registry.register('ReassignManagerResponse', ReassignManagerResponseSchema);
+registry.register('TeamResponse', TeamResponseSchema);
+registry.register('ProfileResponse', ProfileResponseSchema);
+
+registry.registerPath({
+  method: 'post',
+  path: '/employees',
+  tags: ['Employees'],
+  summary: 'Create a new employee (Admin only)',
+  description:
+    'Generates EMP-YYYY-NNNN code, creates employee record, sends first-login invitation email. ' +
+    'BL-008: code is unique and never reused.',
+  security: [{ sessionCookie: [] }],
+  request: {
+    body: {
+      required: true,
+      content: { 'application/json': { schema: CreateEmployeeRequestSchema } },
+    },
+  },
+  responses: {
+    201: {
+      description: 'Employee created. Returns the full detail + invitationSent flag.',
+      content: { 'application/json': { schema: CreateEmployeeResponseSchema } },
+    },
+    ...errorResponse(400, 'VALIDATION_FAILED — invalid body or duplicate email.'),
+    ...errorResponse(401, 'UNAUTHENTICATED.'),
+    ...errorResponse(403, 'FORBIDDEN — caller is not Admin.'),
+  },
+});
+
+registry.registerPath({
+  method: 'get',
+  path: '/employees',
+  tags: ['Employees'],
+  summary: 'List employees (Admin: all; Manager: scoped to team)',
+  description:
+    'Cursor-paginated. Managers see only direct + indirect reports. ' +
+    'Filters: status, role, department, employmentType, managerId, q (name/email/code/department/designation).',
+  security: [{ sessionCookie: [] }],
+  request: {
+    query: EmployeeListQuerySchema,
+  },
+  responses: {
+    200: {
+      description: 'Paginated list of employees.',
+      content: { 'application/json': { schema: EmployeeListResponseSchema } },
+    },
+    ...errorResponse(400, 'VALIDATION_FAILED — invalid query params.'),
+    ...errorResponse(401, 'UNAUTHENTICATED.'),
+    ...errorResponse(403, 'FORBIDDEN — caller is not Admin or Manager.'),
+  },
+});
+
+registry.registerPath({
+  method: 'get',
+  path: '/employees/{id}',
+  tags: ['Employees'],
+  summary: 'Get employee detail',
+  description:
+    'Admin sees all. SELF sees own record with salary. Manager sees team members (salary omitted).',
+  security: [{ sessionCookie: [] }],
+  request: {
+    params: z.object({ id: z.string() }),
+  },
+  responses: {
+    200: {
+      description: 'Employee detail.',
+      content: { 'application/json': { schema: EmployeeDetailResponseSchema } },
+    },
+    ...errorResponse(401, 'UNAUTHENTICATED.'),
+    ...errorResponse(404, 'NOT_FOUND — employee does not exist or is outside caller scope.'),
+  },
+});
+
+registry.registerPath({
+  method: 'patch',
+  path: '/employees/{id}',
+  tags: ['Employees'],
+  summary: 'Update employee profile (Admin only)',
+  description:
+    'Partial update. Email and code are immutable. Uses optimistic concurrency via `version` (BL-034). ' +
+    'Status changes use POST /employees/{id}/status; salary changes use PATCH /employees/{id}/salary.',
+  security: [{ sessionCookie: [] }],
+  request: {
+    params: z.object({ id: z.string() }),
+    body: {
+      required: true,
+      content: { 'application/json': { schema: UpdateEmployeeRequestSchema } },
+    },
+  },
+  responses: {
+    200: {
+      description: 'Updated employee detail.',
+      content: { 'application/json': { schema: UpdateEmployeeResponseSchema } },
+    },
+    ...errorResponse(400, 'VALIDATION_FAILED.'),
+    ...errorResponse(401, 'UNAUTHENTICATED.'),
+    ...errorResponse(403, 'FORBIDDEN.'),
+    ...errorResponse(404, 'NOT_FOUND.'),
+    ...errorResponse(409, 'VERSION_MISMATCH — stale concurrency token.'),
+  },
+});
+
+registry.registerPath({
+  method: 'patch',
+  path: '/employees/{id}/salary',
+  tags: ['Employees'],
+  summary: 'Update salary structure (Admin only)',
+  description:
+    'Inserts a NEW salary row; historical salary rows and past payslips are never mutated (BL-030 / BL-031). ' +
+    'Active structure for a given run = latest effectiveFrom <= run month start.',
+  security: [{ sessionCookie: [] }],
+  request: {
+    params: z.object({ id: z.string() }),
+    body: {
+      required: true,
+      content: { 'application/json': { schema: UpdateSalaryRequestSchema } },
+    },
+  },
+  responses: {
+    200: {
+      description: 'Updated employee detail with new active salary.',
+      content: { 'application/json': { schema: UpdateSalaryResponseSchema } },
+    },
+    ...errorResponse(400, 'VALIDATION_FAILED.'),
+    ...errorResponse(401, 'UNAUTHENTICATED.'),
+    ...errorResponse(403, 'FORBIDDEN.'),
+    ...errorResponse(404, 'NOT_FOUND.'),
+    ...errorResponse(409, 'VERSION_MISMATCH.'),
+  },
+});
+
+registry.registerPath({
+  method: 'post',
+  path: '/employees/{id}/status',
+  tags: ['Employees'],
+  summary: 'Change employee status (Admin only)',
+  description:
+    'Allowed manual transitions: Active, On-Notice, Exited. ' +
+    'On-Leave is system-set on leave approval and cannot be set here (BL-006). ' +
+    'Exiting an employee closes their open ReportingManagerHistory row (BL-022).',
+  security: [{ sessionCookie: [] }],
+  request: {
+    params: z.object({ id: z.string() }),
+    body: {
+      required: true,
+      content: { 'application/json': { schema: ChangeStatusRequestSchema } },
+    },
+  },
+  responses: {
+    200: {
+      description: 'Updated employee detail.',
+      content: { 'application/json': { schema: ChangeStatusResponseSchema } },
+    },
+    ...errorResponse(400, 'VALIDATION_FAILED — including attempted On-Leave set.'),
+    ...errorResponse(401, 'UNAUTHENTICATED.'),
+    ...errorResponse(403, 'FORBIDDEN.'),
+    ...errorResponse(404, 'NOT_FOUND.'),
+    ...errorResponse(409, 'VERSION_MISMATCH.'),
+  },
+});
+
+registry.registerPath({
+  method: 'post',
+  path: '/employees/{id}/reassign-manager',
+  tags: ['Employees'],
+  summary: 'Reassign reporting manager (Admin only)',
+  description:
+    'Validates no circular chain (BL-005). Closes current ReportingManagerHistory row, inserts a new open one. ' +
+    'Pass newManagerId=null to promote to top-of-tree.',
+  security: [{ sessionCookie: [] }],
+  request: {
+    params: z.object({ id: z.string() }),
+    body: {
+      required: true,
+      content: { 'application/json': { schema: ReassignManagerRequestSchema } },
+    },
+  },
+  responses: {
+    200: {
+      description: 'Updated employee detail.',
+      content: { 'application/json': { schema: ReassignManagerResponseSchema } },
+    },
+    ...errorResponse(400, 'VALIDATION_FAILED.'),
+    ...errorResponse(401, 'UNAUTHENTICATED.'),
+    ...errorResponse(403, 'FORBIDDEN.'),
+    ...errorResponse(404, 'NOT_FOUND.'),
+    ...errorResponse(409, 'CIRCULAR_REPORTING (BL-005) or VERSION_MISMATCH.'),
+  },
+});
+
+registry.registerPath({
+  method: 'get',
+  path: '/employees/{id}/team',
+  tags: ['Employees'],
+  summary: 'Get current and past team members',
+  description:
+    'Manager may only query their own id. Admin may query any manager. ' +
+    'Returns current (direct + indirect) and past (BL-022a) team members.',
+  security: [{ sessionCookie: [] }],
+  request: {
+    params: z.object({ id: z.string() }),
+  },
+  responses: {
+    200: {
+      description: 'Current and past team members.',
+      content: { 'application/json': { schema: TeamResponseSchema } },
+    },
+    ...errorResponse(401, 'UNAUTHENTICATED.'),
+    ...errorResponse(403, 'FORBIDDEN — Manager querying another manager\'s team.'),
+    ...errorResponse(404, 'NOT_FOUND.'),
+  },
+});
+
+registry.registerPath({
+  method: 'get',
+  path: '/employees/{id}/profile',
+  tags: ['Employees'],
+  summary: 'Get own profile (SELF or Admin)',
+  description: 'Read-only profile view. Only the employee themselves or Admin may access.',
+  security: [{ sessionCookie: [] }],
+  request: {
+    params: z.object({ id: z.string() }),
+  },
+  responses: {
+    200: {
+      description: 'Full employee detail including salary.',
+      content: { 'application/json': { schema: ProfileResponseSchema } },
+    },
+    ...errorResponse(401, 'UNAUTHENTICATED.'),
+    ...errorResponse(404, 'NOT_FOUND — or access denied (no leakage).'),
   },
 });
 

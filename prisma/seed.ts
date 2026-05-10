@@ -65,13 +65,48 @@ async function seedAdmin(): Promise<void> {
   const existing = await prisma.employee.findUnique({ where: { email: ADMIN_EMAIL } });
 
   if (existing) {
-    console.log(`  [admin] Already exists (${ADMIN_EMAIL}) — skipping.`);
+    console.log(`  [admin] Already exists (${ADMIN_EMAIL}) — skipping employee row.`);
+
+    // Phase 1: idempotently add SalaryStructure and ReportingManagerHistory if missing
+    const hasSalary = await prisma.salaryStructure.findFirst({
+      where: { employeeId: existing.id },
+    });
+    if (!hasSalary) {
+      await prisma.salaryStructure.create({
+        data: {
+          employeeId: existing.id,
+          basicPaise: 0,
+          allowancesPaise: 0,
+          effectiveFrom: existing.joinDate,
+          version: 0,
+        },
+      });
+      console.log(`  [admin] Created initial SalaryStructure for admin.`);
+    }
+
+    const hasHistory = await prisma.reportingManagerHistory.findFirst({
+      where: { employeeId: existing.id },
+    });
+    if (!hasHistory) {
+      await prisma.reportingManagerHistory.create({
+        data: {
+          employeeId: existing.id,
+          managerId: null,
+          fromDate: existing.joinDate,
+          toDate: null,
+          reason: 'Initial',
+        },
+      });
+      console.log(`  [admin] Created initial ReportingManagerHistory for admin.`);
+    }
+
     return;
   }
 
   const passwordHash = await argon2.hash(ADMIN_PASSWORD, { type: argon2.argon2id });
+  const joinDate = new Date('2024-01-01');
 
-  await prisma.employee.create({
+  const admin = await prisma.employee.create({
     data: {
       code: 'EMP-2024-0001',
       email: ADMIN_EMAIL,
@@ -79,13 +114,36 @@ async function seedAdmin(): Promise<void> {
       passwordHash,
       role: 'Admin',
       status: 'Active',
+      employmentType: 'Permanent',
       department: 'HR',
       designation: 'Head of People',
       reportingManagerId: null,
-      joinDate: new Date('2024-01-01'),
+      joinDate,
       exitDate: null,
       mustResetPassword: false,
       version: 0,
+    },
+  });
+
+  // Phase 1: initial salary structure (zeroed — Admin may update)
+  await prisma.salaryStructure.create({
+    data: {
+      employeeId: admin.id,
+      basicPaise: 0,
+      allowancesPaise: 0,
+      effectiveFrom: joinDate,
+      version: 0,
+    },
+  });
+
+  // Phase 1: initial reporting manager history row
+  await prisma.reportingManagerHistory.create({
+    data: {
+      employeeId: admin.id,
+      managerId: null,
+      fromDate: joinDate,
+      toDate: null,
+      reason: 'Initial',
     },
   });
 
