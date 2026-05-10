@@ -108,28 +108,31 @@ notificationsRouter.get(
         where['createdAt'] = { gte: new Date(query.since) };
       }
 
-      // Cursor-based pagination (cursor is the notification id of the last seen row)
+      // Cursor-based pagination (cursor is the notification id of the last seen row).
+      // BUG-NOT-005: use keyset (createdAt, id) so same-millisecond fan-out rows
+      // (e.g. payroll finalise) are never dropped at page boundaries.
       if (query.cursor) {
         const cursorRow = await prisma.notification.findFirst({
           where: { id: query.cursor, recipientId: user.id }, // BL-044 scoped
-          select: { createdAt: true },
+          select: { createdAt: true, id: true },
         });
         if (cursorRow) {
-          // Items older than the cursor (or same createdAt but later id — secondary sort)
-          if (where['createdAt']) {
-            where['createdAt'] = {
-              ...where['createdAt'],
-              lt: cursorRow.createdAt,
-            };
-          } else {
-            where['createdAt'] = { lt: cursorRow.createdAt };
-          }
+          // Items strictly older than the cursor row, OR same createdAt but smaller id.
+          // This composite keyset ensures no rows with identical createdAt are skipped.
+          // The existing index on (recipientId, createdAt DESC) still covers the
+          // leading column so the query plan is unchanged.
+          where['OR'] = [
+            { createdAt: { lt: cursorRow.createdAt } },
+            { createdAt: cursorRow.createdAt, id: { lt: cursorRow.id } },
+          ];
+          // Remove any `since` filter that was merged into createdAt — it is now
+          // handled via a separate top-level `createdAt` key alongside `OR`.
         }
       }
 
       const rows = await prisma.notification.findMany({
         where,
-        orderBy: { createdAt: 'desc' },
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
         take: limit + 1,
       });
 

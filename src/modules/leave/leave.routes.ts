@@ -1157,6 +1157,7 @@ leaveRouter.post(
         category: 'Leave',
         title: 'Your leave was cancelled',
         body: `${result.request.leaveType.name} leave (${result.request.fromDate.toISOString().split('T')[0]} to ${result.request.toDate.toISOString().split('T')[0]}) has been cancelled.${restoredMsg}`,
+        link: `/employee/leave/${result.request.id}`,
       });
 
       return result;

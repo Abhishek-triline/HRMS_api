@@ -900,6 +900,7 @@ payrollRouter.post(
         category: 'Payroll',
         title: `Payroll for ${monthLabel} was reversed`,
         body: `Payroll run ${result.reversalRun.code} for ${monthLabel} was reversed by Admin: ${reason}.`,
+        link: `/payroll/payroll-runs/${result.reversalRun.id}`,
       });
     }
 

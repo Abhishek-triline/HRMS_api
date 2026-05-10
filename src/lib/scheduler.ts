@@ -36,6 +36,7 @@ import { logger } from './logger.js';
 import { escalateStaleRequests, runCarryForward } from '../modules/leave/leave.service.js';
 import { runMidnightGenerate } from '../modules/attendance/attendance.service.js';
 import { audit } from './audit.js';
+import { notify } from './notifications.js';
 
 const ENABLE_CRON = process.env['ENABLE_CRON'] !== 'false';
 
@@ -238,7 +239,117 @@ export function startScheduler(): void {
     },
   );
 
+  // ── performance.review-deadline-nudge — daily 09:00 IST ──────────────────
+  // BUG-NOT-002: send reminder notifications 7 days and 1 day before selfReviewDeadline
+  // to every participant who has not yet submitted a self-review.
+  // De-duplication: checks audit_log for a previous nudge action for the same
+  // (reviewId, employeeId) pair within the last 30 days before sending.
+  cron.schedule(
+    '0 9 * * *',
+    async () => {
+      const jobId = 'performance.review-deadline-nudge';
+      logger.info({ job: jobId }, 'Starting performance review deadline nudge');
+
+      try {
+        const now = new Date();
+
+        // ±12h window centred on each target deadline so the 09:00 daily fire
+        // catches deadlines regardless of what time-of-day they were stored at.
+        const windowHalfMs = 12 * 60 * 60 * 1000;
+
+        for (const daysAhead of [7, 1]) {
+          const targetMs = now.getTime() + daysAhead * 24 * 60 * 60 * 1000;
+          const windowStart = new Date(targetMs - windowHalfMs);
+          const windowEnd   = new Date(targetMs + windowHalfMs);
+
+          // Open cycles whose selfReviewDeadline falls within the window
+          const cycles = await prisma.performanceCycle.findMany({
+            where: {
+              status: 'Open',
+              selfReviewDeadline: { gte: windowStart, lte: windowEnd },
+            },
+            select: { id: true, code: true },
+          });
+
+          for (const cycle of cycles) {
+            // Participants who have NOT yet submitted a self-review and are
+            // not mid-cycle joiners (BL-037 excludes them from self-review)
+            const reviews = await prisma.performanceReview.findMany({
+              where: {
+                cycleId: cycle.id,
+                isMidCycleJoiner: false,
+                selfSubmittedAt: null,
+              },
+              select: { id: true, employeeId: true },
+            });
+
+            const actionKey = daysAhead === 7
+              ? 'performance.deadline-nudge-7d'
+              : 'performance.deadline-nudge-1d';
+
+            const thirtyDaysAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+
+            for (const review of reviews) {
+              // De-duplicate: skip if we already sent this exact nudge in the last 30 days
+              const alreadySent = await prisma.auditLog.findFirst({
+                where: {
+                  action: actionKey,
+                  targetType: 'PerformanceReview',
+                  targetId: review.id,
+                  // The actorId for system nudges is null; match on targetId + action
+                  createdAt: { gte: thirtyDaysAgo },
+                },
+                select: { id: true },
+              });
+
+              if (alreadySent) continue;
+
+              const body = daysAhead === 7
+                ? `Your self-review for "${cycle.code}" is due in 7 days. Please submit your ratings.`
+                : `Your self-review for "${cycle.code}" is due tomorrow. Please submit before the deadline.`;
+
+              const title = daysAhead === 7
+                ? 'Self-review due in 7 days'
+                : 'Self-review due tomorrow';
+
+              await audit({
+                actorId: null,
+                actorRole: 'system',
+                action: actionKey,
+                targetType: 'PerformanceReview',
+                targetId: review.id,
+                module: 'performance',
+                before: null,
+                after: {
+                  cycleId: cycle.id,
+                  cycleCode: cycle.code,
+                  employeeId: review.employeeId,
+                  daysAhead,
+                },
+              });
+
+              await notify({
+                recipientIds: review.employeeId,
+                category: 'Performance',
+                title,
+                body,
+                link: `/employee/performance/${review.id}`,
+              });
+            }
+          }
+        }
+
+        logger.info({ job: jobId }, 'Performance review deadline nudge complete');
+      } catch (err: unknown) {
+        logger.error({ job: jobId, err }, 'Performance review deadline nudge failed — server continues normally');
+      }
+    },
+    {
+      timezone: 'Asia/Kolkata',
+    },
+  );
+
   logger.info(
-    'Scheduled jobs started: attendance.midnight-generate (daily 00:00 IST), leave.escalation-sweep (hourly), leave.carry-forward (Jan 1 00:05 IST), idempotency-key.cleanup (daily 03:00 IST), notifications.archive-90d (daily 03:30 IST)',
+    'Scheduled jobs started: attendance.midnight-generate (daily 00:00 IST), leave.escalation-sweep (hourly), leave.carry-forward (Jan 1 00:05 IST), idempotency-key.cleanup (daily 03:00 IST), notifications.archive-90d (daily 03:30 IST), performance.review-deadline-nudge (daily 09:00 IST)',
   );
 }

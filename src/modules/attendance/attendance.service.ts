@@ -343,6 +343,16 @@ export async function recordCheckIn(
     // for the 4th, 5th, 7th, 8th, 10th… etc. Now: fire at every count >= 3.
     if (lateMonthCount >= 3) {
       lateMarkDeductionApplied = await deductLateMarkPenalty(employeeId, year, now, tx);
+    } else if (lateMonthCount === 2) {
+      // BUG-NOT-001 / BL-028: warn the employee that the next late will trigger a deduction.
+      await notify({
+        tx,
+        recipientIds: employeeId,
+        category: 'Attendance',
+        title: 'Late check-in warning',
+        body: 'You have 2 late check-ins this month. One more late will deduct 1 day from your leave balance.',
+        link: `/employee/attendance`,
+      });
     }
   } else {
     const lateLedger = await tx.attendanceLateLedger.findUnique({
