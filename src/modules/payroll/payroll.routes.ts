@@ -244,7 +244,12 @@ payrollRouter.post(
     let result;
     try {
       result = await prisma.$transaction(async (tx) => {
-        // Check for an existing non-Reversed run for this month+year
+        // Check for an existing non-Reversed run for this month+year.
+        // SEC-P8-007: The application-layer check here is the first line of defense.
+        // The DB unique constraint @@unique([month, year, reversalOfRunId]) on payroll_runs
+        // is the defense-in-depth — if two concurrent requests both pass this check before
+        // either inserts, exactly one wins and the other gets a Prisma P2002 unique-constraint
+        // violation which is caught below and returned as RUN_ALREADY_EXISTS.
         const existing = await tx.payrollRun.findFirst({
           where: {
             month,
@@ -259,7 +264,7 @@ payrollRouter.post(
             `A payroll run already exists for ${year}-${String(month).padStart(2, '0')} (code: ${existing.code}, status: ${existing.status}).`,
           );
           e.statusCode = 409;
-          e.code = ErrorCode.VALIDATION_FAILED;
+          e.code = ErrorCode.RUN_ALREADY_EXISTS;
           throw e;
         }
 
@@ -369,6 +374,19 @@ payrollRouter.post(
         res
           .status(txErr.statusCode)
           .json(errorEnvelope(txErr.code, txErr.message, { ruleId: txErr.ruleId, details: txErr.details }));
+        return;
+      }
+      // SEC-P8-007: DB unique constraint fallback — two concurrent creates raced past the
+      // application-layer check. The DB unique index on (month, year, reversalOfRunId) caught
+      // the duplicate. Return a named RUN_ALREADY_EXISTS rather than a 500.
+      const prismaErr = err as { code?: string };
+      if (prismaErr.code === 'P2002') {
+        res.status(409).json(
+          errorEnvelope(
+            ErrorCode.RUN_ALREADY_EXISTS,
+            `A payroll run already exists for ${year}-${String(month).padStart(2, '0')}.`,
+          ),
+        );
         return;
       }
       throw err;

@@ -294,7 +294,9 @@ router.post(
         where: { email: email.toLowerCase() },
       });
 
-      if (employee && employee.status === 'Active') {
+      // SEC-P8-008: OnNotice employees may also request a password reset —
+      // they still have active employment and should be able to recover access.
+      if (employee && ['Active', 'OnNotice'].includes(employee.status)) {
         const rawToken = generateToken();
         const tokenHash = hashToken(rawToken);
         const expiresAt = new Date(Date.now() + PASSWORD_RESET_TTL_MINUTES * 60 * 1000);

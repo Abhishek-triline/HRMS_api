@@ -71,11 +71,25 @@ if (FORBIDDEN_SESSION_SECRETS.has(SESSION_SECRET)) {
 // Suppress "unused" lint warning — DATABASE_URL is used by Prisma via process.env
 void DATABASE_URL;
 
+// SEC-P8-010: refuse to boot in production with the default or empty admin password.
+// The seed script sets this account on first run; a default password is a trivial takeover.
+if (process.env['NODE_ENV'] === 'production') {
+  const seedPwd = process.env['SEED_ADMIN_PASSWORD'] ?? '';
+  if (!seedPwd || seedPwd === 'admin@123') {
+    console.error(
+      `\n[FATAL] SEED_ADMIN_PASSWORD is set to the default value ("admin@123") or is empty.\n` +
+        `Set a strong, unique value in your production secrets manager before deploying.\n`,
+    );
+    process.exit(1);
+  }
+}
+
 // ── Rate limiters ─────────────────────────────────────────────────────────────
 
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 min
-  max: 10,
+  // SEC-P8-013: align with LOCKOUT_THRESHOLD (5) in auth.service.ts
+  max: 5,
   standardHeaders: true,
   legacyHeaders: false,
   message: errorEnvelope(
@@ -165,8 +179,11 @@ app.use(httpLogger as unknown as express.RequestHandler);
 app.use(globalLimiter);
 
 // Tighter rate limit on auth mutation endpoints
+// SEC-P8-002: also cover token-consumption endpoints to prevent brute-forcing reset/first-login flows
 app.use('/api/v1/auth/login', authLimiter);
 app.use('/api/v1/auth/forgot-password', authLimiter);
+app.use('/api/v1/auth/reset-password', authLimiter);
+app.use('/api/v1/auth/first-login/set-password', authLimiter);
 
 // ── Routes ────────────────────────────────────────────────────────────────────
 

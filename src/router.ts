@@ -6,6 +6,7 @@
 import { Router } from 'express';
 import swaggerUi from 'swagger-ui-express';
 
+import { requireSession } from './middleware/requireSession.js';
 import { authRouter } from './modules/auth/auth.routes.js';
 import { employeesRouter } from './modules/employees/employees.routes.js';
 import { leaveRouter } from './modules/leave/leave.routes.js';
@@ -32,24 +33,47 @@ v1Router.get('/health', (_req, res) => {
   });
 });
 
-// OpenAPI 3.1 spec — served as JSON for tooling (Postman, codegen, etc.)
-v1Router.get('/openapi.json', (_req, res) => {
-  res.status(200).json(openApiSpec);
-});
+// SEC-P8-004: gate /openapi.json + /docs behind session auth in production.
+// In dev/staging they remain open for tooling convenience.
+if (process.env['NODE_ENV'] === 'production') {
+  // OpenAPI 3.1 spec — requires a valid session in production
+  v1Router.get('/openapi.json', requireSession(), (_req, res) => {
+    res.status(200).json(openApiSpec);
+  });
 
-// Swagger UI — interactive docs at /api/v1/docs
-v1Router.use(
-  '/docs',
-  swaggerUi.serve,
-  swaggerUi.setup(openApiSpec, {
-    customSiteTitle: 'Nexora HRMS API — docs',
-    swaggerOptions: {
-      persistAuthorization: true,
-      docExpansion: 'list',
-      defaultModelsExpandDepth: 0,
-    },
-  }),
-);
+  // Swagger UI — requires a valid session in production
+  v1Router.use(
+    '/docs',
+    requireSession(),
+    swaggerUi.serve,
+    swaggerUi.setup(openApiSpec, {
+      customSiteTitle: 'Nexora HRMS API — docs',
+      swaggerOptions: {
+        persistAuthorization: true,
+        docExpansion: 'list',
+        defaultModelsExpandDepth: 0,
+      },
+    }),
+  );
+} else {
+  // Dev / staging — open mount for tooling, Postman, codegen, etc.
+  v1Router.get('/openapi.json', (_req, res) => {
+    res.status(200).json(openApiSpec);
+  });
+
+  v1Router.use(
+    '/docs',
+    swaggerUi.serve,
+    swaggerUi.setup(openApiSpec, {
+      customSiteTitle: 'Nexora HRMS API — docs',
+      swaggerOptions: {
+        persistAuthorization: true,
+        docExpansion: 'list',
+        defaultModelsExpandDepth: 0,
+      },
+    }),
+  );
+}
 
 // Auth module (Phase 0)
 v1Router.use('/auth', authRouter);

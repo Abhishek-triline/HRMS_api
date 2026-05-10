@@ -45,14 +45,18 @@ export const configurationRouter = Router();
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/** Resolve the actor's IP from the request (handles proxies). */
+/**
+ * Resolve the actor's IP from the request.
+ *
+ * SEC-P8-005: do NOT read req.headers['x-forwarded-for'] directly — that header
+ * is trivially spoofable by an attacker and would let them forge the IP stored in
+ * audit rows. Express's req.ip already honours XFF correctly when
+ * app.set('trust proxy', N) is configured (see PRE_PRODUCTION_CHECKLIST.md
+ * SEC-P8-006). In the default no-proxy case, req.ip falls back to the socket
+ * peer, which cannot be spoofed from outside the network.
+ */
 function resolveIp(req: Request): string | null {
-  const forwarded = req.headers['x-forwarded-for'];
-  if (forwarded) {
-    const first = Array.isArray(forwarded) ? forwarded[0] : forwarded.split(',')[0];
-    return first?.trim() ?? null;
-  }
-  return req.ip ?? null;
+  return req.ip ?? req.socket.remoteAddress ?? null;
 }
 
 /**
