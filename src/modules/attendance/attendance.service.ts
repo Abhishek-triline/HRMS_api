@@ -31,12 +31,31 @@ import { ErrorCode } from '@nexora/contracts/errors';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
+/**
+ * SEC-002-P3 — actor context threaded into service helpers so audit rows
+ * carry the real `actorIp` and `actorRole` instead of hardcoded defaults.
+ * All fields are optional; callers are expected to populate from `req.ip`
+ * and `req.user.role` at the route boundary.
+ */
+export interface AuditCtx {
+  role?: string;
+  ip?: string | null;
+}
+
+/**
+ * SEC-003-P3 — conflict details now match `LeaveConflictDetailsSchema` from
+ * `@nexora/contracts/leave` so the front-end can render a single typed
+ * block for both directions of the BL-010 conflict.
+ */
 export interface RegularisationConflictError {
   code: typeof ErrorCode.LEAVE_REG_CONFLICT;
   details: {
+    conflictType: 'Leave';
     conflictId: string;
-    date: string;
-    conflictType: 'leave';
+    conflictCode: string;
+    conflictFrom: string;
+    conflictTo: string | null;
+    conflictStatus: string;
   };
 }
 
@@ -266,6 +285,7 @@ export async function recordCheckIn(
   employeeId: string,
   now: Date,
   tx: Prisma.TransactionClient,
+  auditCtx: AuditCtx = {},
 ): Promise<CheckInResult> {
   const dateOnly = new Date(now);
   dateOnly.setUTCHours(0, 0, 0, 0);
@@ -316,8 +336,11 @@ export async function recordCheckIn(
     });
     lateMonthCount = lateLedger.count;
 
-    // BL-028: if the count is now a multiple of 3, deduct 1 Annual leave day
-    if (lateMonthCount % 3 === 0) {
+    // BL-028 (BUG-ATT-001 fix): the spec deducts 1 Annual leave day on the
+    // 3rd late mark of the month AND on EACH ADDITIONAL late beyond that.
+    // Earlier code only fired on multiples of 3 (3, 6, 9, …) — that's wrong
+    // for the 4th, 5th, 7th, 8th, 10th… etc. Now: fire at every count >= 3.
+    if (lateMonthCount >= 3) {
       lateMarkDeductionApplied = await deductLateMarkPenalty(employeeId, year, now, tx);
     }
   } else {
@@ -327,7 +350,15 @@ export async function recordCheckIn(
     lateMonthCount = lateLedger?.count ?? 0;
   }
 
-  // Upsert the attendance record (create if missing, update check-in)
+  // BUG-ATT-002 fix — BL-026 status priority must hold on check-in. The
+  // priority is On-Leave > Weekly-Off / Holiday > Present > Absent. We
+  // still record the check-in time (so the audit trail keeps it) but the
+  // displayed status reflects the higher-priority reason. `deriveStatusForDay`
+  // returns one of On-Leave / Holiday / Weekly-Off / null; null means no
+  // higher priority applies and the row should be Present.
+  const priorityStatus = await deriveStatusForDay(employeeId, dateOnly, tx);
+  const newStatus = priorityStatus ?? 'Present';
+
   const record = await tx.attendanceRecord.upsert({
     where: {
       employeeId_date_source: {
@@ -339,7 +370,7 @@ export async function recordCheckIn(
     create: {
       employeeId,
       date: dateOnly,
-      status: 'Present',
+      status: newStatus,
       checkInTime: now,
       checkOutTime: null,
       hoursWorkedMinutes: null,
@@ -350,7 +381,7 @@ export async function recordCheckIn(
       version: 0,
     },
     update: {
-      status: 'Present',
+      status: newStatus,
       checkInTime: now,
       late,
       lateMonthCount,
@@ -362,8 +393,8 @@ export async function recordCheckIn(
   await audit({
     tx,
     actorId: employeeId,
-    actorRole: 'Employee',
-    actorIp: null,
+    actorRole: auditCtx.role ?? 'Employee',
+    actorIp: auditCtx.ip ?? null,
     action: 'attendance.check-in',
     targetType: 'AttendanceRecord',
     targetId: record.id,
@@ -477,6 +508,7 @@ export async function recordCheckOut(
   employeeId: string,
   now: Date,
   tx: Prisma.TransactionClient,
+  auditCtx: AuditCtx = {},
 ): Promise<CheckOutResult | null> {
   const dateOnly = new Date(now);
   dateOnly.setUTCHours(0, 0, 0, 0);
@@ -522,8 +554,8 @@ export async function recordCheckOut(
   await audit({
     tx,
     actorId: employeeId,
-    actorRole: 'Employee',
-    actorIp: null,
+    actorRole: auditCtx.role ?? 'Employee',
+    actorIp: auditCtx.ip ?? null,
     action: 'attendance.check-out',
     targetType: 'AttendanceRecord',
     targetId: record.id,
@@ -587,6 +619,7 @@ export async function submitRegularisation(
   employeeId: string,
   input: SubmitRegularisationInput,
   tx: Prisma.TransactionClient,
+  auditCtx: AuditCtx = {},
 ) {
   const { date, proposedCheckIn, proposedCheckOut, reason } = input;
   const today = new Date();
@@ -595,15 +628,21 @@ export async function submitRegularisation(
   const dateOnly = new Date(date);
   dateOnly.setUTCHours(0, 0, 0, 0);
 
-  // BL-010: check for approved leave on that date
+  // BL-010: check for approved leave on that date.
+  // SEC-003-P3 — details now match LeaveConflictDetailsSchema so the front
+  // end can render a single typed conflict block for both directions of
+  // the BL-010 check (leave→reg and reg→leave).
   const conflictingLeave = await findOverlappingLeave(employeeId, dateOnly, dateOnly, tx);
   if (conflictingLeave) {
     const err: RegularisationConflictError = {
       code: ErrorCode.LEAVE_REG_CONFLICT,
       details: {
-        conflictId: conflictingLeave.code,
-        date: dateOnly.toISOString().split('T')[0]!,
-        conflictType: 'leave',
+        conflictType: 'Leave',
+        conflictId: conflictingLeave.id,
+        conflictCode: conflictingLeave.code,
+        conflictFrom: conflictingLeave.fromDate.toISOString().split('T')[0]!,
+        conflictTo: conflictingLeave.toDate.toISOString().split('T')[0]!,
+        conflictStatus: conflictingLeave.status,
       },
     };
     throw err;
@@ -674,8 +713,8 @@ export async function submitRegularisation(
   await audit({
     tx,
     actorId: employeeId,
-    actorRole: 'Employee',
-    actorIp: null,
+    actorRole: auditCtx.role ?? 'Employee',
+    actorIp: auditCtx.ip ?? null,
     action: 'regularisation.create',
     targetType: 'RegularisationRequest',
     targetId: reg.id,
@@ -725,6 +764,7 @@ export async function approveRegularisation(
   approverId: string,
   note: string | undefined,
   tx: Prisma.TransactionClient,
+  auditCtx: AuditCtx = {},
 ) {
   const dateOnly = new Date(reg.date);
   dateOnly.setUTCHours(0, 0, 0, 0);
@@ -797,8 +837,8 @@ export async function approveRegularisation(
   await audit({
     tx,
     actorId: approverId,
-    actorRole: 'Approver',
-    actorIp: null,
+    actorRole: auditCtx.role ?? 'Approver',
+    actorIp: auditCtx.ip ?? null,
     action: 'regularisation.approve',
     targetType: 'RegularisationRequest',
     targetId: reg.id,
@@ -829,6 +869,7 @@ export async function rejectRegularisation(
   rejecterId: string,
   note: string,
   tx: Prisma.TransactionClient,
+  auditCtx: AuditCtx = {},
 ) {
   const now = new Date();
 
@@ -851,8 +892,8 @@ export async function rejectRegularisation(
   await audit({
     tx,
     actorId: rejecterId,
-    actorRole: 'Approver',
-    actorIp: null,
+    actorRole: auditCtx.role ?? 'Approver',
+    actorIp: auditCtx.ip ?? null,
     action: 'regularisation.reject',
     targetType: 'RegularisationRequest',
     targetId: reg.id,

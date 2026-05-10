@@ -124,6 +124,7 @@ regularisationsRouter.post(
             reason: body.reason,
           },
           tx,
+          { role: user.role, ip: req.ip ?? null },
         );
       });
 
@@ -189,12 +190,20 @@ regularisationsRouter.get(
           where['employeeId'] = q.employeeId;
         }
       } else if (user.role === 'Manager') {
-        // Own + subordinates routed to this manager
+        // SEC-001-P3 fix — when ?employeeId is supplied, the previous code
+        // dropped the approverId guard and exposed Admin-routed corrections
+        // belonging to a subordinate. Tighten: filtering by self returns
+        // own requests; filtering by a subordinate returns only the rows
+        // where this manager IS the assigned approver. Anything else 404s.
         const subIds = await getSubordinateIds(user.id);
         if (q.employeeId) {
-          // Respect the filter but enforce ownership
-          if (q.employeeId === user.id || subIds.includes(q.employeeId)) {
-            where['employeeId'] = q.employeeId;
+          if (q.employeeId === user.id) {
+            where['employeeId'] = user.id;
+          } else if (subIds.includes(q.employeeId)) {
+            where['AND'] = [
+              { employeeId: q.employeeId },
+              { approverId: user.id },
+            ];
           } else {
             res.status(200).json({ data: [], nextCursor: null });
             return;
@@ -382,6 +391,7 @@ regularisationsRouter.post(
           user.id,
           body.note,
           tx,
+          { role: user.role, ip: req.ip ?? null },
         );
       });
 
@@ -461,6 +471,7 @@ regularisationsRouter.post(
           user.id,
           body.note,
           tx,
+          { role: user.role, ip: req.ip ?? null },
         );
       });
 

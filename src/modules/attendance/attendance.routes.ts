@@ -44,7 +44,7 @@ attendanceRouter.post(
 
     try {
       const result = await prisma.$transaction(async (tx) => {
-        return recordCheckIn(user.id, now, tx);
+        return recordCheckIn(user.id, now, tx, { role: user.role, ip: req.ip ?? null });
       });
 
       res.status(200).json({
@@ -74,7 +74,7 @@ attendanceRouter.post(
 
     try {
       const result = await prisma.$transaction(async (tx) => {
-        return recordCheckOut(user.id, now, tx);
+        return recordCheckOut(user.id, now, tx, { role: user.role, ip: req.ip ?? null });
       });
 
       if (!result) {
