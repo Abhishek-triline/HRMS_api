@@ -175,27 +175,25 @@ export async function findOverlappingLeave(
  * Find any approved regularisation request for the employee that overlaps
  * with [fromDate, toDate].
  *
- * TODO(Phase 3): The `RegularisationRequest` model does not exist yet.
- * When Phase 3 adds that table, replace this stub with the real query:
- *
- *   return tx.regularisationRequest.findFirst({
- *     where: {
- *       employeeId,
- *       status: { in: ['Approved'] },
- *       date: { gte: fromDate, lte: toDate },
- *     },
- *   });
- *
- * For now, always returns null (no conflict possible in Phase 2).
+ * Phase 3 wire-up: queries the RegularisationRequest table (added in Phase 3
+ * migration). This unblocks TC-LEAVE-004 (leave + reg conflict from leave side).
+ * The leave route already wraps the result with LeaveConflictDetailsSchema and
+ * ruleId: 'BL-010' — only the service query needed filling in.
  */
 export async function findOverlappingRegularisation(
-  _employeeId: string,
-  _fromDate: Date,
-  _toDate: Date,
-  _tx: Prisma.TransactionClient,
-): Promise<null> {
-  // Phase 2 stub — Phase 3 will wire this up.
-  return null;
+  employeeId: string,
+  fromDate: Date,
+  toDate: Date,
+  tx: Prisma.TransactionClient,
+) {
+  return await tx.regularisationRequest.findFirst({
+    where: {
+      employeeId,
+      status: 'Approved',
+      date: { gte: fromDate, lte: toDate },
+    },
+    select: { id: true, code: true, date: true, status: true },
+  });
 }
 
 // ── Balance helpers ───────────────────────────────────────────────────────────

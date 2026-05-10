@@ -9,6 +9,9 @@ import swaggerUi from 'swagger-ui-express';
 import { authRouter } from './modules/auth/auth.routes.js';
 import { employeesRouter } from './modules/employees/employees.routes.js';
 import { leaveRouter } from './modules/leave/leave.routes.js';
+import { attendanceRouter } from './modules/attendance/attendance.routes.js';
+import { regularisationsRouter } from './modules/attendance/regularisations.routes.js';
+import { holidaysRouter } from './modules/attendance/holidays.routes.js';
 import { openApiSpec } from './lib/openapi.js';
 
 const v1Router = Router();
@@ -52,12 +55,15 @@ v1Router.use('/employees', employeesRouter);
 // Phase 2 — Leave Management
 v1Router.use('/leave', leaveRouter);
 
-// Phase 3+ modules will be mounted here:
-// v1Router.use('/attendance', attendanceRouter);
+// Phase 3 — Attendance, Regularisation, Holiday Calendar
+v1Router.use('/attendance', attendanceRouter);
+v1Router.use('/regularisations', regularisationsRouter);
+v1Router.use('/config/holidays', holidaysRouter);
+
+// Phase 4+ modules will be mounted here:
 // v1Router.use('/payroll', payrollRouter);
 // v1Router.use('/performance', performanceRouter);
 // v1Router.use('/notifications', notificationsRouter);
 // v1Router.use('/audit', auditRouter);
-// v1Router.use('/config', configRouter);
 
 export { v1Router };

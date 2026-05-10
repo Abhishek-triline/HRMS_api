@@ -1,5 +1,5 @@
 /**
- * Nexora HRMS — Database seed (Phase 0 + Phase 2)
+ * Nexora HRMS — Database seed (Phase 0 + Phase 2 + Phase 3)
  *
  * Idempotent: safe to run multiple times.
  * Creates:
@@ -9,6 +9,7 @@
  *   3. 6 LeaveType rows with proper flags + caps (Phase 2)
  *   4. LeaveQuota rows for 4 employment types × 4 accrual types (Phase 2)
  *   5. LeaveBalance rows for the admin for the current year (Phase 2)
+ *   6. Holiday calendar for the current year (Phase 3)
  */
 
 import { PrismaClient } from '@prisma/client';
@@ -377,6 +378,53 @@ async function seedAdminLeaveBalances(): Promise<void> {
   console.log(`  [leave-balance] Created ${created} new balance rows for admin.`);
 }
 
+// ── Holiday calendar (Phase 3) ────────────────────────────────────────────────
+
+interface HolidayDef {
+  month: number; // 1-indexed
+  day: number;
+  name: string;
+}
+
+// Test-case seed list (not load-bearing — precise names don't matter for tests)
+const SEED_HOLIDAYS: HolidayDef[] = [
+  { month: 1, day: 26, name: 'Republic Day' },
+  { month: 3, day: 3, name: 'Holi' },
+  { month: 4, day: 3, name: 'Good Friday' },
+  { month: 4, day: 20, name: 'Ram Navami' },
+  { month: 8, day: 15, name: 'Independence Day' },
+  { month: 11, day: 8, name: 'Diwali' },
+  { month: 12, day: 25, name: 'Christmas' },
+];
+
+async function seedHolidays(): Promise<void> {
+  const year = new Date().getFullYear();
+  let created = 0;
+  let skipped = 0;
+
+  for (const h of SEED_HOLIDAYS) {
+    // Use UTC date to match @db.Date storage
+    const date = new Date(Date.UTC(year, h.month - 1, h.day));
+
+    const existing = await prisma.holiday.findFirst({
+      where: { year, date },
+    });
+
+    if (existing) {
+      skipped++;
+    } else {
+      await prisma.holiday.create({
+        data: { year, date, name: h.name },
+      });
+      created++;
+      console.log(`  [holiday] Created: ${h.name} (${year}-${String(h.month).padStart(2, '0')}-${String(h.day).padStart(2, '0')})`);
+    }
+  }
+
+  if (skipped > 0) console.log(`  [holiday] Skipped ${skipped} existing holiday rows.`);
+  console.log(`  [holiday] Created ${created} new holiday rows for ${year}.`);
+}
+
 async function main(): Promise<void> {
   console.log('Nexora HRMS — Seed starting...\n');
 
@@ -394,6 +442,9 @@ async function main(): Promise<void> {
 
   console.log('\nSeeding admin leave balances (Phase 2)...');
   await seedAdminLeaveBalances();
+
+  console.log('\nSeeding holiday calendar (Phase 3)...');
+  await seedHolidays();
 
   console.log('\nSeed complete.');
 }

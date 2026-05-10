@@ -94,6 +94,11 @@ model Employee {
   leaveRequestsApproving  LeaveRequest[]     @relation("LeaveApprover")
   leaveBalances           LeaveBalance[]
   leaveBalanceLedger      LeaveBalanceLedger[] @relation("EmployeeLedger")
+  // Phase 3 — Attendance & Regularisation
+  attendanceRecords       AttendanceRecord[]  @relation("EmployeeAttendance")
+  regularisations         RegularisationRequest[] @relation("EmployeeRegularisations")
+  regularisationsApproving RegularisationRequest[] @relation("RegularisationApprover")
+  lateLedger              AttendanceLateLedger[] @relation("EmployeeLateLedger")
 
   @@index([email])
   @@index([reportingManagerId])
@@ -370,4 +375,147 @@ enum LedgerReason {
   CarryForward
   Adjustment
   Initial
+  LateMarkPenalty
+}
+
+// ── Phase 3 — Attendance & Regularisation ────────────────────────────────────
+
+/// BL-026: Status derivation priority: OnLeave > WeeklyOff/Holiday > Present > Absent.
+/// Stored without hyphens; mapped to contract enum (On-Leave, Weekly-Off) at boundary.
+enum AttendanceStatus {
+  Present
+  Absent
+  OnLeave
+  WeeklyOff
+  Holiday
+}
+
+/// BL-007: system = original midnight row; regularisation = corrected overlay row.
+/// BL-007 mandates: NEVER delete rows. Corrections append a new row.
+enum AttendanceSource {
+  system
+  regularisation
+}
+
+/// Regularisation request status — matches contract RegStatusSchema.
+enum RegStatusDb {
+  Pending
+  Approved
+  Rejected
+}
+
+/// Regularisation routing — matches contract RegRoutedToSchema.
+enum RegRoutedToDb {
+  Manager
+  Admin
+}
+
+/// Attendance record. BL-023: one row per active employee per day (default Absent).
+/// BL-007: rows are NEVER deleted. Regularisation corrections add a new row.
+/// UNIQUE (employeeId, date, source) so the system row and regularisation overlay coexist.
+model AttendanceRecord {
+  id                 String            @id @default(cuid())
+  employeeId         String
+  employee           Employee          @relation("EmployeeAttendance", fields: [employeeId], references: [id], onDelete: Cascade)
+  date               DateTime          @db.Date
+  status             AttendanceStatus
+  checkInTime        DateTime?
+  checkOutTime       DateTime?
+  /// Server-computed: (checkOutTime − checkInTime) in minutes. BL-025.
+  hoursWorkedMinutes Int?
+  /// BL-027: true when checkInTime > configured LATE_THRESHOLD.
+  late               Boolean           @default(false)
+  /// Running count of late marks in the calendar month at the time this row was last written.
+  lateMonthCount     Int               @default(0)
+  /// True when this Absent day incurs LOP at payroll time.
+  lopApplied         Boolean           @default(false)
+  /// BL-007: system = midnight-generated; regularisation = approved correction overlay.
+  source             AttendanceSource
+  /// Set when source = regularisation — links to the approving RegularisationRequest.
+  regularisationId   String?
+  regularisation     RegularisationRequest? @relation("AttendanceCorrection", fields: [regularisationId], references: [id], onDelete: SetNull)
+  createdAt          DateTime          @default(now())
+  /// Optimistic concurrency token (BL-034).
+  version            Int               @default(0)
+
+  @@unique([employeeId, date, source])
+  @@index([employeeId, date])
+  @@index([date, status])
+  @@map("attendance_records")
+}
+
+/// Regularisation request. BL-029: ≤7 days → Manager; >7 days → Admin.
+/// BL-010: cannot overlap an approved leave on the same date.
+model RegularisationRequest {
+  id                 String          @id @default(cuid())
+  /// Format: R-YYYY-NNNN
+  code               String          @unique
+  employeeId         String
+  employee           Employee        @relation("EmployeeRegularisations", fields: [employeeId], references: [id], onDelete: Cascade)
+  /// The date being corrected (always in the past).
+  date               DateTime        @db.Date
+  proposedCheckIn    DateTime?
+  proposedCheckOut   DateTime?
+  reason             String          @db.Text
+  status             RegStatusDb     @default(Pending)
+  /// BL-029: age-based routing (≤7d → Manager, >7d → Admin).
+  routedTo           RegRoutedToDb
+  /// Captured at submit time — snapshot for the audit trail.
+  ageDaysAtSubmit    Int
+  /// Current owner of the approval queue.
+  approverId         String?
+  approver           Employee?       @relation("RegularisationApprover", fields: [approverId], references: [id], onDelete: SetNull)
+  decidedAt          DateTime?
+  decidedBy          String?
+  decisionNote       String?         @db.Text
+  /// Link to the corrected AttendanceRecord row created on approval (BL-026).
+  correctedRecordId  String?
+  createdAt          DateTime        @default(now())
+  updatedAt          DateTime        @updatedAt
+  /// Optimistic concurrency token (BL-034).
+  version            Int             @default(0)
+
+  correctedRecord    AttendanceRecord[] @relation("AttendanceCorrection")
+
+  @@index([employeeId, date])
+  @@index([approverId, status])
+  @@index([status, routedTo])
+  @@map("regularisation_requests")
+}
+
+/// Counter table for generating R-YYYY-NNNN codes — mirrors LeaveCodeCounter.
+model RegCodeCounter {
+  year    Int @id
+  lastSeq Int @default(0)
+
+  @@map("reg_code_counters")
+}
+
+/// Tracks monthly late counts for BL-028 deduction logic.
+/// UNIQUE (employeeId, year, month) ensures idempotent upserts.
+model AttendanceLateLedger {
+  id         String   @id @default(cuid())
+  employeeId String
+  employee   Employee @relation("EmployeeLateLedger", fields: [employeeId], references: [id], onDelete: Cascade)
+  year       Int
+  /// 1-12 calendar month.
+  month      Int
+  /// Running count of late marks this employee has in this year/month.
+  count      Int      @default(0)
+
+  @@unique([employeeId, year, month])
+  @@map("attendance_late_ledger")
+}
+
+/// Holiday calendar. BL-026: holidays are identified via this table.
+/// Admin replaces the calendar per year via PUT /config/holidays.
+model Holiday {
+  id    String   @id @default(cuid())
+  year  Int
+  date  DateTime @db.Date
+  name  String   @db.VarChar(120)
+
+  @@unique([year, date])
+  @@index([date])
+  @@map("holidays")
 }

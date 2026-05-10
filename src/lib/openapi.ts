@@ -86,6 +86,33 @@ import {
   UpdateLeaveTypeRequestSchema,
   UpdateLeaveQuotaRequestSchema,
 } from '@nexora/contracts/leave';
+import {
+  AttendanceStatusSchema,
+  AttendanceSourceSchema,
+  AttendanceRecordSchema,
+  AttendanceCalendarItemSchema,
+  CheckInRequestSchema,
+  CheckInResponseSchema,
+  CheckOutRequestSchema,
+  CheckOutResponseSchema,
+  AttendanceListQuerySchema,
+  AttendanceListResponseSchema,
+  TodayAttendanceResponseSchema,
+  RegStatusSchema,
+  RegRoutedToSchema,
+  RegularisationRequestSchema,
+  RegularisationSummarySchema,
+  CreateRegularisationRequestSchema,
+  CreateRegularisationResponseSchema,
+  RegularisationListQuerySchema,
+  RegularisationListResponseSchema,
+  RegularisationDetailResponseSchema,
+  ApproveRegularisationRequestSchema,
+  RejectRegularisationRequestSchema,
+  HolidaySchema,
+  HolidayListResponseSchema,
+  ReplaceHolidaysRequestSchema,
+} from '@nexora/contracts/attendance';
 
 // Augment the local `z` with .openapi() — required before any registry call.
 extendZodWithOpenApi(z);
@@ -820,6 +847,328 @@ registry.registerPath({
     ...errorResponse(401, 'UNAUTHENTICATED.'),
     ...errorResponse(403, 'FORBIDDEN — Admin only.'),
     ...errorResponse(404, 'NOT_FOUND.'),
+  },
+});
+
+// ── Phase 3 — Attendance & Regularisation components ────────────────────────
+
+registry.register('AttendanceStatus', AttendanceStatusSchema);
+registry.register('AttendanceSource', AttendanceSourceSchema);
+registry.register('AttendanceRecord', AttendanceRecordSchema);
+registry.register('AttendanceCalendarItem', AttendanceCalendarItemSchema);
+registry.register('CheckInRequest', CheckInRequestSchema);
+registry.register('CheckInResponse', CheckInResponseSchema);
+registry.register('CheckOutRequest', CheckOutRequestSchema);
+registry.register('CheckOutResponse', CheckOutResponseSchema);
+registry.register('AttendanceListQuery', AttendanceListQuerySchema);
+registry.register('AttendanceListResponse', AttendanceListResponseSchema);
+registry.register('TodayAttendanceResponse', TodayAttendanceResponseSchema);
+registry.register('RegStatus', RegStatusSchema);
+registry.register('RegRoutedTo', RegRoutedToSchema);
+registry.register('RegularisationRequest', RegularisationRequestSchema);
+registry.register('RegularisationSummary', RegularisationSummarySchema);
+registry.register('CreateRegularisationRequest', CreateRegularisationRequestSchema);
+registry.register('CreateRegularisationResponse', CreateRegularisationResponseSchema);
+registry.register('RegularisationListQuery', RegularisationListQuerySchema);
+registry.register('RegularisationListResponse', RegularisationListResponseSchema);
+registry.register('RegularisationDetailResponse', RegularisationDetailResponseSchema);
+registry.register('ApproveRegularisationRequest', ApproveRegularisationRequestSchema);
+registry.register('RejectRegularisationRequest', RejectRegularisationRequestSchema);
+registry.register('Holiday', HolidaySchema);
+registry.register('HolidayListResponse', HolidayListResponseSchema);
+registry.register('ReplaceHolidaysRequest', ReplaceHolidaysRequestSchema);
+
+// ── Phase 3 — Attendance endpoints ──────────────────────────────────────────
+
+registry.registerPath({
+  method: 'post',
+  path: '/attendance/check-in',
+  tags: ['Attendance'],
+  summary: 'Record check-in for today (BL-027 / BL-028)',
+  description:
+    'Stamps the current server time as check-in. Idempotent — a second call returns ' +
+    'the existing record. Computes late mark against configured LATE_THRESHOLD (BL-027). ' +
+    'If the monthly late count reaches a multiple of 3, deducts 1 day from Annual leave (BL-028).',
+  security: [{ sessionCookie: [] }],
+  responses: {
+    200: {
+      description: 'Check-in recorded. lateMarkDeductionApplied=true when BL-028 fired.',
+      content: { 'application/json': { schema: CheckInResponseSchema } },
+    },
+    ...errorResponse(401, 'UNAUTHENTICATED.'),
+    ...errorResponse(500, 'INTERNAL_ERROR.'),
+  },
+});
+
+registry.registerPath({
+  method: 'post',
+  path: '/attendance/check-out',
+  tags: ['Attendance'],
+  summary: 'Record check-out for today (BL-025)',
+  description:
+    'Stamps the current server time as check-out. Requires an earlier check-in today (BL-024). ' +
+    'Computes hoursWorkedMinutes = checkOut − checkIn. Idempotent.',
+  security: [{ sessionCookie: [] }],
+  responses: {
+    200: {
+      description: 'Check-out recorded.',
+      content: { 'application/json': { schema: CheckOutResponseSchema } },
+    },
+    ...errorResponse(400, 'VALIDATION_FAILED — no check-in for today (BL-024).'),
+    ...errorResponse(401, 'UNAUTHENTICATED.'),
+    ...errorResponse(500, 'INTERNAL_ERROR.'),
+  },
+});
+
+registry.registerPath({
+  method: 'get',
+  path: '/attendance/me/today',
+  tags: ['Attendance'],
+  summary: "Today's attendance panel state",
+  description:
+    'Returns the check-in panel UI state: Ready (no check-in), Working (checked in), ' +
+    'Confirm (checked out). Also returns the configured lateThreshold and standardDailyHours (BL-025a).',
+  security: [{ sessionCookie: [] }],
+  responses: {
+    200: {
+      description: "Today's attendance record and panel state.",
+      content: { 'application/json': { schema: TodayAttendanceResponseSchema } },
+    },
+    ...errorResponse(401, 'UNAUTHENTICATED.'),
+  },
+});
+
+registry.registerPath({
+  method: 'get',
+  path: '/attendance/me',
+  tags: ['Attendance'],
+  summary: 'Own attendance history (calendar month default)',
+  description: 'Returns attendance records for the requesting employee. ' +
+    'Defaults to the current calendar month. Supports date range (?from, ?to) or single day (?date).',
+  security: [{ sessionCookie: [] }],
+  request: { params: z.object({}), query: AttendanceListQuerySchema },
+  responses: {
+    200: {
+      description: 'Attendance records.',
+      content: { 'application/json': { schema: AttendanceListResponseSchema } },
+    },
+    ...errorResponse(400, 'VALIDATION_FAILED.'),
+    ...errorResponse(401, 'UNAUTHENTICATED.'),
+  },
+});
+
+registry.registerPath({
+  method: 'get',
+  path: '/attendance/team',
+  tags: ['Attendance'],
+  summary: "Team attendance (Manager's subordinates)",
+  description: 'Returns attendance for all direct and indirect reports of the requesting Manager. ' +
+    'Optional ?employeeId restricts to one team member.',
+  security: [{ sessionCookie: [] }],
+  request: { params: z.object({}), query: AttendanceListQuerySchema },
+  responses: {
+    200: {
+      description: 'Team attendance records.',
+      content: { 'application/json': { schema: AttendanceListResponseSchema } },
+    },
+    ...errorResponse(401, 'UNAUTHENTICATED.'),
+    ...errorResponse(403, 'FORBIDDEN — Manager or Admin only.'),
+  },
+});
+
+registry.registerPath({
+  method: 'get',
+  path: '/attendance',
+  tags: ['Attendance'],
+  summary: 'Org-wide attendance (Admin)',
+  description: 'Returns attendance for all employees. Optional ?department and ?employeeId filters.',
+  security: [{ sessionCookie: [] }],
+  request: { params: z.object({}), query: AttendanceListQuerySchema },
+  responses: {
+    200: {
+      description: 'Org-wide attendance records.',
+      content: { 'application/json': { schema: AttendanceListResponseSchema } },
+    },
+    ...errorResponse(401, 'UNAUTHENTICATED.'),
+    ...errorResponse(403, 'FORBIDDEN — Admin only.'),
+  },
+});
+
+// ── Phase 3 — Regularisation endpoints ──────────────────────────────────────
+
+registry.registerPath({
+  method: 'post',
+  path: '/regularisations',
+  tags: ['Regularisation'],
+  summary: 'Submit a regularisation request (BL-010 / BL-029)',
+  description:
+    'Submits a request to correct a past attendance record. ' +
+    'BL-010: rejected with LEAVE_REG_CONFLICT if an approved leave already covers the date. ' +
+    'BL-029: requests ≤7 days old route to the reporting Manager; >7 days route to Admin.',
+  security: [{ sessionCookie: [] }],
+  request: {
+    body: {
+      required: true,
+      content: { 'application/json': { schema: CreateRegularisationRequestSchema } },
+    },
+  },
+  responses: {
+    201: {
+      description: 'Regularisation submitted.',
+      content: { 'application/json': { schema: CreateRegularisationResponseSchema } },
+    },
+    ...errorResponse(400, 'VALIDATION_FAILED — date not in past or check-in/out invalid.'),
+    ...errorResponse(401, 'UNAUTHENTICATED.'),
+    ...errorResponse(409, 'LEAVE_REG_CONFLICT — approved leave covers this date (BL-010, DN-19).'),
+  },
+});
+
+registry.registerPath({
+  method: 'get',
+  path: '/regularisations',
+  tags: ['Regularisation'],
+  summary: 'List regularisation requests (role-scoped)',
+  description:
+    'Employee: own requests only. ' +
+    'Manager: own + subordinates\' requests where approverId=self. ' +
+    'Admin: all requests; optional ?routedTo=Admin filter. ' +
+    'PayrollOfficer: own requests only.',
+  security: [{ sessionCookie: [] }],
+  request: { params: z.object({}), query: RegularisationListQuerySchema },
+  responses: {
+    200: {
+      description: 'Scoped list of regularisation requests.',
+      content: { 'application/json': { schema: RegularisationListResponseSchema } },
+    },
+    ...errorResponse(401, 'UNAUTHENTICATED.'),
+  },
+});
+
+registry.registerPath({
+  method: 'get',
+  path: '/regularisations/{id}',
+  tags: ['Regularisation'],
+  summary: 'Get regularisation detail',
+  description:
+    'Visible to: the employee owner, the current approver, a chain manager, or Admin. ' +
+    'Returns 404 (not 403) when the caller cannot see the record.',
+  security: [{ sessionCookie: [] }],
+  request: { params: z.object({ id: z.string() }) },
+  responses: {
+    200: {
+      description: 'Regularisation detail.',
+      content: { 'application/json': { schema: RegularisationDetailResponseSchema } },
+    },
+    ...errorResponse(401, 'UNAUTHENTICATED.'),
+    ...errorResponse(404, 'NOT_FOUND — not found or not visible.'),
+  },
+});
+
+registry.registerPath({
+  method: 'post',
+  path: '/regularisations/{id}/approve',
+  tags: ['Regularisation'],
+  summary: 'Approve a regularisation request',
+  description:
+    'Allowed for: (Manager AND approverId == self) OR Admin. ' +
+    'Creates a new AttendanceRecord row with source=regularisation (BL-007). ' +
+    'Original system row is preserved. Version required for optimistic concurrency (BL-034).',
+  security: [{ sessionCookie: [] }],
+  request: {
+    params: z.object({ id: z.string() }),
+    body: {
+      required: true,
+      content: { 'application/json': { schema: ApproveRegularisationRequestSchema } },
+    },
+  },
+  responses: {
+    200: {
+      description: 'Approved — corrected attendance row created.',
+      content: { 'application/json': { schema: RegularisationDetailResponseSchema } },
+    },
+    ...errorResponse(400, 'VALIDATION_FAILED — already decided.'),
+    ...errorResponse(401, 'UNAUTHENTICATED.'),
+    ...errorResponse(403, 'FORBIDDEN — not the assigned approver.'),
+    ...errorResponse(404, 'NOT_FOUND.'),
+    ...errorResponse(409, 'VERSION_MISMATCH — stale version (BL-034).'),
+  },
+});
+
+registry.registerPath({
+  method: 'post',
+  path: '/regularisations/{id}/reject',
+  tags: ['Regularisation'],
+  summary: 'Reject a regularisation request',
+  description:
+    'Allowed for: (Manager AND approverId == self) OR Admin. ' +
+    'Note is required (TC-REG-005). Version required for optimistic concurrency (BL-034).',
+  security: [{ sessionCookie: [] }],
+  request: {
+    params: z.object({ id: z.string() }),
+    body: {
+      required: true,
+      content: { 'application/json': { schema: RejectRegularisationRequestSchema } },
+    },
+  },
+  responses: {
+    200: {
+      description: 'Rejected.',
+      content: { 'application/json': { schema: RegularisationDetailResponseSchema } },
+    },
+    ...errorResponse(400, 'VALIDATION_FAILED — already decided.'),
+    ...errorResponse(401, 'UNAUTHENTICATED.'),
+    ...errorResponse(403, 'FORBIDDEN — not the assigned approver.'),
+    ...errorResponse(404, 'NOT_FOUND.'),
+    ...errorResponse(409, 'VERSION_MISMATCH — stale version (BL-034).'),
+  },
+});
+
+// ── Phase 3 — Holiday endpoints ──────────────────────────────────────────────
+
+registry.registerPath({
+  method: 'get',
+  path: '/config/holidays',
+  tags: ['Holidays'],
+  summary: 'Get public holiday calendar for a year',
+  description: 'Returns all holiday rows for the given year (default: current year). ' +
+    'Available to all signed-in users — used by the client for status derivation (BL-026).',
+  security: [{ sessionCookie: [] }],
+  request: {
+    params: z.object({}),
+    query: z.object({ year: z.coerce.number().int().min(2000).max(2999).optional() }),
+  },
+  responses: {
+    200: {
+      description: 'Holiday list for the year.',
+      content: { 'application/json': { schema: HolidayListResponseSchema } },
+    },
+    ...errorResponse(401, 'UNAUTHENTICATED.'),
+  },
+});
+
+registry.registerPath({
+  method: 'put',
+  path: '/config/holidays',
+  tags: ['Holidays'],
+  summary: 'Replace the holiday calendar for a year (Admin)',
+  description: 'Atomically replaces all holiday rows for the given year. ' +
+    'Deletes existing rows for the year and re-inserts the provided list. ' +
+    'Audits config.holidays.replace.',
+  security: [{ sessionCookie: [] }],
+  request: {
+    body: {
+      required: true,
+      content: { 'application/json': { schema: ReplaceHolidaysRequestSchema } },
+    },
+  },
+  responses: {
+    200: {
+      description: 'Replaced — returns the new holiday list.',
+      content: { 'application/json': { schema: HolidayListResponseSchema } },
+    },
+    ...errorResponse(400, 'VALIDATION_FAILED.'),
+    ...errorResponse(401, 'UNAUTHENTICATED.'),
+    ...errorResponse(403, 'FORBIDDEN — Admin only.'),
   },
 });
 
