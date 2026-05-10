@@ -17,6 +17,7 @@
 import type { Prisma } from '@prisma/client';
 import { prisma } from '../../lib/prisma.js';
 import { audit } from '../../lib/audit.js';
+import { notify } from '../../lib/notifications.js';
 import { ErrorCode, errorEnvelope } from '@nexora/contracts/errors';
 import type { ErrorEnvelope } from '@nexora/contracts/errors';
 import type { CreateCycleRequest } from '@nexora/contracts/performance';
@@ -391,6 +392,29 @@ export async function createCycle(
     },
   });
 
+  // Notify each participant (not mid-cycle joiners) about the new cycle
+  // and their self-review deadline. Fetch review IDs for per-employee links.
+  if (participants.length > 0) {
+    const reviews = await tx.performanceReview.findMany({
+      where: { cycleId: cycle.id, isMidCycleJoiner: false },
+      select: { id: true, employeeId: true },
+    });
+    const reviewByEmployee = new Map(reviews.map((r) => [r.employeeId, r.id]));
+    const selfDeadlineStr = selfDeadline.toISOString().split('T')[0];
+
+    for (const emp of participants) {
+      const reviewId = reviewByEmployee.get(emp.id);
+      await notify({
+        tx,
+        recipientIds: emp.id,
+        category: 'Performance',
+        title: `Performance cycle ${cycle.code} is open — self-review due by ${selfDeadlineStr}`,
+        body: `A new performance cycle (${cycle.code}) has been opened. Please complete your self-review by ${selfDeadlineStr}.`,
+        link: reviewId ? `/employee/performance/${reviewId}` : '/employee/performance',
+      });
+    }
+  }
+
   return {
     data: {
       cycle: shapeCycle(cycle),
@@ -490,6 +514,23 @@ export async function closeCycle(
     before: { status: mapCycleStatus(cycle.status), version: cycle.version },
     after: { status: 'Closed', closedAt: now.toISOString(), lockedReviews },
   });
+
+  // Notify all participants that the cycle is closed
+  const participantReviews = await tx.performanceReview.findMany({
+    where: { cycleId },
+    select: { employeeId: true },
+  });
+  const participantIds = Array.from(new Set(participantReviews.map((r) => r.employeeId)));
+  if (participantIds.length > 0) {
+    await notify({
+      tx,
+      recipientIds: participantIds,
+      category: 'Performance',
+      title: `Performance cycle ${updated.code} is closed`,
+      body: `The performance cycle ${updated.code} has been closed. Final ratings have been locked.`,
+      link: '/employee/performance',
+    });
+  }
 
   return { data: { cycle: shapeCycle(updated), lockedReviews } };
 }
@@ -835,6 +876,18 @@ export async function submitSelfRating(
     after: { selfRating, selfNote: selfNote ?? null, selfSubmittedAt: now.toISOString() },
   });
 
+  // Notify the assigned manager that the employee submitted their self-rating
+  if (updated.managerId) {
+    await notify({
+      tx,
+      recipientIds: updated.managerId,
+      category: 'Performance',
+      title: `${updated.employee.name} submitted their self-rating`,
+      body: `${updated.employee.name} has submitted their self-rating for performance cycle ${updated.cycle.code}. You can now review and submit your manager rating.`,
+      link: `/manager/performance/${reviewId}`,
+    });
+  }
+
   return { data: shapeReviewDetail(updated) };
 }
 
@@ -992,6 +1045,16 @@ export async function submitManagerRating(
     },
   });
 
+  // Notify the employee that their manager has submitted their performance rating
+  await notify({
+    tx,
+    recipientIds: updated.employeeId,
+    category: 'Performance',
+    title: 'Your manager submitted your performance rating',
+    body: `Your manager has submitted your performance rating for cycle ${updated.cycle.code}.`,
+    link: `/employee/performance/${reviewId}`,
+  });
+
   return { data: shapeReviewDetail(updated) };
 }
 
@@ -1019,6 +1082,23 @@ export async function handleManagerChange(
     select: { id: true, managerId: true, version: true },
   });
 
+  // Fetch employee name once for notification messages
+  const empRow = await tx.employee.findUnique({
+    where: { id: employeeId },
+    select: { name: true },
+  });
+  const employeeName = empRow?.name ?? 'An employee';
+
+  // Fetch new manager name for the message
+  let newManagerName: string | null = null;
+  if (newManagerId) {
+    const newMgr = await tx.employee.findUnique({
+      where: { id: newManagerId },
+      select: { name: true },
+    });
+    newManagerName = newMgr?.name ?? null;
+  }
+
   for (const r of activeReviews) {
     await tx.performanceReview.update({
       where: { id: r.id },
@@ -1041,6 +1121,22 @@ export async function handleManagerChange(
       before: { managerId: r.managerId },
       after: { managerId: newManagerId, previousManagerId: r.managerId },
     });
+
+    // Notify old manager and new manager about the review reassignment (BL-042)
+    const notifyIds = [r.managerId, newManagerId].filter(
+      (id): id is string => id !== null && id !== undefined,
+    );
+    if (notifyIds.length > 0) {
+      const reviewedByMsg = newManagerName ? ` to ${newManagerName}` : '';
+      await notify({
+        tx,
+        recipientIds: notifyIds,
+        category: 'Performance',
+        title: `Performance review for ${employeeName} was reassigned`,
+        body: `The performance review for ${employeeName} has been reassigned${reviewedByMsg}.`,
+        link: `/manager/performance/${r.id}`,
+      });
+    }
   }
 }
 

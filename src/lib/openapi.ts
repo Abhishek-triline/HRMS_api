@@ -173,6 +173,15 @@ import {
   MissingReviewItemSchema,
   MissingReviewsResponseSchema,
 } from '@nexora/contracts/performance';
+import {
+  NotificationCategorySchema,
+  NotificationSchema,
+  NotificationListQuerySchema,
+  NotificationListResponseSchema,
+  MarkReadRequestSchema,
+  MarkReadResponseSchema,
+  UnreadCountResponseSchema,
+} from '@nexora/contracts/notifications';
 
 // Augment the local `z` with .openapi() — required before any registry call.
 extendZodWithOpenApi(z);
@@ -1849,6 +1858,85 @@ registry.registerPath({
     ...errorResponse(403, 'FORBIDDEN — not assigned manager or Admin.'),
     ...errorResponse(404, 'NOT_FOUND.'),
     ...errorResponse(409, 'CYCLE_CLOSED, CYCLE_PHASE (outside deadline), or VERSION_MISMATCH.'),
+  },
+});
+
+// ── Phase 6 — Notifications ──────────────────────────────────────────────────
+
+registry.register('NotificationCategory', NotificationCategorySchema);
+registry.register('Notification', NotificationSchema);
+registry.register('NotificationListQuery', NotificationListQuerySchema);
+registry.register('NotificationListResponse', NotificationListResponseSchema);
+registry.register('MarkReadRequest', MarkReadRequestSchema);
+registry.register('MarkReadResponse', MarkReadResponseSchema);
+registry.register('UnreadCountResponse', UnreadCountResponseSchema);
+
+// GET /notifications
+registry.registerPath({
+  method: 'get',
+  path: '/notifications',
+  tags: ['Notifications'],
+  summary: 'List own notification feed',
+  description:
+    'Returns the authenticated user\'s notification feed, newest first. ' +
+    'BL-044: always scoped to recipientId = current user — no cross-user exposure. ' +
+    'Cursor-paginated. Supports ?category, ?unread, and ?since filters.',
+  security: [{ sessionCookie: [] }],
+  request: {
+    query: NotificationListQuerySchema,
+  },
+  responses: {
+    200: {
+      description: 'Notification feed returned.',
+      content: { 'application/json': { schema: NotificationListResponseSchema } },
+    },
+    ...errorResponse(401, 'UNAUTHENTICATED.'),
+  },
+});
+
+// POST /notifications/mark-read
+registry.registerPath({
+  method: 'post',
+  path: '/notifications/mark-read',
+  tags: ['Notifications'],
+  summary: 'Mark notifications as read',
+  description:
+    'Mark specific notification IDs or ALL unread items as read. ' +
+    'BL-044: intersection with recipientId = current user is always enforced — ' +
+    'a caller cannot affect another user\'s feed. Returns the number of rows updated.',
+  security: [{ sessionCookie: [] }],
+  request: {
+    body: {
+      required: true,
+      content: { 'application/json': { schema: MarkReadRequestSchema } },
+    },
+  },
+  responses: {
+    200: {
+      description: 'Notifications marked as read.',
+      content: { 'application/json': { schema: MarkReadResponseSchema } },
+    },
+    ...errorResponse(400, 'VALIDATION_FAILED — body does not match schema.'),
+    ...errorResponse(401, 'UNAUTHENTICATED.'),
+  },
+});
+
+// GET /notifications/unread-count
+registry.registerPath({
+  method: 'get',
+  path: '/notifications/unread-count',
+  tags: ['Notifications'],
+  summary: 'Get unread notification count',
+  description:
+    'Lightweight count(*) query for the header bell icon. ' +
+    'BL-044: always scoped to the authenticated user.',
+  security: [{ sessionCookie: [] }],
+  responses: {
+    200: {
+      description: 'Unread count returned.',
+      content: { 'application/json': { schema: UnreadCountResponseSchema } },
+    },
+    ...errorResponse(401, 'UNAUTHENTICATED.'),
   },
 });
 

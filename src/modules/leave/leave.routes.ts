@@ -50,6 +50,7 @@ import {
 import { generateLeaveCode } from './leaveCode.js';
 import { getSubordinateIds } from '../employees/hierarchy.js';
 import { logger } from '../../lib/logger.js';
+import { notify } from '../../lib/notifications.js';
 
 // ── Router ────────────────────────────────────────────────────────────────────
 
@@ -689,6 +690,16 @@ leaveRouter.post(
           },
         });
 
+        // Notify the approver — Manager or Admin (BL-044: scoped to approver)
+        await notify({
+          tx,
+          recipientIds: routing.approverId,
+          category: 'Leave',
+          title: `New leave request from ${created.employee.name}`,
+          body: `${type} leave for ${days} day(s) (${fromDateStr} to ${toDateStr}) is pending your approval.`,
+          link: `/${routing.routedTo === 'Manager' ? 'manager' : 'admin'}/leave-queue/${created.id}`,
+        });
+
         return created;
       });
     } catch (err: unknown) {
@@ -924,6 +935,16 @@ leaveRouter.post(
         after: { status: 'Approved', deductedDays: result.deductedDays },
       });
 
+      // Notify the employee that their leave was approved
+      await notify({
+        tx,
+        recipientIds: result.employeeId,
+        category: 'Leave',
+        title: 'Your leave request was approved',
+        body: `${result.leaveType.name} leave for ${result.days} day(s) (${result.fromDate.toISOString().split('T')[0]} to ${result.toDate.toISOString().split('T')[0]}) was approved by ${user.role === 'Admin' ? 'Admin' : result.approver?.name ?? 'your manager'}.`,
+        link: `/employee/leave/${id}`,
+      });
+
       return result;
     });
 
@@ -998,6 +1019,16 @@ leaveRouter.post(
         module: 'leave',
         before: { status: request.status, version: request.version },
         after: { status: 'Rejected', decisionNote: note },
+      });
+
+      // Notify the employee that their leave was rejected
+      await notify({
+        tx,
+        recipientIds: result.employeeId,
+        category: 'Leave',
+        title: 'Your leave request was rejected',
+        body: `${result.leaveType.name} leave request (${result.fromDate.toISOString().split('T')[0]} to ${result.toDate.toISOString().split('T')[0]}) was rejected${note ? ` — ${note}` : ''}.`,
+        link: `/employee/leave/${id}`,
       });
 
       return result;
@@ -1114,6 +1145,18 @@ leaveRouter.post(
           restoredDays: result.restoredDays,
           cancelledAfterStart: result.request.cancelledAfterStart,
         },
+      });
+
+      // Notify the employee of the cancellation and any restored days
+      const restoredMsg = result.restoredDays > 0
+        ? ` ${result.restoredDays} day(s) restored to your balance.`
+        : '';
+      await notify({
+        tx,
+        recipientIds: result.request.employeeId,
+        category: 'Leave',
+        title: 'Your leave was cancelled',
+        body: `${result.request.leaveType.name} leave (${result.request.fromDate.toISOString().split('T')[0]} to ${result.request.toDate.toISOString().split('T')[0]}) has been cancelled.${restoredMsg}`,
       });
 
       return result;

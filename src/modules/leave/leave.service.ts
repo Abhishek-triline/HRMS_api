@@ -26,6 +26,7 @@ import { prisma as defaultPrisma } from '../../lib/prisma.js';
 import { addWorkingDays, workingDaysBetween } from './workingDays.js';
 import { logger } from '../../lib/logger.js';
 import { audit } from '../../lib/audit.js';
+import { notify } from '../../lib/notifications.js';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -590,6 +591,24 @@ export async function escalateStaleRequests(
         escalatedAt: now.toISOString(),
         reason: approverExited ? 'approver_exited' : 'sla_breach',
       },
+    });
+
+    // Notify all Active Admins AND the employee about the escalation
+    const activeAdmins = await tx.employee.findMany({
+      where: { role: 'Admin', status: 'Active' },
+      select: { id: true },
+    });
+    const adminIds = activeAdmins.map((a) => a.id);
+
+    const recipientIds = Array.from(new Set([...adminIds, req.employeeId]));
+
+    await notify({
+      tx,
+      recipientIds,
+      category: 'Leave',
+      title: 'Leave request escalated to Admin (5-working-day SLA)',
+      body: `Leave request ${req.code} has been escalated to Admin because the 5-working-day SLA was breached.`,
+      link: `/admin/leave-queue/${req.id}`,
     });
 
     logger.info(

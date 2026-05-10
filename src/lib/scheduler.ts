@@ -181,7 +181,42 @@ export function startScheduler(): void {
     },
   );
 
+  // ── notifications.archive-90d — daily 03:30 IST ───────────────────────────
+  // BL-045: delete Notification rows older than NOTIFICATION_RETENTION_DAYS
+  // (default 90). The source audit_log rows are NEVER affected. No audit entry
+  // is written for this cleanup — it's a sweep of derived data (BL-045).
+  cron.schedule(
+    '30 3 * * *',
+    async () => {
+      const jobId = 'notifications.archive-90d';
+      logger.info({ job: jobId }, 'Starting notification retention sweep');
+
+      try {
+        // Read retention days from configuration (default 90 per BL-045)
+        const config = await prisma.configuration.findUnique({
+          where: { key: 'NOTIFICATION_RETENTION_DAYS' },
+        });
+        const retentionDays = (config?.value as number) ?? 90;
+        const cutoff = new Date(Date.now() - retentionDays * 24 * 60 * 60 * 1000);
+
+        const deleted = await prisma.notification.deleteMany({
+          where: { createdAt: { lt: cutoff } },
+        });
+
+        logger.info(
+          { job: jobId, retentionDays, cutoff: cutoff.toISOString(), deletedCount: deleted.count },
+          `Notification retention sweep complete — ${deleted.count} rows deleted`,
+        );
+      } catch (err: unknown) {
+        logger.error({ job: jobId, err }, 'Notification retention sweep failed — server continues normally');
+      }
+    },
+    {
+      timezone: 'Asia/Kolkata',
+    },
+  );
+
   logger.info(
-    'Scheduled jobs started: attendance.midnight-generate (daily 00:00 IST), leave.escalation-sweep (hourly), leave.carry-forward (Jan 1 00:05 IST), idempotency-key.cleanup (daily 03:00 IST)',
+    'Scheduled jobs started: attendance.midnight-generate (daily 00:00 IST), leave.escalation-sweep (hourly), leave.carry-forward (Jan 1 00:05 IST), idempotency-key.cleanup (daily 03:00 IST), notifications.archive-90d (daily 03:30 IST)',
   );
 }

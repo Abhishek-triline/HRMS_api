@@ -14,6 +14,7 @@ import { regularisationsRouter } from './modules/attendance/regularisations.rout
 import { holidaysRouter } from './modules/attendance/holidays.routes.js';
 import { payrollRouter, payslipsRouter, taxConfigRouter } from './modules/payroll/payroll.routes.js';
 import { performanceRouter } from './modules/performance/performance.routes.js';
+import { notificationsRouter } from './modules/notifications/notifications.routes.js';
 import { openApiSpec } from './lib/openapi.js';
 
 const v1Router = Router();
@@ -70,8 +71,7 @@ v1Router.use('/config/tax', taxConfigRouter);
 // Phase 5 — Performance Reviews
 v1Router.use('/performance', performanceRouter);
 
-// Phase 6+ modules will be mounted here:
-// v1Router.use('/notifications', notificationsRouter);
-// v1Router.use('/audit', auditRouter);
+// Phase 6 — Notifications
+v1Router.use('/notifications', notificationsRouter);
 
 export { v1Router };

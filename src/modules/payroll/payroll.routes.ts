@@ -54,6 +54,7 @@ import {
 } from './payrollCode.js';
 import { acquireRunLock } from './concurrencyGuard.js';
 import { streamPayslipPDF } from './payslip.pdf.js';
+import { notify } from '../../lib/notifications.js';
 
 // ── Routers ───────────────────────────────────────────────────────────────────
 
@@ -384,6 +385,37 @@ payrollRouter.post(
       return;
     }
 
+    // Notify all PayrollOfficer employees about the new run (batched, outside tx)
+    const payrollOfficers = await prisma.employee.findMany({
+      where: { role: 'PayrollOfficer', status: 'Active' },
+      select: { id: true },
+    });
+    if (payrollOfficers.length > 0) {
+      const monthLabel = `${result.run.year}-${String(result.run.month).padStart(2, '0')}`;
+      await notify({
+        recipientIds: payrollOfficers.map((p) => p.id),
+        category: 'Payroll',
+        title: `New payroll run ${result.run.code} ready for review`,
+        body: `Payroll run ${result.run.code} for ${monthLabel} has been created and is ready for tax review.`,
+        link: `/payroll/payroll-runs/${result.run.id}`,
+      });
+    }
+
+    // Notify all Active employees that payroll is being processed
+    const activeEmployees = await prisma.employee.findMany({
+      where: { status: { in: ['Active', 'OnNotice'] } },
+      select: { id: true },
+    });
+    if (activeEmployees.length > 0) {
+      const monthLabel = new Date(result.run.year, result.run.month - 1, 1).toLocaleString('en-IN', { month: 'long', year: 'numeric' });
+      await notify({
+        recipientIds: activeEmployees.map((e) => e.id),
+        category: 'Payroll',
+        title: `Payroll for ${monthLabel} is being processed`,
+        body: `The payroll run for ${monthLabel} has started. Your payslip will be available once finalised.`,
+      });
+    }
+
     res.status(201).json({
       data: {
         run: formatRun(fullRun),
@@ -651,6 +683,30 @@ payrollRouter.post(
       include: runInclude,
     });
 
+    // Notify all employees whose payslip was in this run that it's ready
+    const finalizedPayslips = await prisma.payslip.findMany({
+      where: { runId: id, status: 'Finalised', reversalOfPayslipId: null },
+      select: { id: true, employeeId: true, month: true, year: true },
+    });
+
+    if (finalizedPayslips.length > 0) {
+      // Fan-out: one notification per employee payslip
+      const monthLabel = new Date(finalizedPayslips[0]!.year, finalizedPayslips[0]!.month - 1, 1)
+        .toLocaleString('en-IN', { month: 'long', year: 'numeric' });
+
+      await Promise.all(
+        finalizedPayslips.map((slip) =>
+          notify({
+            recipientIds: slip.employeeId,
+            category: 'Payroll',
+            title: `Your payslip for ${monthLabel} is ready`,
+            body: `Your payslip for ${monthLabel} has been finalised. You can view and download it now.`,
+            link: `/employee/payslips/${slip.id}`,
+          }),
+        ),
+      );
+    }
+
     res.status(200).json({ data: { run: formatRun(fullRun ?? finalisedRun) } });
   },
 );
@@ -821,6 +877,30 @@ payrollRouter.post(
     if (!fullReversalRun) {
       res.status(500).json(errorEnvelope(ErrorCode.INTERNAL_ERROR, 'Failed to load reversal run.'));
       return;
+    }
+
+    // Notify Admins + affected employees about the reversal
+    const [admins, reversalPayslips] = await Promise.all([
+      prisma.employee.findMany({ where: { role: 'Admin', status: 'Active' }, select: { id: true } }),
+      prisma.payslip.findMany({
+        where: { runId: result.reversalRun.id },
+        select: { employeeId: true },
+      }),
+    ]);
+
+    const adminIds = admins.map((a) => a.id);
+    const affectedEmployeeIds = Array.from(new Set(reversalPayslips.map((s) => s.employeeId)));
+    const monthLabel = new Date(result.reversalRun.year, result.reversalRun.month - 1, 1)
+      .toLocaleString('en-IN', { month: 'long', year: 'numeric' });
+
+    const allReversalRecipients = Array.from(new Set([...adminIds, ...affectedEmployeeIds]));
+    if (allReversalRecipients.length > 0) {
+      await notify({
+        recipientIds: allReversalRecipients,
+        category: 'Payroll',
+        title: `Payroll for ${monthLabel} was reversed`,
+        body: `Payroll run ${result.reversalRun.code} for ${monthLabel} was reversed by Admin: ${reason}.`,
+      });
     }
 
     res.status(201).json({
@@ -1216,6 +1296,22 @@ taxConfigRouter.patch(
 
       return row;
     });
+
+    // Notify all PayrollOfficers that the tax reference rate changed
+    const payrollOfficers = await prisma.employee.findMany({
+      where: { role: 'PayrollOfficer', status: 'Active' },
+      select: { id: true },
+    });
+    if (payrollOfficers.length > 0) {
+      const ratePercent = (referenceRate * 100).toFixed(2);
+      await notify({
+        recipientIds: payrollOfficers.map((p) => p.id),
+        category: 'Configuration',
+        title: `Tax reference rate changed to ${ratePercent}%`,
+        body: `The standard tax reference rate has been updated to ${ratePercent}% by Admin.`,
+        link: '/payroll/config/tax',
+      });
+    }
 
     res.status(200).json({
       data: {

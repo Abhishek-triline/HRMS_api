@@ -54,6 +54,7 @@ import {
   getPastTeamMembers,
 } from './hierarchy.js';
 import { handleManagerChange } from '../performance/performance.service.js';
+import { notify } from '../../lib/notifications.js';
 
 const router = Router();
 
@@ -886,6 +887,35 @@ router.post(
           },
         });
 
+        // Notify Admin + reporting manager when an employee is marked as Exited
+        if (body.status === 'Exited') {
+          const notifyTargets: string[] = [];
+
+          // All active Admins
+          const admins = await tx.employee.findMany({
+            where: { role: 'Admin', status: 'Active' },
+            select: { id: true },
+          });
+          notifyTargets.push(...admins.map((a) => a.id));
+
+          // Reporting manager (if any, and not the exited employee themselves)
+          if (current.reportingManagerId && current.reportingManagerId !== id) {
+            notifyTargets.push(current.reportingManagerId);
+          }
+
+          const uniqueTargets = Array.from(new Set(notifyTargets));
+          if (uniqueTargets.length > 0) {
+            await notify({
+              tx,
+              recipientIds: uniqueTargets,
+              category: 'Status',
+              title: `${current.name} marked as Exited`,
+              body: `${current.name} (${current.code}) has been marked as Exited effective ${body.effectiveDate}.`,
+              link: `/admin/employees/${id}`,
+            });
+          }
+        }
+
         return u;
       });
 
@@ -1017,6 +1047,31 @@ router.post(
             note: body.note ?? null,
           },
         });
+
+        // Notify old manager and new manager about the reassignment
+        const reassignTargets = [oldManagerId, body.newManagerId].filter(
+          (mid): mid is string => mid !== null && mid !== undefined,
+        );
+        if (reassignTargets.length > 0) {
+          // Fetch new manager name for the message
+          let newMgrName: string | null = null;
+          if (body.newManagerId) {
+            const newMgr = await tx.employee.findUnique({
+              where: { id: body.newManagerId },
+              select: { name: true },
+            });
+            newMgrName = newMgr?.name ?? null;
+          }
+          const toMgrMsg = newMgrName ? ` to ${newMgrName}` : '';
+          await notify({
+            tx,
+            recipientIds: Array.from(new Set(reassignTargets)),
+            category: 'Status',
+            title: `${current.name} has been reassigned`,
+            body: `${current.name} (${current.code}) has been reassigned${toMgrMsg}.`,
+            link: `/admin/employees/${id}`,
+          });
+        }
 
         return u;
       });

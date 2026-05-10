@@ -19,6 +19,7 @@
 import type { Prisma } from '@prisma/client';
 import { prisma as defaultPrisma } from '../../lib/prisma.js';
 import { audit } from '../../lib/audit.js';
+import { notify } from '../../lib/notifications.js';
 import { logger } from '../../lib/logger.js';
 import { isHoliday, isWeeklyOff } from './holidays.js';
 import {
@@ -486,6 +487,16 @@ async function deductLateMarkPenalty(
     },
   });
 
+  // Notify the employee about the late-mark deduction (BL-028)
+  await notify({
+    tx,
+    recipientIds: employeeId,
+    category: 'Attendance',
+    title: 'Late-mark deduction applied',
+    body: '1 day has been deducted from your Annual leave balance due to repeated late check-ins this month (BL-028).',
+    link: '/employee/attendance',
+  });
+
   return true;
 }
 
@@ -729,6 +740,18 @@ export async function submitRegularisation(
     },
   });
 
+  // Notify the approver about the new regularisation request
+  if (approverId) {
+    await notify({
+      tx,
+      recipientIds: approverId,
+      category: 'Attendance',
+      title: `Regularisation request from ${reg.employee.name}`,
+      body: `Regularisation request ${code} for ${dateOnly.toISOString().split('T')[0]} is pending your approval.`,
+      link: `/${routedTo === 'Manager' ? 'manager' : 'admin'}/regularisations/${reg.id}`,
+    });
+  }
+
   return reg;
 }
 
@@ -852,6 +875,16 @@ export async function approveRegularisation(
     },
   });
 
+  // Notify the employee that their regularisation was approved
+  await notify({
+    tx,
+    recipientIds: reg.employeeId,
+    category: 'Attendance',
+    title: 'Your regularisation request was approved',
+    body: `Regularisation for ${dateOnly.toISOString().split('T')[0]} has been approved. Your attendance record has been corrected.`,
+    link: `/employee/regularisations/${reg.id}`,
+  });
+
   return updated;
 }
 
@@ -904,6 +937,16 @@ export async function rejectRegularisation(
       decidedAt: now.toISOString(),
       note,
     },
+  });
+
+  // Notify the employee that their regularisation was rejected
+  await notify({
+    tx,
+    recipientIds: updated.employeeId,
+    category: 'Attendance',
+    title: 'Your regularisation request was rejected',
+    body: `Regularisation for ${updated.date.toISOString().split('T')[0]} was rejected${note ? ` — ${note}` : ''}.`,
+    link: `/employee/regularisations/${reg.id}`,
   });
 
   return updated;

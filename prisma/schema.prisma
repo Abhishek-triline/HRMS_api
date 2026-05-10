@@ -111,6 +111,8 @@ model Employee {
   reviewsAsEmployee         PerformanceReview[]  @relation("ReviewEmployee")
   reviewsAsManager          PerformanceReview[]  @relation("ReviewManager")
   reviewsAsPreviousManager  PerformanceReview[]  @relation("ReviewPreviousManager")
+  // Phase 6 — Notifications
+  notifications             Notification[]       @relation("EmployeeNotifications")
 
   @@index([email])
   @@index([reportingManagerId])
@@ -725,6 +727,50 @@ model PerformanceCycle {
   @@index([status])
   @@index([fyStart])
   @@map("performance_cycles")
+}
+
+// ── Phase 6 — Notifications ──────────────────────────────────────────────────
+
+/// Category enum — mirrors NotificationCategorySchema in @nexora/contracts/notifications.
+/// Stored without hyphens; mapped at the application boundary.
+enum NotificationCategoryDb {
+  Leave
+  Attendance
+  Payroll
+  Performance
+  Status
+  Configuration
+  Auth
+  System
+}
+
+/// In-app notification feed. BL-043: system-generated only (no public POST).
+/// BL-044: every query MUST filter recipientId = user.id.
+/// BL-045: archived after NOTIFICATION_RETENTION_DAYS (default 90) by a daily cron.
+/// BL-046: in-app only — no email/SMS/push integration.
+model Notification {
+  id           String                  @id @default(cuid())
+  recipientId  String
+  recipient    Employee                @relation("EmployeeNotifications", fields: [recipientId], references: [id], onDelete: Cascade)
+  category     NotificationCategoryDb
+  /// ≤ 120 chars — enforced at the application layer before insert
+  title        String                  @db.VarChar(120)
+  /// ≤ 600 chars — plain text only (BL-046)
+  body         String                  @db.VarChar(600)
+  /// Deep link to the originating record, e.g. /employee/leave/L-2026-0118
+  link         String?
+  unread       Boolean                 @default(true)
+  /// References the audit_log row that produced this notification (BL-047 link)
+  auditLogId   String?
+  createdAt    DateTime                @default(now())
+
+  /// BL-044: unread feed sorted by newest first
+  @@index([recipientId, unread])
+  /// Cursor-pagination / feed queries
+  @@index([recipientId, createdAt(sort: Desc)])
+  /// Retention sweep — daily cron deletes rows older than retentionDays (BL-045)
+  @@index([createdAt])
+  @@map("notifications")
 }
 
 /// Performance review. One per employee per cycle.
