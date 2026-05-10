@@ -1,8 +1,10 @@
 /**
- * Phase 7 — Carry-forward cron: test that the cron reads leaveType.carryForwardCap
- * from the leaveType table (NOT from the Configuration table), exposing BUG-CFG-001.
+ * Phase 7 — Carry-forward cron regression test.
+ * BUG-CFG-001 fix: PUT /config/leave now also writes to leaveType.carryForwardCap
+ * inside the same transaction, so the cron's read of lt.carryForwardCap reflects
+ * the admin-configured value. This test pins the cron's read path to the column.
  *
- * TC-LEAVE-020 / BL-013 / Risk #1 from scope doc.
+ * TC-LEAVE-020 / BL-013.
  */
 
 import { describe, it, expect, vi, type Mock } from 'vitest';
@@ -41,16 +43,12 @@ vi.mock('../../lib/config.js', () => ({
 
 import { runCarryForward } from './leave.service.js';
 
-describe('BUG-CFG-001: runCarryForward reads leaveType.carryForwardCap, NOT Configuration table', () => {
-  it('TC-LEAVE-020 / BL-013: carry-forward uses lt.carryForwardCap (DB column), ignoring PUT /config/leave value', async () => {
-    // This test documents the sync gap:
-    //   - Configuration table has Annual cap = 15 (via PUT /config/leave)
-    //   - leaveType.carryForwardCap column still = 10 (unchanged)
-    //   - runCarryForward reads lt.carryForwardCap = 10 → applies cap of 10, NOT 15
-    //
-    // The test simulates an employee with 20 Annual days remaining.
-    // Expected with correct behaviour (cap=15): carry-forward = 15
-    // Actual with the bug (cap=10 from DB column): carry-forward = 10
+describe('runCarryForward respects leaveType.carryForwardCap (kept in sync by PUT /config/leave)', () => {
+  it('TC-LEAVE-020 / BL-013: carry-forward applies lt.carryForwardCap as the cap', async () => {
+    // The fix for BUG-CFG-001: PUT /config/leave updates both Configuration AND
+    // leaveType.carryForwardCap atomically. This test pins the cron's read path
+    // to the column. With column=10 the cron caps at 10; if PUT had set Annual=15
+    // both Configuration AND the column would carry 15.
 
     const mockTx = {
       employee: {
@@ -90,15 +88,11 @@ describe('BUG-CFG-001: runCarryForward reads leaveType.carryForwardCap, NOT Conf
     // Verify carry-forward was applied
     expect(processed).toBe(1);
 
-    // Verify the carry-forward cap used was 10 (from lt.carryForwardCap DB column)
-    // NOT 15 (from the Configuration table updated by PUT /config/leave)
-    const createCall = (mockTx.leaveBalance.create as Mock).mock.calls[0][0];
+    // The cron reads lt.carryForwardCap = 10 (the column). PUT /config/leave keeps
+    // this column in sync with the Configuration table (BUG-CFG-001 fix).
+    const createCall = (mockTx.leaveBalance.create as Mock).mock.calls[0]?.[0];
+    expect(createCall).toBeDefined();
     const actualCarryForward = createCall.data.daysRemaining - 18; // daysRemaining - annualQuota = carryForward
-
-    // BUG: should be 15 if config table was honoured, but actual is 10 from leaveType column
-    expect(actualCarryForward).toBe(10); // Documents the bug: cap is 10, not the configured 15
-
-    // This assertion will FAIL once the bug is fixed (carryForward would be 15):
-    // To verify fix: change expect(actualCarryForward).toBe(10) → expect(actualCarryForward).toBe(15)
+    expect(actualCarryForward).toBe(10);
   });
 });
