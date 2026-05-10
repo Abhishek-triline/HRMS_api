@@ -17,7 +17,10 @@
  * inside a Prisma interactive transaction to prevent two simultaneous callers
  * from finalising/reversing the same run.
  *
- * BL-031 / BL-032: finalised payslips are NEVER updated; reversals create new rows.
+ * BL-031 / BL-032: finalised payslips' financial fields are NEVER updated;
+ * reversals create new rows. The back-link field `reversedByPayslipId` IS
+ * set on the original payslip by the reversal handler — that's a schema-
+ * intended pointer, not a financial mutation (SEC-004-P4 doc clarification).
  */
 
 import { Router } from 'express';
@@ -887,15 +890,17 @@ payslipsRouter.get(
   validateQuery(PayslipListQuerySchema),
   async (req: Request, res: Response): Promise<void> => {
     const user = req.user!;
-    const { year, month, employeeId, status, isReversal, cursor, limit } = req.query as {
-      year?: number;
-      month?: number;
-      employeeId?: string;
-      status?: string;
-      isReversal?: boolean;
-      cursor?: string;
-      limit?: number;
-    };
+    const { year, month, employeeId, status, runId, isReversal, cursor, limit } =
+      req.query as {
+        year?: number;
+        month?: number;
+        employeeId?: string;
+        status?: string;
+        runId?: string;
+        isReversal?: boolean;
+        cursor?: string;
+        limit?: number;
+      };
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const where: Record<string, any> = {};
@@ -923,6 +928,8 @@ payslipsRouter.get(
     if (year) where['year'] = Number(year);
     if (month) where['month'] = Number(month);
     if (status) where['status'] = status;
+    // BUG-PAY-004 fix — `runId` is a documented filter; was previously dropped.
+    if (runId) where['runId'] = runId;
     if (isReversal !== undefined) {
       where['reversalOfPayslipId'] = isReversal ? { not: null } : null;
     }
