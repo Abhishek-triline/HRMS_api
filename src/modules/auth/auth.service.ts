@@ -21,6 +21,20 @@ export async function hashPassword(plain: string): Promise<string> {
   return argon2.hash(plain, { type: argon2.argon2id });
 }
 
+/**
+ * Lazy-initialised argon2id hash of an unguessable random string.
+ * Used to keep login response time constant when the email does not exist
+ * (SEC-005 — prevents email enumeration via timing side-channel).
+ */
+let _decoyHash: Promise<string> | null = null;
+export function decoyHash(): Promise<string> {
+  if (!_decoyHash) {
+    const seed = `nx-decoy-${process.pid}-${Date.now()}-${Math.random()}`;
+    _decoyHash = argon2.hash(seed, { type: argon2.argon2id });
+  }
+  return _decoyHash;
+}
+
 /** Constant-time comparison of a plain password against a stored hash. */
 export async function verifyPassword(plain: string, hash: string): Promise<boolean> {
   return argon2.verify(hash, plain);
@@ -137,7 +151,7 @@ const ROLE_PERMISSIONS: Record<Role, AuthPermissionValue[]> = {
     AuthPermission.EMPLOYEES_READ,
     AuthPermission.PAYROLL_RUN,
     AuthPermission.PAYROLL_FINALISE,
-    AuthPermission.PAYROLL_REVERSE,
+    // PAYROLL_REVERSE intentionally omitted — Admin-only per BL-033 / DN-12 (SEC-003).
   ],
   Admin: [
     AuthPermission.EMPLOYEES_READ,

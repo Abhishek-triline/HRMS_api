@@ -41,6 +41,7 @@ import {
   permissionsFor,
   generateToken,
   hashToken,
+  decoyHash,
 } from './auth.service.js';
 
 const router = Router();
@@ -53,10 +54,18 @@ const WEB_BASE_URL = process.env['WEB_BASE_URL'] ?? 'http://localhost:3000';
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+/**
+ * Resolve the requesting IP for audit + lockout purposes.
+ *
+ * SEC-002: We deliberately do NOT honour `X-Forwarded-For` directly.
+ * Express's `req.ip` already reflects XFF when `app.set('trust proxy', N)`
+ * is configured (see index.ts) — and only when configured. In default
+ * (no-proxy) mode, `req.ip` is the socket address, which an external
+ * attacker cannot spoof. Trusting raw XFF here would let an attacker
+ * rotate header values to bypass the BL-005 5-strikes lockout.
+ */
 function clientIp(req: Request): string {
-  const forwarded = req.headers['x-forwarded-for'];
-  if (typeof forwarded === 'string') return forwarded.split(',')[0]?.trim() ?? req.ip ?? 'unknown';
-  return req.ip ?? 'unknown';
+  return req.ip ?? req.socket.remoteAddress ?? 'unknown';
 }
 
 /**
@@ -114,6 +123,17 @@ router.post('/login', validateBody(LoginRequestSchema), async (req: Request, res
     // 5-strikes lockout check (BL-005)
     if (await isLockedOut(email, ip)) {
       const retryAfter = await lockoutRetryAfterSeconds(email, ip);
+      // SEC-004: lockouts are an auditable security event — record before responding.
+      await audit({
+        actorId: null,
+        actorRole: 'unknown',
+        actorIp: ip,
+        action: 'auth.login.lockout',
+        targetType: 'Employee',
+        targetId: null,
+        module: 'auth',
+        after: { email, retryAfterSeconds: retryAfter },
+      });
       res
         .status(423)
         .setHeader('Retry-After', String(retryAfter))
@@ -132,11 +152,12 @@ router.post('/login', validateBody(LoginRequestSchema), async (req: Request, res
       where: { email: email.toLowerCase() },
     });
 
-    // Constant-time path — always verify hash even on miss to prevent timing attacks
-    const dummyHash =
-      '$argon2id$v=19$m=65536,t=3,p=4$deadbeef$deadbeef';
-    const hashToVerify = employee?.passwordHash ?? dummyHash;
-    const passwordOk = employee ? await verifyPassword(password, hashToVerify) : false;
+    // SEC-005: always run argon2 verification — even on miss — so the response
+    // time does not leak whether the email exists. The decoy hash is a real
+    // argon2id hash of an unguessable random string generated at first use.
+    const hashToVerify = employee?.passwordHash ?? (await decoyHash());
+    const verified = await verifyPassword(password, hashToVerify);
+    const passwordOk = employee ? verified : false;
 
     if (!employee || !passwordOk) {
       await recordLoginAttempt({ email, ip, success: false, employeeId: employee?.id ?? null });
@@ -451,6 +472,12 @@ router.post(
           where: { id: tokenRow.id },
           data: { usedAt: new Date() },
         });
+
+        // SEC-007: drop any pre-existing sessions for this employee — same
+        // pattern as /reset-password. An Inactive employee shouldn't have any
+        // sessions, but we enforce the invariant here so the path stays
+        // consistent with the rest of the auth surface.
+        await tx.session.deleteMany({ where: { employeeId: tokenRow.employeeId } });
 
         await audit({
           tx,

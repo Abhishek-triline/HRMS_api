@@ -16,7 +16,8 @@ import helmet from 'helmet';
 import cors from 'cors';
 import rateLimit from 'express-rate-limit';
 import cookieParser from 'cookie-parser';
-import pinoHttp from 'pino-http';
+import { pinoHttp } from 'pino-http';
+import type { IncomingMessage } from 'node:http';
 import crypto from 'crypto';
 import { v1Router } from './router.js';
 import { errorHandler } from './middleware/errorHandler.js';
@@ -53,6 +54,19 @@ if (SESSION_SECRET.length < 32) {
   process.exit(1);
 }
 
+// SEC-008: refuse to boot with the .env.example placeholder.
+const FORBIDDEN_SESSION_SECRETS = new Set([
+  'REPLACE_ME',
+  'change-me-replace-with-32+-char-random-string-aaaaaaaa',
+]);
+if (FORBIDDEN_SESSION_SECRETS.has(SESSION_SECRET)) {
+  console.error(
+    `\n[FATAL] SESSION_SECRET is set to a placeholder value.\n` +
+      `Generate a real one with: openssl rand -hex 32\n`,
+  );
+  process.exit(1);
+}
+
 // Suppress "unused" lint warning — DATABASE_URL is used by Prisma via process.env
 void DATABASE_URL;
 
@@ -84,7 +98,16 @@ const globalLimiter = rateLimit({
 const app = express();
 
 // Security headers
-app.use(helmet());
+// SEC-010: enable HSTS preload alongside the helmet defaults.
+app.use(
+  helmet({
+    hsts: {
+      maxAge: 60 * 60 * 24 * 365, // 1 year
+      includeSubDomains: true,
+      preload: true,
+    },
+  }),
+);
 
 // CORS — allow frontend origin only
 const allowedOrigins = (process.env['CORS_ORIGIN'] ?? 'http://localhost:3000')
@@ -94,11 +117,15 @@ const allowedOrigins = (process.env['CORS_ORIGIN'] ?? 'http://localhost:3000')
 app.use(
   cors({
     origin: (origin, cb) => {
-      // Allow requests with no origin (same-origin, curl, Postman in dev)
+      // Allow requests with no origin (same-origin, curl, Postman in dev).
+      // SEC-006: a non-allowlisted origin is rejected by omitting the ACAO
+      // header — never by throwing. Throwing routes through Express's error
+      // handler and surfaces as 500, which pollutes monitoring with false
+      // positives. Browsers still block the response with no ACAO set.
       if (!origin || allowedOrigins.includes(origin)) {
         cb(null, true);
       } else {
-        cb(new Error(`Origin ${origin} not allowed by CORS`));
+        cb(null, false);
       }
     },
     credentials: true,
@@ -114,21 +141,22 @@ app.use(express.urlencoded({ extended: false, limit: '1mb' }));
 // Cookie parsing — signed cookies use SESSION_SECRET
 app.use(cookieParser(SESSION_SECRET));
 
-// Structured request logging (pino-http)
-app.use(
-  pinoHttp({
-    logger,
-    genReqId: () => crypto.randomUUID(),
-    customProps: (req) => ({
-      traceId: req.id,
-    }),
-    // Redact sensitive headers/bodies from logs
-    redact: {
-      paths: ['req.headers.cookie', 'req.body.password', 'req.body.newPassword'],
-      censor: '[REDACTED]',
-    },
+// Structured request logging (pino-http).
+// Cast to RequestHandler — pino-http types use IncomingMessage/ServerResponse
+// from node:http, which Express's app.use overloads don't directly accept.
+const httpLogger = pinoHttp({
+  logger,
+  genReqId: () => crypto.randomUUID(),
+  customProps: (req: IncomingMessage & { id?: string }) => ({
+    traceId: req.id,
   }),
-);
+  // Redact sensitive headers/bodies from logs
+  redact: {
+    paths: ['req.headers.cookie', 'req.body.password', 'req.body.newPassword'],
+    censor: '[REDACTED]',
+  },
+});
+app.use(httpLogger as unknown as express.RequestHandler);
 
 // Global rate limiter (applied before routes)
 app.use(globalLimiter);

