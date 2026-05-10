@@ -27,6 +27,7 @@ import { addWorkingDays, workingDaysBetween } from './workingDays.js';
 import { logger } from '../../lib/logger.js';
 import { audit } from '../../lib/audit.js';
 import { notify } from '../../lib/notifications.js';
+import { getLeaveConfig } from '../../lib/config.js';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -532,6 +533,10 @@ export async function escalateStaleRequests(
 ): Promise<number> {
   const now = new Date();
 
+  // Read the escalation period from live config (BL-018 — default 5 working days).
+  // getLeaveConfig() is cached for 30 s so this doesn't hit the DB per request.
+  const { escalationPeriodDays } = await getLeaveConfig();
+
   // Load all Pending Manager-routed requests
   const pending = await tx.leaveRequest.findMany({
     where: {
@@ -547,7 +552,7 @@ export async function escalateStaleRequests(
   let escalatedCount = 0;
 
   for (const req of pending) {
-    const slaDeadline = addWorkingDays(req.createdAt, 5);
+    const slaDeadline = addWorkingDays(req.createdAt, escalationPeriodDays);
     const slaBreach = now > slaDeadline;
     const approverExited = req.approver?.status === 'Exited';
 

@@ -379,6 +379,10 @@ leaveRouter.get(
             total: null as number | null,
             carryForwardCap: null as number | null,
             eligible: true, // Phase 2 stub — eligibility logic (gender etc.) is out of scope for v1
+            // TODO: BUG-CFG-002 — enforce maxDaysPerEvent from leave_types table when
+            // eligibility checks land. PUT /config/leave now keeps maxDaysPerEvent in
+            // sync for Maternity and Paternity rows, so the correct value will be
+            // available here without further migration when that enforcement is added.
           };
         }
 

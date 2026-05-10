@@ -15,6 +15,8 @@ import { holidaysRouter } from './modules/attendance/holidays.routes.js';
 import { payrollRouter, payslipsRouter, taxConfigRouter } from './modules/payroll/payroll.routes.js';
 import { performanceRouter } from './modules/performance/performance.routes.js';
 import { notificationsRouter } from './modules/notifications/notifications.routes.js';
+import { auditRouter } from './modules/audit/audit.routes.js';
+import { configurationRouter } from './modules/configuration/configuration.routes.js';
 import { openApiSpec } from './lib/openapi.js';
 
 const v1Router = Router();
@@ -73,5 +75,9 @@ v1Router.use('/performance', performanceRouter);
 
 // Phase 6 — Notifications
 v1Router.use('/notifications', notificationsRouter);
+
+// Phase 7 — Audit Log + Configuration
+v1Router.use('/audit-logs', auditRouter);
+v1Router.use('/config', configurationRouter);
 
 export { v1Router };

@@ -17,10 +17,10 @@
  */
 
 import type { Prisma } from '@prisma/client';
-import { prisma as defaultPrisma } from '../../lib/prisma.js';
 import { audit } from '../../lib/audit.js';
 import { notify } from '../../lib/notifications.js';
 import { logger } from '../../lib/logger.js';
+import { getAttendanceConfig } from '../../lib/config.js';
 import { isHoliday, isWeeklyOff } from './holidays.js';
 import {
   findOverlappingLeave,
@@ -58,26 +58,6 @@ export interface RegularisationConflictError {
     conflictTo: string | null;
     conflictStatus: string;
   };
-}
-
-// ── Configuration helpers ─────────────────────────────────────────────────────
-
-/**
- * Read a configuration value from the DB.
- * Falls back to the provided default if the key is missing.
- */
-async function getConfig(
-  key: string,
-  defaultValue: string,
-  tx: Prisma.TransactionClient,
-): Promise<string> {
-  const row = await tx.configuration.findUnique({ where: { key } });
-  if (!row) return defaultValue;
-  // config values are stored as JSON; unwrap string values
-  const val = row.value;
-  if (typeof val === 'string') return val;
-  if (typeof val === 'number') return String(val);
-  return defaultValue;
 }
 
 /**
@@ -317,9 +297,9 @@ export async function recordCheckIn(
     };
   }
 
-  // Read the late threshold from configuration
-  const lateThreshold = await getConfig('LATE_THRESHOLD', '10:30', tx);
-  const late = isLate(now, lateThreshold);
+  // Read the late threshold from the shared config cache (30 s TTL, BL-027).
+  const { lateThresholdTime } = await getAttendanceConfig();
+  const late = isLate(now, lateThresholdTime);
 
   const year = now.getUTCFullYear();
   const month = now.getUTCMonth() + 1;
@@ -811,8 +791,8 @@ export async function approveRegularisation(
   let late = false;
 
   if (reg.proposedCheckIn) {
-    const lateThreshold = await getConfig('LATE_THRESHOLD', '10:30', tx);
-    late = isLate(reg.proposedCheckIn, lateThreshold);
+    const { lateThresholdTime } = await getAttendanceConfig();
+    late = isLate(reg.proposedCheckIn, lateThresholdTime);
 
     if (reg.proposedCheckOut) {
       hoursWorkedMinutes = Math.max(
@@ -1139,5 +1119,3 @@ export function formatRegularisation(row: {
   };
 }
 
-/** Export getConfig for use in routes (read LATE_THRESHOLD, STANDARD_DAILY_HOURS). */
-export { getConfig };

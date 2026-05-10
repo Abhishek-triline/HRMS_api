@@ -22,13 +22,13 @@ import { errorEnvelope, ErrorCode } from '@nexora/contracts/errors';
 import { AttendanceListQuerySchema } from '@nexora/contracts/attendance';
 import { getSubordinateIds } from '../employees/hierarchy.js';
 import { logger } from '../../lib/logger.js';
+import { getAttendanceConfig } from '../../lib/config.js';
 import {
   recordCheckIn,
   recordCheckOut,
   findOpenAttendance,
   formatAttendanceRecord,
   mapAttendanceStatusToDb,
-  getConfig,
 } from './attendance.service.js';
 
 export const attendanceRouter = Router();
@@ -114,16 +114,13 @@ attendanceRouter.get(
     const today = new Date();
 
     try {
-      const [record, lateThreshold, standardDailyHoursStr] = await prisma.$transaction(
-        async (tx) => {
-          const rec = await findOpenAttendance(user.id, today, tx);
-          const lt = await getConfig('LATE_THRESHOLD', '10:30', tx);
-          const sdh = await getConfig('STANDARD_DAILY_HOURS', '8', tx);
-          return [rec, lt, sdh] as const;
-        },
-      );
+      const [record, attendanceCfg] = await Promise.all([
+        prisma.$transaction((tx) => findOpenAttendance(user.id, today, tx)),
+        getAttendanceConfig(),
+      ]);
 
-      const standardDailyHours = parseInt(standardDailyHoursStr, 10) || 8;
+      const lateThreshold = attendanceCfg.lateThresholdTime;
+      const standardDailyHours = attendanceCfg.standardDailyHours;
 
       // Derive panel state
       let panelState: 'Ready' | 'Working' | 'Confirm' = 'Ready';

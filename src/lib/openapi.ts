@@ -182,6 +182,19 @@ import {
   MarkReadResponseSchema,
   UnreadCountResponseSchema,
 } from '@nexora/contracts/notifications';
+import {
+  AuditLogEntrySchema,
+  AuditLogListQuerySchema,
+  AuditLogListResponseSchema,
+} from '@nexora/contracts/audit';
+import {
+  AttendanceConfigSchema,
+  AttendanceConfigResponseSchema,
+  UpdateAttendanceConfigSchema,
+  LeaveConfigSchema,
+  LeaveConfigResponseSchema,
+  UpdateLeaveConfigSchema,
+} from '@nexora/contracts/configuration';
 
 // Augment the local `z` with .openapi() — required before any registry call.
 extendZodWithOpenApi(z);
@@ -1937,6 +1950,143 @@ registry.registerPath({
       content: { 'application/json': { schema: UnreadCountResponseSchema } },
     },
     ...errorResponse(401, 'UNAUTHENTICATED.'),
+  },
+});
+
+// ── Audit Log (Phase 7) ─────────────────────────────────────────────────────
+
+registry.register('AuditLogEntry', AuditLogEntrySchema);
+registry.register('AuditLogListQuery', AuditLogListQuerySchema);
+registry.register('AuditLogListResponse', AuditLogListResponseSchema);
+
+registry.registerPath({
+  method: 'get',
+  path: '/audit-logs',
+  tags: ['Audit Log'],
+  summary: 'List audit log entries (Admin only)',
+  description:
+    'Returns a cursor-paginated, reverse-chronological list of audit log entries. ' +
+    'Supports filtering by actor, module, action, target, and date range. ' +
+    'BL-047: append-only — no POST/PUT/DELETE exists on this resource.',
+  security: [{ sessionCookie: [] }],
+  request: {
+    query: AuditLogListQuerySchema,
+  },
+  responses: {
+    200: {
+      description: 'Paginated list of audit log entries.',
+      content: { 'application/json': { schema: AuditLogListResponseSchema } },
+    },
+    ...errorResponse(401, 'Not authenticated.'),
+    ...errorResponse(403, 'Not authorised — Admin role required.'),
+    ...errorResponse(500, 'Internal server error.'),
+  },
+});
+
+// ── Configuration — Attendance (Phase 7) ────────────────────────────────────
+
+registry.register('AttendanceConfig', AttendanceConfigSchema);
+registry.register('AttendanceConfigResponse', AttendanceConfigResponseSchema);
+registry.register('UpdateAttendanceConfig', UpdateAttendanceConfigSchema);
+
+registry.registerPath({
+  method: 'get',
+  path: '/config/attendance',
+  tags: ['Configuration'],
+  summary: 'Get attendance configuration (Admin only)',
+  description:
+    'Returns the current attendance configuration: late-threshold time and standard daily hours. ' +
+    'Defaults: lateThresholdTime="10:30", standardDailyHours=8.',
+  security: [{ sessionCookie: [] }],
+  responses: {
+    200: {
+      description: 'Current attendance configuration.',
+      content: { 'application/json': { schema: AttendanceConfigResponseSchema } },
+    },
+    ...errorResponse(401, 'Not authenticated.'),
+    ...errorResponse(403, 'Not authorised — Admin role required.'),
+    ...errorResponse(500, 'Internal server error.'),
+  },
+});
+
+registry.registerPath({
+  method: 'put',
+  path: '/config/attendance',
+  tags: ['Configuration'],
+  summary: 'Update attendance configuration (Admin only)',
+  description:
+    'Atomically updates one or both attendance config keys. Audits each changed key ' +
+    'with before/after snapshots. Notifies all active Admins. Busts the 30-second in-process cache.',
+  security: [{ sessionCookie: [] }],
+  request: {
+    body: {
+      required: true,
+      content: { 'application/json': { schema: UpdateAttendanceConfigSchema } },
+    },
+  },
+  responses: {
+    200: {
+      description: 'Updated attendance configuration.',
+      content: { 'application/json': { schema: AttendanceConfigResponseSchema } },
+    },
+    ...errorResponse(400, 'Validation failed.'),
+    ...errorResponse(401, 'Not authenticated.'),
+    ...errorResponse(403, 'Not authorised — Admin role required.'),
+    ...errorResponse(500, 'Internal server error.'),
+  },
+});
+
+// ── Configuration — Leave (Phase 7) ─────────────────────────────────────────
+
+registry.register('LeaveConfig', LeaveConfigSchema);
+registry.register('LeaveConfigResponse', LeaveConfigResponseSchema);
+registry.register('UpdateLeaveConfig', UpdateLeaveConfigSchema);
+
+registry.registerPath({
+  method: 'get',
+  path: '/config/leave',
+  tags: ['Configuration'],
+  summary: 'Get leave configuration (Admin only)',
+  description:
+    'Returns the current leave configuration: carry-forward caps per type, escalation period, ' +
+    'maternity duration, and paternity duration.',
+  security: [{ sessionCookie: [] }],
+  responses: {
+    200: {
+      description: 'Current leave configuration.',
+      content: { 'application/json': { schema: LeaveConfigResponseSchema } },
+    },
+    ...errorResponse(401, 'Not authenticated.'),
+    ...errorResponse(403, 'Not authorised — Admin role required.'),
+    ...errorResponse(500, 'Internal server error.'),
+  },
+});
+
+registry.registerPath({
+  method: 'put',
+  path: '/config/leave',
+  tags: ['Configuration'],
+  summary: 'Update leave configuration (Admin only)',
+  description:
+    'Atomically updates one or more leave config keys. Audits each changed key. ' +
+    'Notifies all active Admins. BL-012 / BL-014: Sick, Unpaid, Maternity, and Paternity ' +
+    'carry-forward caps are always forced to 0 regardless of input.',
+  security: [{ sessionCookie: [] }],
+  request: {
+    body: {
+      required: true,
+      content: { 'application/json': { schema: UpdateLeaveConfigSchema } },
+    },
+  },
+  responses: {
+    200: {
+      description: 'Updated leave configuration.',
+      content: { 'application/json': { schema: LeaveConfigResponseSchema } },
+    },
+    ...errorResponse(400, 'Validation failed.'),
+    ...errorResponse(401, 'Not authenticated.'),
+    ...errorResponse(403, 'Not authorised — Admin role required.'),
+    ...errorResponse(500, 'Internal server error.'),
   },
 });
 
