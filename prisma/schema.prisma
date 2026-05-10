@@ -99,6 +99,12 @@ model Employee {
   regularisations         RegularisationRequest[] @relation("EmployeeRegularisations")
   regularisationsApproving RegularisationRequest[] @relation("RegularisationApprover")
   lateLedger              AttendanceLateLedger[] @relation("EmployeeLateLedger")
+  // Phase 4 — Payroll
+  payrollRunsInitiated    PayrollRun[]           @relation("PayrollInitiator")
+  payrollRunsFinalised    PayrollRun[]           @relation("PayrollFinaliser")
+  payrollRunsReversed     PayrollRun[]           @relation("PayrollReverser")
+  payslips                Payslip[]              @relation("EmployeePayslips")
+  idempotencyKeys         IdempotencyKey[]       @relation("EmployeeIdempotencyKeys")
 
   @@index([email])
   @@index([reportingManagerId])
@@ -518,4 +524,150 @@ model Holiday {
   @@unique([year, date])
   @@index([date])
   @@map("holidays")
+}
+
+// ── Phase 4 — Payroll Processing ─────────────────────────────────────────────
+
+/// BL-034: run lifecycle status.
+/// Draft → Review → Finalised → (Reversed via a new reversal run record)
+enum PayrollRunStatusDb {
+  Draft
+  Review
+  Finalised
+  Reversed
+}
+
+/// Mirrors PayrollRunStatusDb — payslips track the same lifecycle.
+/// Reversal payslip records carry Reversed; originals stay Finalised (BL-031 / BL-032).
+enum PayslipStatusDb {
+  Draft
+  Review
+  Finalised
+  Reversed
+}
+
+/// Payroll run. One per month per origination (original has reversalOfRunId=NULL;
+/// reversal records have reversalOfRunId set to the source).
+/// BL-034: UNIQUE (month, year, reversalOfRunId) allows original + reversal to coexist.
+model PayrollRun {
+  id              String             @id @default(cuid())
+  /// RUN-YYYY-MM for originals; RUN-YYYY-MM-R<n> for reversal records.
+  code            String             @unique
+  month           Int                // 1–12
+  year            Int
+  status          PayrollRunStatusDb @default(Review)
+  workingDays     Int
+  periodStart     DateTime           @db.Date
+  periodEnd       DateTime           @db.Date
+  initiatedBy     String
+  initiator       Employee           @relation("PayrollInitiator", fields: [initiatedBy], references: [id])
+  finalisedBy     String?
+  finaliser       Employee?          @relation("PayrollFinaliser", fields: [finalisedBy], references: [id])
+  finalisedAt     DateTime?
+  reversedBy      String?
+  reverser        Employee?          @relation("PayrollReverser", fields: [reversedBy], references: [id])
+  reversedAt      DateTime?
+  reversalReason  String?            @db.Text
+  /// Points to the original run when this is a reversal record. Null on originals.
+  reversalOfRunId String?
+  reversalOf      PayrollRun?        @relation("PayrollReversal", fields: [reversalOfRunId], references: [id])
+  reversalRuns    PayrollRun[]       @relation("PayrollReversal")
+  createdAt       DateTime           @default(now())
+  updatedAt       DateTime           @updatedAt
+  /// Optimistic concurrency token (BL-034).
+  version         Int                @default(0)
+
+  payslips        Payslip[]
+
+  /// BL-034: original (NULL reversalOfRunId) is unique per month+year;
+  /// multiple reversal records per month+year are allowed (n can increment).
+  @@unique([month, year, reversalOfRunId])
+  @@index([year, status])
+  @@map("payroll_runs")
+}
+
+/// Payslip. One per employee per run. Immutable once Finalised (BL-031).
+/// Reversal creates new rows; originals are never modified (BL-032).
+model Payslip {
+  id                   String          @id @default(cuid())
+  /// P-YYYY-MM-NNNN — globally unique across all payslips.
+  code                 String          @unique
+  runId                String
+  run                  PayrollRun      @relation(fields: [runId], references: [id])
+  employeeId           String
+  employee             Employee        @relation("EmployeePayslips", fields: [employeeId], references: [id])
+  month                Int
+  year                 Int
+  status               PayslipStatusDb @default(Review)
+  periodStart          DateTime        @db.Date
+  periodEnd            DateTime        @db.Date
+  workingDays          Int
+  /// Days actually worked — used for BL-036 proration.
+  daysWorked           Int
+  /// Loss of pay days (BL-035).
+  lopDays              Int             @default(0)
+  /// Snapshot of the active salary structure (BL-030).
+  basicPaise           Int
+  allowancesPaise      Int
+  /// Pro-rated gross for this period (BL-036).
+  grossPaise           Int
+  /// LOP deduction paise (BL-035).
+  lopDeductionPaise    Int             @default(0)
+  /// Reference tax = gross × standardRate (BL-036a).
+  referenceTaxPaise    Int             @default(0)
+  /// Final tax — editable by PO until run is Finalised (BL-036a).
+  finalTaxPaise        Int             @default(0)
+  /// Other deductions (PF, etc.) — zero in v1.
+  otherDeductionsPaise Int             @default(0)
+  /// Net pay = gross − lop − finalTax − other; never negative (BL-035).
+  netPayPaise          Int
+  finalisedAt          DateTime?
+  /// Set on reversal payslips — points to the original payslip (BL-032).
+  reversalOfPayslipId  String?
+  reversalOfPayslip    Payslip?        @relation("PayslipReversal", fields: [reversalOfPayslipId], references: [id])
+  reversalPayslips     Payslip[]       @relation("PayslipReversal")
+  /// Set on original payslip when a reversal row exists.
+  reversedByPayslipId  String?         @unique
+  reversedByPayslip    Payslip?        @relation("PayslipReversedBy", fields: [reversedByPayslipId], references: [id])
+  reversedByPayslipRef Payslip[]       @relation("PayslipReversedBy")
+  createdAt            DateTime        @default(now())
+  updatedAt            DateTime        @updatedAt
+  /// Optimistic concurrency token.
+  version              Int             @default(0)
+
+  @@index([employeeId, year, month])
+  @@index([runId])
+  @@index([status])
+  @@map("payslips")
+}
+
+/// Counter table for generating RUN and Payslip codes.
+/// kind: 'run' for RUN-YYYY-MM codes, 'payslip' for P-YYYY-MM-NNNN codes.
+/// Indexed on (year, month, kind) — each combination holds its own sequence.
+model PayrollCodeCounter {
+  id      String @id @default(cuid())
+  year    Int
+  month   Int
+  kind    String // 'run' | 'payslip'
+  lastSeq Int    @default(0)
+
+  @@unique([year, month, kind])
+  @@map("payroll_code_counters")
+}
+
+/// Idempotency-Key store (SEC-004-P3 close-out).
+/// One row per (userId, key). TTL: 24 h — cleanup cron deletes stale rows.
+model IdempotencyKey {
+  id           String   @id @default(cuid())
+  userId       String
+  user         Employee @relation("EmployeeIdempotencyKeys", fields: [userId], references: [id], onDelete: Cascade)
+  key          String
+  path         String
+  status       Int
+  responseBody Json
+  createdAt    DateTime @default(now())
+
+  @@unique([userId, key])
+  @@index([userId, key])
+  @@map("idempotency_keys")
 }

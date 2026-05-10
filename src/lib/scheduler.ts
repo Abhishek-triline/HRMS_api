@@ -35,6 +35,7 @@ import { prisma } from './prisma.js';
 import { logger } from './logger.js';
 import { escalateStaleRequests, runCarryForward } from '../modules/leave/leave.service.js';
 import { runMidnightGenerate } from '../modules/attendance/attendance.service.js';
+import { audit } from './audit.js';
 
 const ENABLE_CRON = process.env['ENABLE_CRON'] !== 'false';
 
@@ -141,7 +142,46 @@ export function startScheduler(): void {
     },
   );
 
+  // ── idempotency-key.cleanup — daily 03:00 IST ─────────────────────────────
+  // Deletes IdempotencyKey rows older than 24h (TTL enforcement).
+  // Audits the number of rows deleted so the cleanup can be traced.
+  cron.schedule(
+    '0 3 * * *',
+    async () => {
+      const jobId = 'idempotency-key.cleanup';
+      logger.info({ job: jobId }, 'Starting idempotency-key cleanup');
+
+      try {
+        const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000);
+        const deleted = await prisma.idempotencyKey.deleteMany({
+          where: { createdAt: { lt: cutoff } },
+        });
+
+        await audit({
+          actorId: null,
+          actorRole: 'system',
+          action: 'idempotency-key.cleanup',
+          targetType: null,
+          targetId: null,
+          module: 'payroll',
+          before: null,
+          after: { deletedCount: deleted.count, cutoff: cutoff.toISOString() },
+        });
+
+        logger.info(
+          { job: jobId, deletedCount: deleted.count },
+          `Idempotency-key cleanup complete — ${deleted.count} rows deleted`,
+        );
+      } catch (err: unknown) {
+        logger.error({ job: jobId, err }, 'Idempotency-key cleanup failed — server continues normally');
+      }
+    },
+    {
+      timezone: 'Asia/Kolkata',
+    },
+  );
+
   logger.info(
-    'Scheduled jobs started: attendance.midnight-generate (daily 00:00 IST), leave.escalation-sweep (hourly), leave.carry-forward (Jan 1 00:05 IST)',
+    'Scheduled jobs started: attendance.midnight-generate (daily 00:00 IST), leave.escalation-sweep (hourly), leave.carry-forward (Jan 1 00:05 IST), idempotency-key.cleanup (daily 03:00 IST)',
   );
 }
