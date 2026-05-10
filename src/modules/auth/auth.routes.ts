@@ -1,0 +1,538 @@
+/**
+ * Auth router — mounted at /api/v1/auth.
+ *
+ * Endpoints (HRMS_API.md § 4):
+ *   POST /login                     UC-AUTH-01
+ *   POST /logout                    —
+ *   POST /forgot-password           UC-FL-02
+ *   POST /reset-password            UC-FL-02
+ *   POST /first-login/set-password  UC-FL-01
+ *   GET  /me                        —
+ *
+ * Business rules enforced:
+ *   BL-005 (5-strikes lockout, 15 min)
+ *   BL-047 (audit every auth event)
+ *   UC-FL-01 (first login → must set password)
+ *   UC-FL-02 (forgot/reset password flow, no enumeration leak)
+ */
+
+import { Router } from 'express';
+import type { Request, Response } from 'express';
+import {
+  LoginRequestSchema,
+  ForgotPasswordRequestSchema,
+  ResetPasswordRequestSchema,
+  FirstLoginSetPasswordRequestSchema,
+} from '@nexora/contracts/auth';
+import { errorEnvelope, ErrorCode } from '@nexora/contracts/errors';
+import { validateBody } from '../../middleware/validateBody.js';
+import { requireSession } from '../../middleware/requireSession.js';
+import { audit } from '../../lib/audit.js';
+import { sendMail } from '../../lib/mailer.js';
+import { prisma } from '../../lib/prisma.js';
+import { logger } from '../../lib/logger.js';
+import {
+  hashPassword,
+  verifyPassword,
+  recordLoginAttempt,
+  isLockedOut,
+  lockoutRetryAfterSeconds,
+  createSessionFor,
+  permissionsFor,
+  generateToken,
+  hashToken,
+} from './auth.service.js';
+
+const router = Router();
+
+const COOKIE_NAME = process.env['SESSION_COOKIE_NAME'] ?? 'nx_session';
+const SESSION_TTL_HOURS = Number(process.env['SESSION_TTL_HOURS'] ?? 12);
+const SESSION_REMEMBER_ME_DAYS = Number(process.env['SESSION_REMEMBER_ME_DAYS'] ?? 30);
+const PASSWORD_RESET_TTL_MINUTES = Number(process.env['PASSWORD_RESET_TTL_MINUTES'] ?? 30);
+const WEB_BASE_URL = process.env['WEB_BASE_URL'] ?? 'http://localhost:3000';
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+function clientIp(req: Request): string {
+  const forwarded = req.headers['x-forwarded-for'];
+  if (typeof forwarded === 'string') return forwarded.split(',')[0]?.trim() ?? req.ip ?? 'unknown';
+  return req.ip ?? 'unknown';
+}
+
+/**
+ * Map DB EmployeeStatus enum (PascalCase) to the contract enum (hyphenated).
+ * The DB stores "OnNotice" and "OnLeave"; the API surfaces "On-Notice" / "On-Leave".
+ */
+function mapStatus(dbStatus: string): 'Active' | 'On-Notice' | 'Exited' | 'On-Leave' | 'Inactive' {
+  const map: Record<string, 'Active' | 'On-Notice' | 'Exited' | 'On-Leave' | 'Inactive'> = {
+    Active: 'Active',
+    OnNotice: 'On-Notice',
+    Exited: 'Exited',
+    OnLeave: 'On-Leave',
+    Inactive: 'Inactive',
+  };
+  return map[dbStatus] ?? 'Inactive';
+}
+
+/**
+ * Set the session cookie using cookie-parser's signed cookie support.
+ * The cookie value is signed with SESSION_SECRET (set in cookieParser(SECRET) in index.ts).
+ * HttpOnly + Secure + SameSite=Lax (BL-003 / SRS § 9.2).
+ */
+function setSessionCookie(
+  res: Response,
+  sessionId: string,
+  rememberMe: boolean,
+): void {
+  const maxAge = rememberMe
+    ? SESSION_REMEMBER_ME_DAYS * 24 * 60 * 60
+    : SESSION_TTL_HOURS * 60 * 60;
+
+  // res.cookie with `signed: true` uses the secret passed to cookieParser()
+  res.cookie(COOKIE_NAME, sessionId, {
+    httpOnly: true,
+    secure: process.env['NODE_ENV'] === 'production',
+    sameSite: 'lax',
+    maxAge: maxAge * 1000, // express expects ms
+    path: '/',
+    signed: true,
+  });
+}
+
+// ── POST /login ───────────────────────────────────────────────────────────────
+
+router.post('/login', validateBody(LoginRequestSchema), async (req: Request, res: Response) => {
+  const { email, password, rememberMe } = req.body as {
+    email: string;
+    password: string;
+    rememberMe: boolean;
+  };
+  const ip = clientIp(req);
+  const userAgent = req.headers['user-agent'];
+
+  try {
+    // 5-strikes lockout check (BL-005)
+    if (await isLockedOut(email, ip)) {
+      const retryAfter = await lockoutRetryAfterSeconds(email, ip);
+      res
+        .status(423)
+        .setHeader('Retry-After', String(retryAfter))
+        .json(
+          errorEnvelope(
+            ErrorCode.LOCKED,
+            `Account locked due to too many failed attempts. Try again in ${Math.ceil(retryAfter / 60)} minute(s).`,
+            { details: { retryAfterSeconds: retryAfter } },
+          ),
+        );
+      return;
+    }
+
+    // Look up employee by email
+    const employee = await prisma.employee.findUnique({
+      where: { email: email.toLowerCase() },
+    });
+
+    // Constant-time path — always verify hash even on miss to prevent timing attacks
+    const dummyHash =
+      '$argon2id$v=19$m=65536,t=3,p=4$deadbeef$deadbeef';
+    const hashToVerify = employee?.passwordHash ?? dummyHash;
+    const passwordOk = employee ? await verifyPassword(password, hashToVerify) : false;
+
+    if (!employee || !passwordOk) {
+      await recordLoginAttempt({ email, ip, success: false, employeeId: employee?.id ?? null });
+      await audit({
+        actorId: employee?.id ?? null,
+        actorRole: employee?.role ?? 'unknown',
+        actorIp: ip,
+        action: 'auth.login.failure',
+        targetType: 'Employee',
+        targetId: employee?.id ?? null,
+        module: 'auth',
+      });
+      res
+        .status(401)
+        .json(errorEnvelope(ErrorCode.INVALID_CREDENTIALS, 'Invalid email or password.'));
+      return;
+    }
+
+    // Success — record, create session, set cookie
+    await recordLoginAttempt({ email, ip, success: true, employeeId: employee.id });
+
+    const { sessionId } = await createSessionFor({
+      employeeId: employee.id,
+      ip,
+      userAgent,
+      rememberMe: rememberMe ?? false,
+    });
+
+    setSessionCookie(res, sessionId, rememberMe ?? false);
+
+    await audit({
+      actorId: employee.id,
+      actorRole: employee.role,
+      actorIp: ip,
+      action: 'auth.login.success',
+      targetType: 'Employee',
+      targetId: employee.id,
+      module: 'auth',
+    });
+
+    res.status(200).json({
+      data: {
+        user: {
+          id: employee.id,
+          code: employee.code,
+          email: employee.email,
+          name: employee.name,
+          role: employee.role,
+          status: mapStatus(employee.status),
+          department: employee.department ?? null,
+          designation: employee.designation ?? null,
+          reportingManagerId: employee.reportingManagerId ?? null,
+          mustResetPassword: employee.mustResetPassword,
+        },
+        role: employee.role,
+      },
+    });
+  } catch (err: unknown) {
+    logger.error({ err }, 'auth.login.error');
+    res
+      .status(500)
+      .json(errorEnvelope(ErrorCode.INTERNAL_ERROR, 'Login failed due to a server error.'));
+  }
+});
+
+// ── POST /logout ──────────────────────────────────────────────────────────────
+
+router.post('/logout', requireSession(), async (req: Request, res: Response) => {
+  const user = req.user!;
+  const ip = clientIp(req);
+
+  try {
+    // Delete session row
+    if (user.sessionId) {
+      await prisma.session.delete({ where: { id: user.sessionId } }).catch(() => undefined);
+    }
+
+    await audit({
+      actorId: user.id,
+      actorRole: user.role,
+      actorIp: ip,
+      action: 'auth.logout',
+      targetType: 'Employee',
+      targetId: user.id,
+      module: 'auth',
+    });
+
+    res.clearCookie(COOKIE_NAME, { path: '/' }).status(200).json({ data: { success: true } });
+  } catch (err: unknown) {
+    logger.error({ err }, 'auth.logout.error');
+    res
+      .status(500)
+      .json(errorEnvelope(ErrorCode.INTERNAL_ERROR, 'Logout failed due to a server error.'));
+  }
+});
+
+// ── POST /forgot-password ─────────────────────────────────────────────────────
+
+router.post(
+  '/forgot-password',
+  validateBody(ForgotPasswordRequestSchema),
+  async (req: Request, res: Response) => {
+    const { email } = req.body as { email: string };
+    const ip = clientIp(req);
+
+    // Always return 200 — never reveal account existence (no enumeration leak)
+    const GENERIC_MSG = 'If an account with that email exists, a password reset link has been sent.';
+
+    try {
+      const employee = await prisma.employee.findUnique({
+        where: { email: email.toLowerCase() },
+      });
+
+      if (employee && employee.status === 'Active') {
+        const rawToken = generateToken();
+        const tokenHash = hashToken(rawToken);
+        const expiresAt = new Date(Date.now() + PASSWORD_RESET_TTL_MINUTES * 60 * 1000);
+
+        await prisma.passwordResetToken.create({
+          data: {
+            employeeId: employee.id,
+            tokenHash,
+            purpose: 'ResetPassword',
+            expiresAt,
+          },
+        });
+
+        const resetUrl = `${WEB_BASE_URL}/reset-password?token=${rawToken}`;
+
+        await sendMail({
+          to: employee.email,
+          subject: 'Nexora HRMS — Password Reset',
+          text: `Hello ${employee.name},\n\nUse the link below to reset your password (valid for ${PASSWORD_RESET_TTL_MINUTES} minutes):\n\n${resetUrl}\n\nIf you did not request this, please ignore this email.\n\nNexora HRMS`,
+          html: `<p>Hello ${employee.name},</p><p>Click the link below to reset your password (valid for ${PASSWORD_RESET_TTL_MINUTES} minutes):</p><p><a href="${resetUrl}">${resetUrl}</a></p><p>If you did not request this, ignore this email.</p>`,
+        });
+
+        await audit({
+          actorId: employee.id,
+          actorRole: employee.role,
+          actorIp: ip,
+          action: 'auth.password.reset.requested',
+          targetType: 'Employee',
+          targetId: employee.id,
+          module: 'auth',
+        });
+      } else {
+        // Still audit the attempt so security team can review unusual requests
+        await audit({
+          actorId: null,
+          actorRole: 'unknown',
+          actorIp: ip,
+          action: 'auth.password.reset.requested.noop',
+          targetType: null,
+          targetId: null,
+          module: 'auth',
+        });
+      }
+
+      res.status(200).json({ data: { message: GENERIC_MSG } });
+    } catch (err: unknown) {
+      logger.error({ err }, 'auth.forgot-password.error');
+      // Still return 200 to avoid timing-based enumeration
+      res.status(200).json({ data: { message: GENERIC_MSG } });
+    }
+  },
+);
+
+// ── POST /reset-password ──────────────────────────────────────────────────────
+
+router.post(
+  '/reset-password',
+  validateBody(ResetPasswordRequestSchema),
+  async (req: Request, res: Response) => {
+    const { token, newPassword } = req.body as { token: string; newPassword: string };
+    const ip = clientIp(req);
+
+    try {
+      const tokenHash = hashToken(token);
+
+      const tokenRow = await prisma.passwordResetToken.findUnique({
+        where: { tokenHash },
+        include: { employee: true },
+      });
+
+      if (!tokenRow || tokenRow.purpose !== 'ResetPassword') {
+        res.status(400).json(errorEnvelope(ErrorCode.TOKEN_INVALID, 'Invalid or unknown token.'));
+        return;
+      }
+
+      if (tokenRow.usedAt) {
+        res
+          .status(400)
+          .json(errorEnvelope(ErrorCode.TOKEN_INVALID, 'This reset link has already been used.'));
+        return;
+      }
+
+      if (tokenRow.expiresAt < new Date()) {
+        res
+          .status(400)
+          .json(errorEnvelope(ErrorCode.TOKEN_EXPIRED, 'This reset link has expired. Request a new one.'));
+        return;
+      }
+
+      const passwordHash = await hashPassword(newPassword);
+
+      // Transactional: update password, mark token used, delete all sessions (BL-047 / SRS § 9.7)
+      await prisma.$transaction(async (tx) => {
+        await tx.employee.update({
+          where: { id: tokenRow.employeeId },
+          data: { passwordHash, updatedAt: new Date() },
+        });
+
+        await tx.passwordResetToken.update({
+          where: { id: tokenRow.id },
+          data: { usedAt: new Date() },
+        });
+
+        await tx.session.deleteMany({ where: { employeeId: tokenRow.employeeId } });
+
+        await audit({
+          tx,
+          actorId: tokenRow.employeeId,
+          actorRole: tokenRow.employee.role,
+          actorIp: ip,
+          action: 'auth.password.reset',
+          targetType: 'Employee',
+          targetId: tokenRow.employeeId,
+          module: 'auth',
+          before: { passwordChanged: false },
+          after: { passwordChanged: true, sessionsRevoked: true },
+        });
+      });
+
+      res.clearCookie(COOKIE_NAME, { path: '/' }).status(200).json({ data: { success: true } });
+    } catch (err: unknown) {
+      logger.error({ err }, 'auth.reset-password.error');
+      res
+        .status(500)
+        .json(
+          errorEnvelope(ErrorCode.INTERNAL_ERROR, 'Password reset failed due to a server error.'),
+        );
+    }
+  },
+);
+
+// ── POST /first-login/set-password ────────────────────────────────────────────
+
+router.post(
+  '/first-login/set-password',
+  validateBody(FirstLoginSetPasswordRequestSchema),
+  async (req: Request, res: Response) => {
+    const { tempCredentialsToken, newPassword } = req.body as {
+      tempCredentialsToken: string;
+      newPassword: string;
+    };
+    const ip = clientIp(req);
+    const userAgent = req.headers['user-agent'];
+
+    try {
+      const tokenHash = hashToken(tempCredentialsToken);
+
+      const tokenRow = await prisma.passwordResetToken.findUnique({
+        where: { tokenHash },
+        include: { employee: true },
+      });
+
+      if (!tokenRow || tokenRow.purpose !== 'FirstLogin') {
+        res
+          .status(400)
+          .json(errorEnvelope(ErrorCode.TOKEN_INVALID, 'Invalid or unknown first-login token.'));
+        return;
+      }
+
+      if (tokenRow.usedAt) {
+        res
+          .status(400)
+          .json(
+            errorEnvelope(
+              ErrorCode.TOKEN_INVALID,
+              'This first-login link has already been used.',
+            ),
+          );
+        return;
+      }
+
+      if (tokenRow.expiresAt < new Date()) {
+        res
+          .status(400)
+          .json(
+            errorEnvelope(
+              ErrorCode.TOKEN_EXPIRED,
+              'This first-login link has expired. Please contact your administrator.',
+            ),
+          );
+        return;
+      }
+
+      const passwordHash = await hashPassword(newPassword);
+
+      const updatedEmployee = await prisma.$transaction(async (tx) => {
+        const emp = await tx.employee.update({
+          where: { id: tokenRow.employeeId },
+          data: {
+            passwordHash,
+            mustResetPassword: false,
+            status: 'Active',
+            updatedAt: new Date(),
+          },
+        });
+
+        await tx.passwordResetToken.update({
+          where: { id: tokenRow.id },
+          data: { usedAt: new Date() },
+        });
+
+        await audit({
+          tx,
+          actorId: tokenRow.employeeId,
+          actorRole: tokenRow.employee.role,
+          actorIp: ip,
+          action: 'auth.first-login.complete',
+          targetType: 'Employee',
+          targetId: tokenRow.employeeId,
+          module: 'auth',
+          before: { mustResetPassword: true, status: tokenRow.employee.status },
+          after: { mustResetPassword: false, status: 'Active' },
+        });
+
+        return emp;
+      });
+
+      // Create session after password is set
+      const { sessionId } = await createSessionFor({
+        employeeId: tokenRow.employeeId,
+        ip,
+        userAgent,
+        rememberMe: false,
+      });
+
+      setSessionCookie(res, sessionId, false);
+
+      const emp = updatedEmployee;
+      res.status(200).json({
+        data: {
+          user: {
+            id: emp.id,
+            code: emp.code,
+            email: emp.email,
+            name: emp.name,
+            role: emp.role,
+            status: mapStatus(emp.status),
+            department: emp.department ?? null,
+            designation: emp.designation ?? null,
+            reportingManagerId: emp.reportingManagerId ?? null,
+            mustResetPassword: emp.mustResetPassword,
+          },
+          role: emp.role,
+        },
+      });
+    } catch (err: unknown) {
+      logger.error({ err }, 'auth.first-login.error');
+      res
+        .status(500)
+        .json(
+          errorEnvelope(
+            ErrorCode.INTERNAL_ERROR,
+            'First-login setup failed due to a server error.',
+          ),
+        );
+    }
+  },
+);
+
+// ── GET /me ───────────────────────────────────────────────────────────────────
+
+router.get('/me', requireSession(), (req: Request, res: Response) => {
+  const user = req.user!;
+
+  res.status(200).json({
+    data: {
+      user: {
+        id: user.id,
+        code: user.code,
+        email: user.email,
+        name: user.name,
+        role: user.role,
+        status: user.status,
+        department: user.department ?? null,
+        designation: user.designation ?? null,
+        reportingManagerId: user.reportingManagerId ?? null,
+        mustResetPassword: user.mustResetPassword,
+      },
+      role: user.role,
+      permissions: permissionsFor(user.role),
+    },
+  });
+});
+
+export { router as authRouter };

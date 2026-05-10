@@ -1,0 +1,35 @@
+/**
+ * Root /api/v1 router.
+ * Add sub-routers here as modules are implemented in later phases.
+ */
+
+import { Router } from 'express';
+import { authRouter } from './modules/auth/auth.routes.js';
+
+const v1Router = Router();
+
+// Health endpoint (no auth required)
+v1Router.get('/health', (_req, res) => {
+  res.status(200).json({
+    data: {
+      status: 'ok',
+      uptime: process.uptime(),
+      version: process.env['npm_package_version'] ?? '0.1.0',
+    },
+  });
+});
+
+// Auth module (Phase 0)
+v1Router.use('/auth', authRouter);
+
+// Phase 1+ modules will be mounted here:
+// v1Router.use('/employees', employeesRouter);
+// v1Router.use('/leave', leaveRouter);
+// v1Router.use('/attendance', attendanceRouter);
+// v1Router.use('/payroll', payrollRouter);
+// v1Router.use('/performance', performanceRouter);
+// v1Router.use('/notifications', notificationsRouter);
+// v1Router.use('/audit', auditRouter);
+// v1Router.use('/config', configRouter);
+
+export { v1Router };
