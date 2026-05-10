@@ -59,6 +59,20 @@ export function requireSession(): RequestHandler {
 
     const { employee } = session;
 
+    // SEC-002-P2: a session belonging to an Exited or Inactive employee must
+    // not authenticate further requests, even if the cookie hasn't expired.
+    // We delete the row defensively so subsequent calls also fail fast, and
+    // surface the same UNAUTHENTICATED envelope so the caller can't tell
+    // whether the session is missing or just disabled.
+    if (employee.status === 'Exited' || employee.status === 'Inactive') {
+      await prisma.session.delete({ where: { id: session.id } }).catch(() => undefined);
+      res.clearCookie(COOKIE_NAME, { path: '/' });
+      res
+        .status(401)
+        .json(errorEnvelope(ErrorCode.UNAUTHENTICATED, 'Session is no longer valid.'));
+      return;
+    }
+
     // Map DB EmployeeStatus enum (no hyphens) → zod enum (with hyphens)
     const statusMap: Record<string, AuthUser['status']> = {
       Active: 'Active',

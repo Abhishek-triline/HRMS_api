@@ -59,6 +59,33 @@ import {
   ProfileResponseSchema,
   SalaryStructureSchema,
 } from '@nexora/contracts/employees';
+import {
+  LeaveTypeSchema,
+  LeaveStatusSchema,
+  RoutedToSchema,
+  LeaveBalanceSchema,
+  LeaveBalancesResponseSchema,
+  LeaveTypeCatalogItemSchema,
+  LeaveTypesResponseSchema,
+  LeaveRequestSchema,
+  LeaveRequestSummarySchema,
+  CreateLeaveRequestSchema,
+  CreateLeaveResponseSchema,
+  LeaveListQuerySchema,
+  LeaveListResponseSchema,
+  LeaveRequestDetailResponseSchema,
+  ApproveLeaveRequestSchema,
+  ApproveLeaveResponseSchema,
+  RejectLeaveRequestSchema,
+  RejectLeaveResponseSchema,
+  CancelLeaveRequestSchema,
+  CancelLeaveResponseSchema,
+  LeaveConflictDetailsSchema,
+  AdjustBalanceRequestSchema,
+  AdjustBalanceResponseSchema,
+  UpdateLeaveTypeRequestSchema,
+  UpdateLeaveQuotaRequestSchema,
+} from '@nexora/contracts/leave';
 
 // Augment the local `z` with .openapi() — required before any registry call.
 extendZodWithOpenApi(z);
@@ -512,6 +539,287 @@ registry.registerPath({
     },
     ...errorResponse(401, 'UNAUTHENTICATED.'),
     ...errorResponse(404, 'NOT_FOUND — or access denied (no leakage).'),
+  },
+});
+
+// ── Phase 2 — Leave Management ─────────────────────────────────────────────
+
+registry.register('LeaveType', LeaveTypeSchema);
+registry.register('LeaveStatus', LeaveStatusSchema);
+registry.register('RoutedTo', RoutedToSchema);
+registry.register('LeaveBalance', LeaveBalanceSchema);
+registry.register('LeaveBalancesResponse', LeaveBalancesResponseSchema);
+registry.register('LeaveTypeCatalogItem', LeaveTypeCatalogItemSchema);
+registry.register('LeaveTypesResponse', LeaveTypesResponseSchema);
+registry.register('LeaveRequest', LeaveRequestSchema);
+registry.register('LeaveRequestSummary', LeaveRequestSummarySchema);
+registry.register('CreateLeaveRequest', CreateLeaveRequestSchema);
+registry.register('CreateLeaveResponse', CreateLeaveResponseSchema);
+registry.register('LeaveListQuery', LeaveListQuerySchema);
+registry.register('LeaveListResponse', LeaveListResponseSchema);
+registry.register('LeaveRequestDetailResponse', LeaveRequestDetailResponseSchema);
+registry.register('ApproveLeaveRequest', ApproveLeaveRequestSchema);
+registry.register('ApproveLeaveResponse', ApproveLeaveResponseSchema);
+registry.register('RejectLeaveRequest', RejectLeaveRequestSchema);
+registry.register('RejectLeaveResponse', RejectLeaveResponseSchema);
+registry.register('CancelLeaveRequest', CancelLeaveRequestSchema);
+registry.register('CancelLeaveResponse', CancelLeaveResponseSchema);
+registry.register('LeaveConflictDetails', LeaveConflictDetailsSchema);
+registry.register('AdjustBalanceRequest', AdjustBalanceRequestSchema);
+registry.register('AdjustBalanceResponse', AdjustBalanceResponseSchema);
+registry.register('UpdateLeaveTypeRequest', UpdateLeaveTypeRequestSchema);
+registry.register('UpdateLeaveQuotaRequest', UpdateLeaveQuotaRequestSchema);
+
+registry.registerPath({
+  method: 'get',
+  path: '/leave/types',
+  tags: ['Leave'],
+  summary: 'Get leave type catalogue (all roles)',
+  security: [{ sessionCookie: [] }],
+  responses: {
+    200: {
+      description: 'Leave type catalogue with quotas per employment type.',
+      content: { 'application/json': { schema: LeaveTypesResponseSchema } },
+    },
+    ...errorResponse(401, 'UNAUTHENTICATED.'),
+  },
+});
+
+registry.registerPath({
+  method: 'get',
+  path: '/leave/balances/{employeeId}',
+  tags: ['Leave'],
+  summary: 'Get leave balances for an employee (SELF / Manager / Admin)',
+  description:
+    'Returns the current-year balance for every leave type. ' +
+    'Event-based types (Maternity/Paternity) show null remaining / total with an `eligible` flag.',
+  security: [{ sessionCookie: [] }],
+  request: { params: z.object({ employeeId: z.string() }) },
+  responses: {
+    200: {
+      description: 'Leave balances for the requested year.',
+      content: { 'application/json': { schema: LeaveBalancesResponseSchema } },
+    },
+    ...errorResponse(401, 'UNAUTHENTICATED.'),
+    ...errorResponse(403, 'FORBIDDEN — caller is not authorised for this employee.'),
+    ...errorResponse(404, 'NOT_FOUND — employee does not exist or outside caller scope.'),
+  },
+});
+
+registry.registerPath({
+  method: 'post',
+  path: '/leave/requests',
+  tags: ['Leave'],
+  summary: 'Submit a leave request (any authenticated user)',
+  description:
+    'BL-009: returns 409 LEAVE_OVERLAP if dates clash with an existing request. ' +
+    'BL-010: returns 409 LEAVE_REG_CONFLICT if dates clash with an approved regularisation. ' +
+    'BL-014: returns 409 INSUFFICIENT_BALANCE if balance is insufficient. ' +
+    'Routing: Maternity/Paternity → Admin (BL-015/016); no-manager → Admin (BL-017); else Manager.',
+  security: [{ sessionCookie: [] }],
+  request: {
+    body: { required: true, content: { 'application/json': { schema: CreateLeaveRequestSchema } } },
+  },
+  responses: {
+    201: {
+      description: 'Leave request created. Balance snapshot before deduction.',
+      content: { 'application/json': { schema: CreateLeaveResponseSchema } },
+    },
+    ...errorResponse(400, 'VALIDATION_FAILED — invalid body.'),
+    ...errorResponse(401, 'UNAUTHENTICATED.'),
+    ...errorResponse(409, 'LEAVE_OVERLAP | LEAVE_REG_CONFLICT | INSUFFICIENT_BALANCE.'),
+  },
+});
+
+registry.registerPath({
+  method: 'get',
+  path: '/leave/requests',
+  tags: ['Leave'],
+  summary: 'List leave requests (scoped by role)',
+  description:
+    'Employee: own requests only. Manager: own + team requests where they are the approver. ' +
+    'Admin: all requests with optional ?routedTo filter for escalations/event-based queue.',
+  security: [{ sessionCookie: [] }],
+  request: { query: LeaveListQuerySchema },
+  responses: {
+    200: {
+      description: 'Paginated list of leave request summaries.',
+      content: { 'application/json': { schema: LeaveListResponseSchema } },
+    },
+    ...errorResponse(400, 'VALIDATION_FAILED.'),
+    ...errorResponse(401, 'UNAUTHENTICATED.'),
+  },
+});
+
+registry.registerPath({
+  method: 'get',
+  path: '/leave/requests/{id}',
+  tags: ['Leave'],
+  summary: 'Get leave request detail',
+  description:
+    'Returns full detail. Accessible by: owner, current approverId, Admin, or Manager-in-chain. ' +
+    '404 when not visible (no leakage).',
+  security: [{ sessionCookie: [] }],
+  request: { params: z.object({ id: z.string() }) },
+  responses: {
+    200: {
+      description: 'Full leave request detail.',
+      content: { 'application/json': { schema: LeaveRequestDetailResponseSchema } },
+    },
+    ...errorResponse(401, 'UNAUTHENTICATED.'),
+    ...errorResponse(404, 'NOT_FOUND.'),
+  },
+});
+
+registry.registerPath({
+  method: 'post',
+  path: '/leave/requests/{id}/approve',
+  tags: ['Leave'],
+  summary: 'Approve a leave request',
+  description:
+    'BL-021: balance deducted immediately on approval. ' +
+    'Uses optimistic concurrency via `version`. ' +
+    'Manager may only approve requests in their queue (approverId == self).',
+  security: [{ sessionCookie: [] }],
+  request: {
+    params: z.object({ id: z.string() }),
+    body: { required: true, content: { 'application/json': { schema: ApproveLeaveRequestSchema } } },
+  },
+  responses: {
+    200: {
+      description: 'Approved leave request with deducted balance.',
+      content: { 'application/json': { schema: ApproveLeaveResponseSchema } },
+    },
+    ...errorResponse(401, 'UNAUTHENTICATED.'),
+    ...errorResponse(403, 'FORBIDDEN.'),
+    ...errorResponse(404, 'NOT_FOUND.'),
+    ...errorResponse(409, 'VERSION_MISMATCH or invalid status transition.'),
+  },
+});
+
+registry.registerPath({
+  method: 'post',
+  path: '/leave/requests/{id}/reject',
+  tags: ['Leave'],
+  summary: 'Reject a leave request (note required)',
+  security: [{ sessionCookie: [] }],
+  request: {
+    params: z.object({ id: z.string() }),
+    body: { required: true, content: { 'application/json': { schema: RejectLeaveRequestSchema } } },
+  },
+  responses: {
+    200: {
+      description: 'Rejected leave request.',
+      content: { 'application/json': { schema: RejectLeaveResponseSchema } },
+    },
+    ...errorResponse(400, 'VALIDATION_FAILED — note is required (min 3 chars).'),
+    ...errorResponse(401, 'UNAUTHENTICATED.'),
+    ...errorResponse(403, 'FORBIDDEN.'),
+    ...errorResponse(404, 'NOT_FOUND.'),
+    ...errorResponse(409, 'VERSION_MISMATCH.'),
+  },
+});
+
+registry.registerPath({
+  method: 'post',
+  path: '/leave/requests/{id}/cancel',
+  tags: ['Leave'],
+  summary: 'Cancel a leave request (BL-019 / BL-020)',
+  description:
+    'BL-019: Owner may cancel if Pending or Approved-before-start. Manager/Admin may always cancel. ' +
+    'BL-020: full restore before start; partial restore after start (days already consumed deducted).',
+  security: [{ sessionCookie: [] }],
+  request: {
+    params: z.object({ id: z.string() }),
+    body: { required: true, content: { 'application/json': { schema: CancelLeaveRequestSchema } } },
+  },
+  responses: {
+    200: {
+      description: 'Cancelled request with restoredDays.',
+      content: { 'application/json': { schema: CancelLeaveResponseSchema } },
+    },
+    ...errorResponse(401, 'UNAUTHENTICATED.'),
+    ...errorResponse(403, 'FORBIDDEN.'),
+    ...errorResponse(404, 'NOT_FOUND.'),
+    ...errorResponse(409, 'VERSION_MISMATCH.'),
+  },
+});
+
+registry.registerPath({
+  method: 'post',
+  path: '/leave/balances/adjust',
+  tags: ['Leave'],
+  summary: 'Admin: adjust an employee leave balance (A-07)',
+  description:
+    'One-off balance correction. Positive delta = grant; negative = deduct. ' +
+    'Always audit-logged with before/after. Integer days only (BL-011).',
+  security: [{ sessionCookie: [] }],
+  request: {
+    body: { required: true, content: { 'application/json': { schema: AdjustBalanceRequestSchema } } },
+  },
+  responses: {
+    200: {
+      description: 'Updated balance snapshot.',
+      content: { 'application/json': { schema: AdjustBalanceResponseSchema } },
+    },
+    ...errorResponse(400, 'VALIDATION_FAILED.'),
+    ...errorResponse(401, 'UNAUTHENTICATED.'),
+    ...errorResponse(403, 'FORBIDDEN — Admin only.'),
+    ...errorResponse(404, 'NOT_FOUND.'),
+  },
+});
+
+registry.registerPath({
+  method: 'get',
+  path: '/leave/config/types',
+  tags: ['Leave'],
+  summary: 'Get leave type catalogue (admin config UI alias)',
+  security: [{ sessionCookie: [] }],
+  responses: {
+    200: {
+      description: 'Leave type catalogue.',
+      content: { 'application/json': { schema: LeaveTypesResponseSchema } },
+    },
+    ...errorResponse(401, 'UNAUTHENTICATED.'),
+  },
+});
+
+registry.registerPath({
+  method: 'patch',
+  path: '/leave/config/types/{type}',
+  tags: ['Leave'],
+  summary: 'Update leave type config (A-08, Admin only)',
+  description: 'Update carryForwardCap or maxDaysPerEvent for a leave type. Audit-logged.',
+  security: [{ sessionCookie: [] }],
+  request: {
+    params: z.object({ type: z.string() }),
+    body: { required: true, content: { 'application/json': { schema: UpdateLeaveTypeRequestSchema } } },
+  },
+  responses: {
+    200: { description: 'Updated leave type config.' },
+    ...errorResponse(400, 'VALIDATION_FAILED.'),
+    ...errorResponse(401, 'UNAUTHENTICATED.'),
+    ...errorResponse(403, 'FORBIDDEN — Admin only.'),
+    ...errorResponse(404, 'NOT_FOUND.'),
+  },
+});
+
+registry.registerPath({
+  method: 'patch',
+  path: '/leave/config/quotas/{type}',
+  tags: ['Leave'],
+  summary: 'Update leave quota for an employment type (A-08, Admin only)',
+  security: [{ sessionCookie: [] }],
+  request: {
+    params: z.object({ type: z.string() }),
+    body: { required: true, content: { 'application/json': { schema: UpdateLeaveQuotaRequestSchema } } },
+  },
+  responses: {
+    200: { description: 'Updated quota.' },
+    ...errorResponse(400, 'VALIDATION_FAILED.'),
+    ...errorResponse(401, 'UNAUTHENTICATED.'),
+    ...errorResponse(403, 'FORBIDDEN — Admin only.'),
+    ...errorResponse(404, 'NOT_FOUND.'),
   },
 });
 

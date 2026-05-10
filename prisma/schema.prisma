@@ -89,6 +89,11 @@ model Employee {
   salaryStructures      SalaryStructure[]
   reportingManagerHistory ReportingManagerHistory[] @relation("EmployeeHistory")
   managedHistories        ReportingManagerHistory[] @relation("ManagerHistory")
+  // Phase 2 — Leave
+  leaveRequests           LeaveRequest[]     @relation("EmployeeLeaveRequests")
+  leaveRequestsApproving  LeaveRequest[]     @relation("LeaveApprover")
+  leaveBalances           LeaveBalance[]
+  leaveBalanceLedger      LeaveBalanceLedger[] @relation("EmployeeLedger")
 
   @@index([email])
   @@index([reportingManagerId])
@@ -211,4 +216,158 @@ model Configuration {
   updatedAt DateTime @updatedAt
 
   @@map("configuration")
+}
+
+// ── Phase 2 — Leave Management ───────────────────────────────────────────────
+
+/// BL-011 / BL-015 / BL-016: Leave type definitions.
+/// name is validated as one of the 6 canonical types at the application layer (zod).
+/// isEventBased=true for Maternity/Paternity (no annual accrual).
+model LeaveType {
+  id                    String   @id @default(cuid())
+  name                  String   @unique   // 'Annual'|'Sick'|'Casual'|'Unpaid'|'Maternity'|'Paternity'
+  isEventBased          Boolean
+  requiresAdminApproval Boolean
+  /// Annual + Casual carry forward; Sick/Unpaid/event-based = 0 or null
+  carryForwardCap       Int?
+  /// Maternity = 182 days (26w), Paternity = 10 days; null for accrual types
+  maxDaysPerEvent       Int?
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+
+  quotas     LeaveQuota[]
+  balances   LeaveBalance[]
+  requests   LeaveRequest[]
+  ledger     LeaveBalanceLedger[]
+
+  @@map("leave_types")
+}
+
+/// Per-employment-type entitlement for each accrual leave type.
+/// Maternity/Paternity have no quota rows (event-based, no annual limit).
+model LeaveQuota {
+  id              String         @id @default(cuid())
+  leaveTypeId     String
+  leaveType       LeaveType      @relation(fields: [leaveTypeId], references: [id], onDelete: Cascade)
+  employmentType  EmploymentType
+  daysPerYear     Int
+
+  @@unique([leaveTypeId, employmentType])
+  @@index([leaveTypeId])
+  @@map("leave_quotas")
+}
+
+/// Per-employee per-year balance snapshot (BL-021).
+/// version for optimistic concurrency on balance mutations.
+/// daysUsed tracks lifetime usage for event-based types in a given year.
+model LeaveBalance {
+  id            String    @id @default(cuid())
+  employeeId    String
+  employee      Employee  @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  leaveTypeId   String
+  leaveType     LeaveType @relation(fields: [leaveTypeId], references: [id], onDelete: Cascade)
+  year          Int       // calendar year
+  daysRemaining Int       @default(0)
+  daysUsed      Int       @default(0)  // running tally; for event-based: lifetime used this year
+  version       Int       @default(0)
+
+  @@unique([employeeId, leaveTypeId, year])
+  @@index([employeeId, year])
+  @@map("leave_balances")
+}
+
+/// Tracks pending + resolved leave requests. BL-009 / BL-019 / BL-020 / BL-021.
+model LeaveRequest {
+  id                 String              @id @default(cuid())
+  /// Format: L-YYYY-NNNN (same pattern as EMP code)
+  code               String              @unique
+  employeeId         String
+  employee           Employee            @relation("EmployeeLeaveRequests", fields: [employeeId], references: [id], onDelete: Cascade)
+  leaveTypeId        String
+  leaveType          LeaveType           @relation(fields: [leaveTypeId], references: [id], onDelete: Restrict)
+  fromDate           DateTime            @db.Date
+  toDate             DateTime            @db.Date
+  days               Int                 // server-computed inclusive count (BL-011)
+  reason             String              @db.Text
+  status             LeaveRequestStatus  @default(Pending)
+  routedTo           RoutedTo
+  /// The current approver (Manager or Admin). Null after final decision.
+  approverId         String?
+  approver           Employee?           @relation("LeaveApprover", fields: [approverId], references: [id], onDelete: SetNull)
+  decidedAt          DateTime?
+  decidedBy          String?             // employee id of the decision-maker
+  decisionNote       String?             @db.Text
+  escalatedAt        DateTime?           // set by the hourly cron (BL-018)
+  cancelledAt        DateTime?
+  cancelledBy        String?
+  /// BL-020: true when cancellation happens on/after fromDate
+  cancelledAfterStart Boolean            @default(false)
+  /// Balance deduction recorded on approval (BL-021); 0 until approved
+  deductedDays       Int                 @default(0)
+  /// Days restored on cancellation (BL-020)
+  restoredDays       Int                 @default(0)
+  createdAt          DateTime            @default(now())
+  updatedAt          DateTime            @updatedAt
+  version            Int                 @default(0)
+
+  ledgerEntries      LeaveBalanceLedger[]
+
+  @@index([employeeId, fromDate])
+  @@index([approverId, status])
+  @@index([status, escalatedAt])
+  @@map("leave_requests")
+}
+
+/// Append-only ledger — every balance change is a row (BL-021 traceability).
+/// Reconstruct the balance at any point by summing delta for (employeeId, leaveTypeId, year).
+model LeaveBalanceLedger {
+  id               String        @id @default(cuid())
+  employeeId       String
+  employee         Employee      @relation("EmployeeLedger", fields: [employeeId], references: [id], onDelete: Cascade)
+  leaveTypeId      String
+  leaveType        LeaveType     @relation(fields: [leaveTypeId], references: [id], onDelete: Cascade)
+  year             Int
+  /// Positive = grant; negative = deduction (full days only, BL-011)
+  delta            Int
+  reason           LedgerReason
+  /// The leave request that triggered this entry (null for adjustments/carry-forward)
+  relatedRequestId String?
+  relatedRequest   LeaveRequest? @relation(fields: [relatedRequestId], references: [id], onDelete: SetNull)
+  createdBy        String?       // actorId; null for system/cron
+  createdAt        DateTime      @default(now())
+
+  @@index([employeeId, leaveTypeId, year])
+  @@index([relatedRequestId])
+  @@map("leave_balance_ledger")
+}
+
+/// Counter table for generating L-YYYY-NNNN codes — same pattern as EMP code.
+model LeaveCodeCounter {
+  year    Int @id
+  lastSeq Int @default(0)
+
+  @@map("leave_code_counters")
+}
+
+// ── Leave enums ──────────────────────────────────────────────────────────────
+
+enum LeaveRequestStatus {
+  Pending
+  Approved
+  Rejected
+  Cancelled
+  Escalated
+}
+
+enum RoutedTo {
+  Manager
+  Admin
+}
+
+enum LedgerReason {
+  Approval
+  Cancellation
+  CarryForward
+  Adjustment
+  Initial
 }

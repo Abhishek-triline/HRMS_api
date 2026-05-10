@@ -23,6 +23,7 @@ import { v1Router } from './router.js';
 import { errorHandler } from './middleware/errorHandler.js';
 import { errorEnvelope, ErrorCode } from '@nexora/contracts/errors';
 import { logger } from './lib/logger.js';
+import { startScheduler } from './lib/scheduler.js';
 
 // Load .env before anything else accesses process.env
 // (Prisma, pino-http, and app config all read env at module init time)
@@ -186,6 +187,10 @@ app.listen(API_PORT, () => {
     { port: API_PORT, env: process.env['NODE_ENV'] ?? 'development' },
     `Nexora HRMS API listening on port ${API_PORT}`,
   );
+
+  // Start scheduled jobs (Phase 2+) after the server is listening.
+  // Disable in tests via ENABLE_CRON=false.
+  startScheduler();
 });
 
 export { app };

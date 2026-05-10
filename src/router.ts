@@ -8,6 +8,7 @@ import swaggerUi from 'swagger-ui-express';
 
 import { authRouter } from './modules/auth/auth.routes.js';
 import { employeesRouter } from './modules/employees/employees.routes.js';
+import { leaveRouter } from './modules/leave/leave.routes.js';
 import { openApiSpec } from './lib/openapi.js';
 
 const v1Router = Router();
@@ -48,8 +49,10 @@ v1Router.use('/auth', authRouter);
 // Phase 1 — Employees & Hierarchy
 v1Router.use('/employees', employeesRouter);
 
-// Phase 2+ modules will be mounted here:
-// v1Router.use('/leave', leaveRouter);
+// Phase 2 — Leave Management
+v1Router.use('/leave', leaveRouter);
+
+// Phase 3+ modules will be mounted here:
 // v1Router.use('/attendance', attendanceRouter);
 // v1Router.use('/payroll', payrollRouter);
 // v1Router.use('/performance', performanceRouter);

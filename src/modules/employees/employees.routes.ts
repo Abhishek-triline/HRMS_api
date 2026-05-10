@@ -848,6 +848,13 @@ router.post(
             where: { employeeId: id, toDate: null },
             data: { toDate: effectiveDate, reason: 'Exited' },
           });
+
+          // SEC-002-P2: revoke every active session for this employee on
+          // the spot — they MUST NOT be able to keep using the system on
+          // their previous cookie. requireSession also defends in depth
+          // by rejecting Exited employees on every request, but pre-emptive
+          // deletion makes the access cut clean.
+          await tx.session.deleteMany({ where: { employeeId: id } });
         }
 
         const u = await tx.employee.update({
