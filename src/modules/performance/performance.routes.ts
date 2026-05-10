@@ -369,9 +369,12 @@ router.get(
         return;
       }
 
-      // Reviews with missing manager rating (managerSubmittedAt IS NULL)
+      // Reviews with missing manager rating (managerSubmittedAt IS NULL).
+      // BUG-PERF-001 fix — mid-cycle joiners (BL-037) are excluded from
+      // the cycle's rating workflow and must NOT appear in this report.
+      // Mirrors the distribution-report filter.
       const reviews = await prisma.performanceReview.findMany({
-        where: { cycleId: id, managerSubmittedAt: null },
+        where: { cycleId: id, managerSubmittedAt: null, isMidCycleJoiner: false },
         include: {
           employee: { select: { name: true, code: true, department: true, designation: true } },
           manager: { select: { name: true } },

@@ -935,16 +935,29 @@ export async function submitManagerRating(
     version: review.version,
   };
 
-  // Apply goal outcome updates if provided
+  // Apply goal outcome updates if provided.
+  // SEC-002-P5 fix — every goal update is constrained to THIS review.
+  // Without the `reviewId` clause a malicious manager could pass goal IDs
+  // from a different review they have access to and falsify outcomes on
+  // a colleague's record. `updateMany` returns count=0 when the goal
+  // doesn't belong to this review; we treat that as a hard error.
   if (goals && goals.length > 0) {
     for (const g of goals) {
-      await tx.goal.update({
-        where: { id: g.id },
+      const result = await tx.goal.updateMany({
+        where: { id: g.id, reviewId },
         data: {
           outcome: mapGoalOutcomeToDB(g.outcome),
           version: { increment: 1 },
         },
       });
+      if (result.count === 0) {
+        const err = new Error(
+          `Goal ${g.id} does not belong to review ${reviewId}.`,
+        ) as Error & { statusCode?: number; code?: string };
+        err.statusCode = 400;
+        err.code = 'VALIDATION_FAILED';
+        throw err;
+      }
     }
   }
 
