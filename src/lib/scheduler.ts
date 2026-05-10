@@ -192,15 +192,37 @@ export function startScheduler(): void {
       logger.info({ job: jobId }, 'Starting notification retention sweep');
 
       try {
-        // Read retention days from configuration (default 90 per BL-045)
+        // SEC-003-P6: Read retention days from configuration with validated parse.
+        // Unsafe cast (config?.value as number) replaced with type-safe guard +
+        // clamp to [1, 3650] to prevent NaN, Infinity, negative, or absurd values.
         const config = await prisma.configuration.findUnique({
           where: { key: 'NOTIFICATION_RETENTION_DAYS' },
         });
-        const retentionDays = (config?.value as number) ?? 90;
+        const rawValue = config?.value;
+        const parsed =
+          typeof rawValue === 'number' && Number.isFinite(rawValue) ? rawValue : 90;
+        const retentionDays = Math.max(1, Math.min(parsed, 3650)); // floor 1d, ceiling 10y
         const cutoff = new Date(Date.now() - retentionDays * 24 * 60 * 60 * 1000);
 
         const deleted = await prisma.notification.deleteMany({
           where: { createdAt: { lt: cutoff } },
+        });
+
+        // SEC-003-P6: Audit each sweep for traceability (even though notifications
+        // themselves are derived data, the sweep action warrants an audit row).
+        await audit({
+          actorId: null,
+          actorRole: 'system',
+          action: 'notifications.archive-90d',
+          targetType: null,
+          targetId: null,
+          module: 'notifications',
+          before: null,
+          after: {
+            retentionDays,
+            cutoff: cutoff.toISOString(),
+            deletedCount: deleted.count,
+          },
         });
 
         logger.info(

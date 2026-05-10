@@ -98,6 +98,23 @@ export async function notify(params: NotifyParams): Promise<void> {
   const unique = Array.from(new Set(recipients.filter(Boolean)));
   if (unique.length === 0) return;
 
+  // SEC-001-P6: Defence-in-depth — sanitize link even if caller skips contract validation.
+  // A link that doesn't start with '/' (absolute URL, protocol-relative, javascript:, etc.)
+  // is nulled out and a warning is emitted. Truncate to 191 chars for symmetry with
+  // title/body limits (also covers SEC-008-P6 Info).
+  let safeLink: string | null = params.link ?? null;
+  if (safeLink !== null) {
+    if (!/^\//.test(safeLink)) {
+      logger.warn(
+        { link: safeLink, category: params.category },
+        'notify: link does not start with / — nulled for safety (SEC-001-P6)',
+      );
+      safeLink = null;
+    } else {
+      safeLink = safeLink.slice(0, 191);
+    }
+  }
+
   try {
     await db.notification.createMany({
       data: unique.map((recipientId) => ({
@@ -105,7 +122,7 @@ export async function notify(params: NotifyParams): Promise<void> {
         category: mapCategoryToDB(params.category),
         title: params.title.slice(0, 120),
         body: params.body.slice(0, 600),
-        link: params.link ?? null,
+        link: safeLink,
         auditLogId: params.auditLogId ?? null,
       })),
       // createMany with skipDuplicates is intentionally NOT set — every event

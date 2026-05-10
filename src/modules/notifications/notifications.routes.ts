@@ -186,6 +186,22 @@ notificationsRouter.post(
           data: { unread: false },
         });
         updated = result.count;
+
+        // SEC-002-P6: Detect and log possible IDOR attempts.
+        // If fewer rows were updated than requested, some IDs either don't
+        // belong to this user, don't exist, or were already read. The count
+        // discrepancy alone is suspicious — log it for forensics.
+        if (result.count < body.ids.length) {
+          logger.warn(
+            {
+              userId: user.id,
+              requestedIds: body.ids.length,
+              updatedCount: result.count,
+              missingCount: body.ids.length - result.count,
+            },
+            'notifications.mark-read: some IDs did not match caller — possible IDOR attempt',
+          );
+        }
       } else {
         updated = 0;
       }
