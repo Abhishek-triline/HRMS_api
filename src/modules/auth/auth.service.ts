@@ -3,7 +3,7 @@
  *
  * Covers:
  *  - Password hashing / verification (argon2id)
- *  - Lockout detection (5-strikes in 15 min, BL-005)
+ *  - Lockout detection (25-strikes in 5 min)
  *  - Session creation
  *  - Permission derivation from role
  */
@@ -42,8 +42,10 @@ export async function verifyPassword(plain: string, hash: string): Promise<boole
 
 // ── Login attempt tracking ────────────────────────────────────────────────────
 
-const LOCKOUT_THRESHOLD = Number(process.env['LOGIN_LOCKOUT_THRESHOLD'] ?? 5);
-const LOCKOUT_MINUTES = Number(process.env['LOGIN_LOCKOUT_MINUTES'] ?? 15);
+// Hardcoded — env overrides removed by request. Bump the constants directly
+// if you need to tune. 25 failed attempts in a 5-minute window before lockout.
+const LOCKOUT_THRESHOLD = 25;
+const LOCKOUT_MINUTES = 5;
 
 /**
  * Record a login attempt (success or failure).

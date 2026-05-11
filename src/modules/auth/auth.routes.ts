@@ -10,7 +10,7 @@
  *   GET  /me                        —
  *
  * Business rules enforced:
- *   BL-005 (5-strikes lockout, 15 min)
+ *   BL-005 (lockout — relaxed to 25 strikes / 5 min)
  *   BL-047 (audit every auth event)
  *   UC-FL-01 (first login → must set password)
  *   UC-FL-02 (forgot/reset password flow, no enumeration leak)

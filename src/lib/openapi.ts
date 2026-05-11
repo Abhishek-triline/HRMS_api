@@ -331,7 +331,6 @@ registry.registerPath({
       content: { 'application/json': { schema: ForgotPasswordResponseSchema } },
     },
     ...errorResponse(400, 'VALIDATION_FAILED — invalid request body.'),
-    ...errorResponse(429, 'RATE_LIMITED — too many requests; retry later.'),
   },
 });
 

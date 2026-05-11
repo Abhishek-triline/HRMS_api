@@ -3,7 +3,7 @@
  *
  * Startup order:
  *  1. Validate required env vars (fail fast with a friendly message)
- *  2. Create Express app with security middleware (helmet, CORS, rate-limit)
+ *  2. Create Express app with security middleware (helmet, CORS)
  *  3. Attach pino-http request logger with traceId
  *  4. Mount /api/v1 router
  *  5. 404 + global error handler
@@ -14,7 +14,6 @@ import { config as dotenvConfig } from 'dotenv';
 import express from 'express';
 import helmet from 'helmet';
 import cors from 'cors';
-import rateLimit from 'express-rate-limit';
 import cookieParser from 'cookie-parser';
 import { pinoHttp } from 'pino-http';
 import type { IncomingMessage } from 'node:http';
@@ -84,40 +83,6 @@ if (process.env['NODE_ENV'] === 'production') {
   }
 }
 
-// ── Rate limiters ─────────────────────────────────────────────────────────────
-
-// Production defaults: tight. Development defaults: looser. Either can be
-// overridden via env (RATE_LIMIT_AUTH_MAX / RATE_LIMIT_GLOBAL_MAX) so an
-// operator can tune for their proxy topology and traffic shape without a
-// code change.
-const IS_DEV = process.env['NODE_ENV'] !== 'production';
-const AUTH_MAX = Number(process.env['RATE_LIMIT_AUTH_MAX'] ?? (IS_DEV ? 50 : 5));
-const GLOBAL_MAX = Number(
-  process.env['RATE_LIMIT_GLOBAL_MAX'] ?? (IS_DEV ? 2000 : 100),
-);
-
-const authLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 min
-  // SEC-P8-013: prod aligns with LOCKOUT_THRESHOLD (5) in auth.service.ts.
-  // Dev allows ~50/15min so developers and demos don't hit the wall.
-  max: AUTH_MAX,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: errorEnvelope(
-    ErrorCode.RATE_LIMITED,
-    'Too many requests. Please try again after 15 minutes.',
-  ),
-  skip: () => process.env['NODE_ENV'] === 'test',
-});
-
-const globalLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: GLOBAL_MAX,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: errorEnvelope(ErrorCode.RATE_LIMITED, 'Too many requests.'),
-  skip: () => process.env['NODE_ENV'] === 'test',
-});
 
 // ── App ───────────────────────────────────────────────────────────────────────
 
@@ -185,16 +150,6 @@ const httpLogger = pinoHttp({
   },
 });
 app.use(httpLogger as unknown as express.RequestHandler);
-
-// Global rate limiter (applied before routes)
-app.use(globalLimiter);
-
-// Tighter rate limit on auth mutation endpoints
-// SEC-P8-002: also cover token-consumption endpoints to prevent brute-forcing reset/first-login flows
-app.use('/api/v1/auth/login', authLimiter);
-app.use('/api/v1/auth/forgot-password', authLimiter);
-app.use('/api/v1/auth/reset-password', authLimiter);
-app.use('/api/v1/auth/first-login/set-password', authLimiter);
 
 // ── Routes ────────────────────────────────────────────────────────────────────
 
