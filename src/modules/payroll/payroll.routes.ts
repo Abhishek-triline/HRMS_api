@@ -1251,27 +1251,54 @@ payslipsRouter.get(
 
 // ── Tax config ────────────────────────────────────────────────────────────────
 
+// Default basis used when the Configuration row is absent (pre-seed installs).
+const DEFAULT_GROSS_TAXABLE_BASIS = 'GrossMinusStandardDeduction' as const;
+type GrossTaxableBasisValue =
+  | 'GrossMinusStandardDeduction'
+  | 'GrossFull'
+  | 'BasicOnly';
+
+function coerceBasis(raw: unknown): GrossTaxableBasisValue {
+  return raw === 'GrossFull' || raw === 'BasicOnly' || raw === 'GrossMinusStandardDeduction'
+    ? (raw as GrossTaxableBasisValue)
+    : DEFAULT_GROSS_TAXABLE_BASIS;
+}
+
 // GET /config/tax
 taxConfigRouter.get(
   '/',
   requireSession(),
   requireRole('Admin'),
   async (_req: Request, res: Response): Promise<void> => {
-    const row = await prisma.configuration.findUnique({
-      where: { key: 'STANDARD_TAX_REFERENCE_RATE' },
-    });
+    const [rateRow, basisRow] = await Promise.all([
+      prisma.configuration.findUnique({
+        where: { key: 'STANDARD_TAX_REFERENCE_RATE' },
+      }),
+      prisma.configuration.findUnique({
+        where: { key: 'TAX_GROSS_TAXABLE_BASIS' },
+      }),
+    ]);
+
+    // The most recently touched of the two rows wins for updatedBy/updatedAt.
+    const newest =
+      rateRow && basisRow
+        ? rateRow.updatedAt >= basisRow.updatedAt
+          ? rateRow
+          : basisRow
+        : (rateRow ?? basisRow ?? null);
 
     res.status(200).json({
       data: {
-        referenceRate: (row?.value as number) ?? 0.095,
-        updatedBy: row?.updatedBy ?? null,
-        updatedAt: row?.updatedAt?.toISOString() ?? null,
+        referenceRate: (rateRow?.value as number) ?? 0.095,
+        grossTaxableBasis: coerceBasis(basisRow?.value),
+        updatedBy: newest?.updatedBy ?? null,
+        updatedAt: newest?.updatedAt?.toISOString() ?? null,
       },
     });
   },
 );
 
-// PATCH /config/tax
+// PATCH /config/tax — partial body; rate and basis can be saved independently.
 taxConfigRouter.patch(
   '/',
   requireSession(),
@@ -1280,63 +1307,116 @@ taxConfigRouter.patch(
   validateBody(UpdateTaxSettingsRequestSchema),
   async (req: Request, res: Response): Promise<void> => {
     const user = req.user!;
-    const { referenceRate } = req.body as { referenceRate: number };
+    const { referenceRate, grossTaxableBasis } = req.body as {
+      referenceRate?: number;
+      grossTaxableBasis?: GrossTaxableBasisValue;
+    };
 
-    const before = await prisma.configuration.findUnique({
-      where: { key: 'STANDARD_TAX_REFERENCE_RATE' },
-    });
-
-    const updated = await prisma.$transaction(async (tx) => {
-      const row = await tx.configuration.upsert({
+    const [beforeRate, beforeBasis] = await Promise.all([
+      prisma.configuration.findUnique({
         where: { key: 'STANDARD_TAX_REFERENCE_RATE' },
-        create: {
-          key: 'STANDARD_TAX_REFERENCE_RATE',
-          value: referenceRate,
-          updatedBy: user.id,
-        },
-        update: {
-          value: referenceRate,
-          updatedBy: user.id,
-        },
-      });
+      }),
+      prisma.configuration.findUnique({
+        where: { key: 'TAX_GROSS_TAXABLE_BASIS' },
+      }),
+    ]);
 
-      await audit({
-        tx,
-        actorId: user.id,
-        actorRole: user.role,
-        actorIp: req.ip ?? null,
-        action: 'config.tax.update',
-        targetType: 'Configuration',
-        targetId: 'STANDARD_TAX_REFERENCE_RATE',
-        module: 'payroll',
-        before: { referenceRate: (before?.value as number) ?? null },
-        after: { referenceRate },
-      });
+    const { rateRow, basisRow } = await prisma.$transaction(async (tx) => {
+      let nextRateRow = beforeRate;
+      let nextBasisRow = beforeBasis;
 
-      return row;
+      if (referenceRate !== undefined) {
+        nextRateRow = await tx.configuration.upsert({
+          where: { key: 'STANDARD_TAX_REFERENCE_RATE' },
+          create: {
+            key: 'STANDARD_TAX_REFERENCE_RATE',
+            value: referenceRate,
+            updatedBy: user.id,
+          },
+          update: {
+            value: referenceRate,
+            updatedBy: user.id,
+          },
+        });
+
+        await audit({
+          tx,
+          actorId: user.id,
+          actorRole: user.role,
+          actorIp: req.ip ?? null,
+          action: 'config.tax.update',
+          targetType: 'Configuration',
+          targetId: 'STANDARD_TAX_REFERENCE_RATE',
+          module: 'payroll',
+          before: { referenceRate: (beforeRate?.value as number) ?? null },
+          after: { referenceRate },
+        });
+      }
+
+      if (grossTaxableBasis !== undefined) {
+        nextBasisRow = await tx.configuration.upsert({
+          where: { key: 'TAX_GROSS_TAXABLE_BASIS' },
+          create: {
+            key: 'TAX_GROSS_TAXABLE_BASIS',
+            value: grossTaxableBasis,
+            updatedBy: user.id,
+          },
+          update: {
+            value: grossTaxableBasis,
+            updatedBy: user.id,
+          },
+        });
+
+        await audit({
+          tx,
+          actorId: user.id,
+          actorRole: user.role,
+          actorIp: req.ip ?? null,
+          action: 'config.tax.update',
+          targetType: 'Configuration',
+          targetId: 'TAX_GROSS_TAXABLE_BASIS',
+          module: 'payroll',
+          before: { grossTaxableBasis: coerceBasis(beforeBasis?.value) },
+          after: { grossTaxableBasis },
+        });
+      }
+
+      return { rateRow: nextRateRow, basisRow: nextBasisRow };
     });
 
-    // Notify all PayrollOfficers that the tax reference rate changed
-    const payrollOfficers = await prisma.employee.findMany({
-      where: { role: 'PayrollOfficer', status: 'Active' },
-      select: { id: true },
-    });
-    if (payrollOfficers.length > 0) {
-      const ratePercent = (referenceRate * 100).toFixed(2);
-      await notify({
-        recipientIds: payrollOfficers.map((p) => p.id),
-        category: 'Configuration',
-        title: `Tax reference rate changed to ${ratePercent}%`,
-        body: `The standard tax reference rate has been updated to ${ratePercent}% by Admin.`,
-        link: '/payroll/config/tax',
+    // Notify all PayrollOfficers if the reference rate changed. Basis-only
+    // changes do not affect the live reference figure today (v1 engine
+    // ignores the basis) — skip the notify to avoid noise.
+    if (referenceRate !== undefined) {
+      const payrollOfficers = await prisma.employee.findMany({
+        where: { role: 'PayrollOfficer', status: 'Active' },
+        select: { id: true },
       });
+      if (payrollOfficers.length > 0) {
+        const ratePercent = (referenceRate * 100).toFixed(2);
+        await notify({
+          recipientIds: payrollOfficers.map((p) => p.id),
+          category: 'Configuration',
+          title: `Tax reference rate changed to ${ratePercent}%`,
+          body: `The standard tax reference rate has been updated to ${ratePercent}% by Admin.`,
+          link: '/payroll/config/tax',
+        });
+      }
     }
+
+    const newest =
+      rateRow && basisRow
+        ? rateRow.updatedAt >= basisRow.updatedAt
+          ? rateRow
+          : basisRow
+        : (rateRow ?? basisRow ?? null);
 
     res.status(200).json({
       data: {
-        referenceRate: updated.value as number,
-        updatedBy: updated.updatedBy,
-        updatedAt: updated.updatedAt?.toISOString() ?? null,
+        referenceRate: (rateRow?.value as number) ?? 0.095,
+        grossTaxableBasis: coerceBasis(basisRow?.value),
+        updatedBy: newest?.updatedBy ?? null,
+        updatedAt: newest?.updatedAt?.toISOString() ?? null,
       },
     });
   },

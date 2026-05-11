@@ -133,6 +133,13 @@ export async function computePayslip(
   }
 
   // 4. Reference tax (BL-036a)
+  // TODO(v2): branch on Configuration TAX_GROSS_TAXABLE_BASIS:
+  //   - 'GrossMinusStandardDeduction' (default): subtract the standard
+  //     deduction before applying slab/rate.
+  //   - 'GrossFull': use grossPaise as-is.
+  //   - 'BasicOnly': use basicPaise instead of grossPaise.
+  // v1 keeps a flat `gross × referenceRate` — the basis is stored + displayed
+  // but ignored by the engine until the slab engine ships.
   const referenceTaxPaise = Math.round(grossPaise * referenceRate);
 
   // 5. Final tax defaults to reference

@@ -35,6 +35,7 @@ const CONFIG_DEFAULTS: Array<{ key: string; value: unknown }> = [
   { key: 'PATERNITY_WORKING_DAYS', value: 10 },
   { key: 'NOTIFICATION_RETENTION_DAYS', value: 90 },
   { key: 'STANDARD_TAX_REFERENCE_RATE', value: 0.095 },
+  { key: 'TAX_GROSS_TAXABLE_BASIS', value: 'GrossMinusStandardDeduction' },
 ];
 
 // ── Admin defaults (override via env) ────────────────────────────────────────
