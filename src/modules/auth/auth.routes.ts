@@ -47,6 +47,11 @@ import {
 const router = Router();
 
 const COOKIE_NAME = process.env['SESSION_COOKIE_NAME'] ?? 'nx_session';
+// SESSION_COOKIE_DOMAIN — set to the parent registrable domain in production
+// (e.g. ".tlitech.net") when the web and API live on different subdomains so
+// the cookie is shared across both. Leave empty in dev (localhost) — the
+// browser will scope the cookie to the host automatically.
+const COOKIE_DOMAIN = process.env['SESSION_COOKIE_DOMAIN'] ?? '';
 const SESSION_TTL_HOURS = Number(process.env['SESSION_TTL_HOURS'] ?? 12);
 const SESSION_REMEMBER_ME_DAYS = Number(process.env['SESSION_REMEMBER_ME_DAYS'] ?? 30);
 const PASSWORD_RESET_TTL_MINUTES = Number(process.env['PASSWORD_RESET_TTL_MINUTES'] ?? 30);
@@ -105,6 +110,7 @@ function setSessionCookie(
     maxAge: maxAge * 1000, // express expects ms
     path: '/',
     signed: true,
+    ...(COOKIE_DOMAIN ? { domain: COOKIE_DOMAIN } : {}),
   });
 }
 
@@ -268,7 +274,7 @@ router.post('/logout', requireSession(), async (req: Request, res: Response) => 
       module: 'auth',
     });
 
-    res.clearCookie(COOKIE_NAME, { path: '/' }).status(200).json({ data: { success: true } });
+    res.clearCookie(COOKIE_NAME, { path: '/', ...(COOKIE_DOMAIN ? { domain: COOKIE_DOMAIN } : {}) }).status(200).json({ data: { success: true } });
   } catch (err: unknown) {
     logger.error({ err }, 'auth.logout.error');
     res
@@ -416,7 +422,7 @@ router.post(
         });
       });
 
-      res.clearCookie(COOKIE_NAME, { path: '/' }).status(200).json({ data: { success: true } });
+      res.clearCookie(COOKIE_NAME, { path: '/', ...(COOKIE_DOMAIN ? { domain: COOKIE_DOMAIN } : {}) }).status(200).json({ data: { success: true } });
     } catch (err: unknown) {
       logger.error({ err }, 'auth.reset-password.error');
       res
