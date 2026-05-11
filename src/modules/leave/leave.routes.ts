@@ -733,10 +733,22 @@ leaveRouter.post(
           },
         });
 
-        // Notify the approver — Manager or Admin (BL-044: scoped to approver)
+        // Notify the approver(s). For Manager routing this is the assigned
+        // reporting manager. For Admin routing (Maternity/Paternity, no
+        // manager, or manager Exited) HR = Admin and the queue is open to all
+        // admins (see /requests handler), so fan out to every active Admin —
+        // mirroring the escalation-sweep behaviour (leave.service.ts:602-608).
+        let recipientIds: string | string[] = routing.approverId;
+        if (routing.routedTo === 'Admin') {
+          const activeAdmins = await tx.employee.findMany({
+            where: { role: 'Admin', status: 'Active' },
+            select: { id: true },
+          });
+          recipientIds = activeAdmins.map((a) => a.id);
+        }
         await notify({
           tx,
-          recipientIds: routing.approverId,
+          recipientIds,
           category: 'Leave',
           title: `New leave request from ${created.employee.name}`,
           body: `${type} leave for ${days} day(s) (${fromDateStr} to ${toDateStr}) is pending your approval.`,
