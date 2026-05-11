@@ -87,6 +87,7 @@ function formatRequest(
     updatedAt: Date;
     version: number;
   },
+  canceller?: { name: string; role: 'Self' | 'Manager' | 'Admin' } | null,
 ) {
   return {
     id: req.id,
@@ -114,6 +115,8 @@ function formatRequest(
     escalatedAt: req.escalatedAt?.toISOString() ?? null,
     cancelledAt: req.cancelledAt?.toISOString() ?? null,
     cancelledBy: req.cancelledBy,
+    cancelledByName: canceller?.name ?? null,
+    cancelledByRole: canceller?.role ?? null,
     cancelledAfterStart: req.cancelledAfterStart,
     deductedDays: req.deductedDays,
     restoredDays: req.restoredDays,
@@ -128,6 +131,42 @@ const requestInclude = {
   approver: { select: { name: true } },
   leaveType: { select: { name: true } },
 } as const;
+
+/**
+ * Look up the canceller's name and compute their role label.
+ *
+ * Role mapping:
+ *   'Self'    — cancelledBy === request.employeeId
+ *   'Admin'   — canceller's DB role is 'Admin'
+ *   'Manager' — otherwise (manager in the approval chain)
+ *
+ * Returns null when cancelledBy is null (never cancelled).
+ * Uses a direct Prisma query — no Prisma relation added to schema.
+ */
+async function resolveCanceller(
+  cancelledBy: string | null,
+  employeeId: string,
+): Promise<{ name: string; role: 'Self' | 'Manager' | 'Admin' } | null> {
+  if (!cancelledBy) return null;
+
+  const canceller = await prisma.employee.findUnique({
+    where: { id: cancelledBy },
+    select: { name: true, role: true },
+  });
+
+  if (!canceller) return null;
+
+  let roleLabel: 'Self' | 'Manager' | 'Admin';
+  if (cancelledBy === employeeId) {
+    roleLabel = 'Self';
+  } else if (canceller.role === 'Admin') {
+    roleLabel = 'Admin';
+  } else {
+    roleLabel = 'Manager';
+  }
+
+  return { name: canceller.name, role: roleLabel };
+}
 
 /**
  * Check if the calling user can see a specific leave request.
@@ -842,7 +881,7 @@ leaveRouter.get(
     const nextCursor = hasMore ? (page[page.length - 1]?.id ?? null) : null;
 
     res.status(200).json({
-      data: page.map(formatRequest),
+      data: page.map((r) => formatRequest(r)),
       nextCursor,
     });
   },
@@ -874,7 +913,8 @@ leaveRouter.get(
       return;
     }
 
-    res.status(200).json({ data: formatRequest(request) });
+    const canceller = await resolveCanceller(request.cancelledBy, request.employeeId);
+    res.status(200).json({ data: formatRequest(request, canceller) });
   },
 );
 
@@ -1167,9 +1207,10 @@ leaveRouter.post(
       return result;
     });
 
+    const canceller = await resolveCanceller(updated.cancelledBy, updated.employeeId);
     res.status(200).json({
       data: {
-        leaveRequest: formatRequest(updated),
+        leaveRequest: formatRequest(updated, canceller),
         restoredDays,
       },
     });
