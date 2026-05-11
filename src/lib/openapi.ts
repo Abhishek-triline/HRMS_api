@@ -2110,7 +2110,7 @@ export const openApiSpec = generator.generateDocument({
       'Audit, and Configuration. See docs/HRMS_API.md for the canonical spec.',
     contact: {
       name: 'Nexora HRMS Team',
-      email: 'admin@triline.in',
+      email: 'admin@triline.co.in',
     },
   },
   servers: [

@@ -4,7 +4,7 @@
  * Idempotent: safe to run multiple times.
  * Creates:
  *   1. Configuration rows (all Phase-0 configurable defaults)
- *   2. Default admin employee — admin@triline.in / admin@123
+ *   2. Default admin employee — admin@triline.co.in / admin@123
  *      code EMP-2024-0001, mustResetPassword=false
  *   3. 6 LeaveType rows with proper flags + caps (Phase 2)
  *   4. LeaveQuota rows for 4 employment types × 4 accrual types (Phase 2)
@@ -40,7 +40,7 @@ const CONFIG_DEFAULTS: Array<{ key: string; value: unknown }> = [
 
 // ── Admin defaults (override via env) ────────────────────────────────────────
 
-const ADMIN_EMAIL = process.env['SEED_ADMIN_EMAIL'] ?? 'admin@triline.in';
+const ADMIN_EMAIL = process.env['SEED_ADMIN_EMAIL'] ?? 'admin@triline.co.in';
 const ADMIN_PASSWORD = process.env['SEED_ADMIN_PASSWORD'] ?? 'admin@123';
 
 async function seedConfiguration(): Promise<void> {

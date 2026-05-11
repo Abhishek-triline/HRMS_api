@@ -1,6 +1,6 @@
 /**
  * Seeds the three demo accounts that the login page's role chips expect:
- *   manager@triline.in, employee@triline.in, payroll@triline.in (all admin@123).
+ *   manager@triline.co.in, employee@triline.co.in, payroll@triline.co.in (all admin@123).
  *
  * Idempotent — re-running skips accounts that already exist.
  */
@@ -22,34 +22,34 @@ const DEMO_USERS: Array<{
   reportsToEmail: string | null;
 }> = [
   {
-    email: 'manager@triline.in',
+    email: 'manager@triline.co.in',
     name: 'Arjun Mehta',
     role: 'Manager',
     code: 'EMP-2024-0002',
     designation: 'Engineering Manager',
     department: 'Engineering',
     employmentType: 'Permanent',
-    reportsToEmail: 'admin@triline.in',
+    reportsToEmail: 'admin@triline.co.in',
   },
   {
-    email: 'employee@triline.in',
+    email: 'employee@triline.co.in',
     name: 'Kavya Reddy',
     role: 'Employee',
     code: 'EMP-2024-0003',
     designation: 'Software Engineer',
     department: 'Engineering',
     employmentType: 'Permanent',
-    reportsToEmail: 'manager@triline.in',
+    reportsToEmail: 'manager@triline.co.in',
   },
   {
-    email: 'payroll@triline.in',
+    email: 'payroll@triline.co.in',
     name: 'Ravi Iyer',
     role: 'PayrollOfficer',
     code: 'EMP-2024-0004',
     designation: 'Payroll Officer',
     department: 'Finance',
     employmentType: 'Permanent',
-    reportsToEmail: 'admin@triline.in',
+    reportsToEmail: 'admin@triline.co.in',
   },
 ];
 

@@ -61,7 +61,7 @@ vi.mock('../../middleware/requireSession.js', () => ({
       id: 'admin-id-001',
       name: 'Priya Sharma',
       role,
-      email: 'admin@triline.in',
+      email: 'admin@triline.co.in',
       code: 'EMP-2024-0001',
       employmentType: 'Permanent',
       status: 'Active',

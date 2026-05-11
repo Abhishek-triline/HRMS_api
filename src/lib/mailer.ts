@@ -24,7 +24,7 @@ export type MailPayload = {
 };
 
 const MAIL_TRANSPORT = process.env['MAIL_TRANSPORT'] ?? 'filesystem';
-const MAIL_FROM = process.env['MAIL_FROM'] ?? 'Nexora HRMS <no-reply@triline.in>';
+const MAIL_FROM = process.env['MAIL_FROM'] ?? 'Nexora HRMS <no-reply@triline.co.in>';
 const MAIL_DIR = process.env['MAIL_DIR'] ?? '/tmp/mail';
 
 // Build the nodemailer transporter lazily (only when MAIL_TRANSPORT=smtp)
