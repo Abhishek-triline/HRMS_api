@@ -124,8 +124,8 @@ export async function deriveStatusForDay(
   const holiday = await isHoliday(date, tx);
   if (holiday) return 'Holiday';
 
-  // 3. Weekly off
-  if (isWeeklyOff(date)) return 'WeeklyOff';
+  // 3. Weekly off (Admin-configurable set of days; default Sat/Sun)
+  if (await isWeeklyOff(date)) return 'WeeklyOff';
 
   return null;
 }

@@ -18,6 +18,7 @@
  * Configuration keys (stored in the `configuration` table):
  *   ATTENDANCE_LATE_THRESHOLD_TIME   — "HH:MM" string
  *   ATTENDANCE_STANDARD_DAILY_HOURS  — number
+ *   ATTENDANCE_WEEKLY_OFF_DAYS       — Weekday[] (e.g. ["Sat","Sun"])
  *   LEAVE_CARRY_FORWARD_CAPS         — Record<LeaveType, number>
  *   LEAVE_ESCALATION_PERIOD_DAYS     — number
  *   LEAVE_MATERNITY_DAYS             — number
@@ -165,6 +166,34 @@ configurationRouter.put(
             targetId: 'ATTENDANCE_STANDARD_DAILY_HOURS',
             // BUG-CFG-003: use resolved before value so first-write audit is not null
             before: { value: beforeResolved.standardDailyHours },
+            after: { value: after },
+          });
+        }
+
+        if (body.weeklyOffDays !== undefined) {
+          // Dedupe + canonicalise (Mon→Sun) so the stored value is stable
+          const WEEKDAY_ORDER = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'] as const;
+          const incoming = new Set(body.weeklyOffDays);
+          const canonical = WEEKDAY_ORDER.filter((d) => incoming.has(d));
+
+          const { before, after } = await upsertConfigKey(
+            tx,
+            'ATTENDANCE_WEEKLY_OFF_DAYS',
+            canonical,
+            actorId,
+          );
+          changedKeys.push({ key: 'ATTENDANCE_WEEKLY_OFF_DAYS', before, after });
+
+          await audit({
+            tx,
+            actorId,
+            actorRole,
+            actorIp,
+            action: 'config.attendance.update',
+            module: 'configuration',
+            targetType: 'Configuration',
+            targetId: 'ATTENDANCE_WEEKLY_OFF_DAYS',
+            before: { value: beforeResolved.weeklyOffDays },
             after: { value: after },
           });
         }

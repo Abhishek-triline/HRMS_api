@@ -42,7 +42,7 @@ vi.mock('../../lib/logger.js', () => ({
   logger: { info: vi.fn(), error: vi.fn(), warn: vi.fn() },
 }));
 vi.mock('../../lib/config.js', () => ({
-  getAttendanceConfig: vi.fn().mockResolvedValue({ lateThresholdTime: '10:30', standardDailyHours: 8 }),
+  getAttendanceConfig: vi.fn().mockResolvedValue({ lateThresholdTime: '10:30', standardDailyHours: 8, weeklyOffDays: ['Sat', 'Sun'] }),
   getLeaveConfig: vi.fn().mockResolvedValue({
     carryForwardCaps: { Annual: 10, Sick: 0, Casual: 5, Unpaid: 0, Maternity: 0, Paternity: 0 },
     escalationPeriodDays: 5,
@@ -263,7 +263,7 @@ describe('GET /api/v1/config/attendance', () => {
 describe('PUT /api/v1/config/attendance', () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    (getAttendanceConfig as Mock).mockResolvedValue({ lateThresholdTime: '10:30', standardDailyHours: 8 });
+    (getAttendanceConfig as Mock).mockResolvedValue({ lateThresholdTime: '10:30', standardDailyHours: 8, weeklyOffDays: ['Sat', 'Sun'] });
     (bustConfigCache as Mock).mockReturnValue(undefined);
     (prisma.$transaction as Mock).mockImplementation(async (fn: (tx: unknown) => Promise<unknown>) => fn({
       configuration: { findUnique: vi.fn().mockResolvedValue(null), upsert: vi.fn() },
@@ -272,8 +272,8 @@ describe('PUT /api/v1/config/attendance', () => {
   });
 
   it('TC-CFG-001: Admin can update lateThresholdTime and response reflects new value', async () => {
-    (getAttendanceConfig as Mock).mockResolvedValueOnce({ lateThresholdTime: '10:30', standardDailyHours: 8 })
-      .mockResolvedValue({ lateThresholdTime: '11:00', standardDailyHours: 8 });
+    (getAttendanceConfig as Mock).mockResolvedValueOnce({ lateThresholdTime: '10:30', standardDailyHours: 8, weeklyOffDays: ['Sat', 'Sun'] })
+      .mockResolvedValue({ lateThresholdTime: '11:00', standardDailyHours: 8, weeklyOffDays: ['Sat', 'Sun'] });
 
     const app = makeApp('Admin');
     const res = await request(app)

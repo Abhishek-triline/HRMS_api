@@ -23,7 +23,15 @@
  */
 
 import { prisma } from './prisma.js';
-import type { AttendanceConfig, LeaveConfig, CarryForwardCaps } from '@nexora/contracts/configuration';
+import type {
+  AttendanceConfig,
+  CarryForwardCaps,
+  LeaveConfig,
+  Weekday,
+} from '@nexora/contracts/configuration';
+
+const WEEKDAY_TOKENS: readonly Weekday[] = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+const WEEKDAY_TOKEN_SET: ReadonlySet<string> = new Set(WEEKDAY_TOKENS);
 
 // ── Simple TTL cache ──────────────────────────────────────────────────────────
 
@@ -64,11 +72,28 @@ async function readConfigKey(key: string): Promise<unknown | null> {
 
 // ── Attendance config ─────────────────────────────────────────────────────────
 
-/** Defaults (BL-027 / Phase 3). */
+/** Defaults (BL-027 / Phase 3 + Indian 5-day work-week). */
 const ATTENDANCE_DEFAULTS: AttendanceConfig = {
   lateThresholdTime: '10:30',
   standardDailyHours: 8,
+  weeklyOffDays: ['Sat', 'Sun'],
 };
+
+/**
+ * Parse a persisted JSON value into a deduplicated, canonical-order Weekday[].
+ * Unknown tokens are dropped silently. Returns null if the value is not an array.
+ */
+function parseWeeklyOffDays(value: unknown): Weekday[] | null {
+  if (!Array.isArray(value)) return null;
+  const found = new Set<Weekday>();
+  for (const item of value) {
+    if (typeof item === 'string' && WEEKDAY_TOKEN_SET.has(item)) {
+      found.add(item as Weekday);
+    }
+  }
+  // Return in canonical Mon→Sun order so callers can rely on stable ordering.
+  return WEEKDAY_TOKENS.filter((d) => found.has(d));
+}
 
 /**
  * Returns the current attendance configuration.
@@ -83,11 +108,12 @@ export async function getAttendanceConfig(): Promise<AttendanceConfig> {
   const cached = cacheGet<AttendanceConfig>(CACHE_KEY);
   if (cached) return cached;
 
-  // Read both keys in parallel
-  const [thresholdVal, hoursVal, legacyThresholdVal] = await Promise.all([
+  // Read all keys in parallel
+  const [thresholdVal, hoursVal, legacyThresholdVal, weeklyOffVal] = await Promise.all([
     readConfigKey('ATTENDANCE_LATE_THRESHOLD_TIME'),
     readConfigKey('ATTENDANCE_STANDARD_DAILY_HOURS'),
     readConfigKey('LATE_THRESHOLD'), // legacy Phase-3 alias
+    readConfigKey('ATTENDANCE_WEEKLY_OFF_DAYS'),
   ]);
 
   // Resolve lateThresholdTime: prefer new key, fall back to legacy, then default
@@ -104,9 +130,35 @@ export async function getAttendanceConfig(): Promise<AttendanceConfig> {
     standardDailyHours = Math.round(hoursVal);
   }
 
-  const result: AttendanceConfig = { lateThresholdTime, standardDailyHours };
+  // Resolve weeklyOffDays — fall back to default Sat/Sun if absent/invalid.
+  // An explicitly persisted EMPTY array is honoured (some orgs may run a 7-day
+  // operation); only a missing/non-array value triggers the default.
+  const parsedWeeklyOff = parseWeeklyOffDays(weeklyOffVal);
+  const weeklyOffDays: Weekday[] = parsedWeeklyOff ?? [...ATTENDANCE_DEFAULTS.weeklyOffDays];
+
+  const result: AttendanceConfig = { lateThresholdTime, standardDailyHours, weeklyOffDays };
   cacheSet(CACHE_KEY, result);
   return result;
+}
+
+/**
+ * Map a JS Date.getUTCDay() / getDay() index (0=Sun..6=Sat) to a Weekday token.
+ * Exported so attendance / leave helpers share the same mapping.
+ */
+export function weekdayTokenFromIndex(dayIndex: number): Weekday {
+  // JS: 0=Sun, 1=Mon, … 6=Sat. Map to our canonical Mon-first token list.
+  const map: Record<number, Weekday> = {
+    0: 'Sun',
+    1: 'Mon',
+    2: 'Tue',
+    3: 'Wed',
+    4: 'Thu',
+    5: 'Fri',
+    6: 'Sat',
+  };
+  const token = map[dayIndex];
+  if (!token) throw new Error(`weekdayTokenFromIndex: invalid index ${dayIndex}`);
+  return token;
 }
 
 // ── Leave config ──────────────────────────────────────────────────────────────
