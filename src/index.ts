@@ -86,10 +86,21 @@ if (process.env['NODE_ENV'] === 'production') {
 
 // ── Rate limiters ─────────────────────────────────────────────────────────────
 
+// Production defaults: tight. Development defaults: looser. Either can be
+// overridden via env (RATE_LIMIT_AUTH_MAX / RATE_LIMIT_GLOBAL_MAX) so an
+// operator can tune for their proxy topology and traffic shape without a
+// code change.
+const IS_DEV = process.env['NODE_ENV'] !== 'production';
+const AUTH_MAX = Number(process.env['RATE_LIMIT_AUTH_MAX'] ?? (IS_DEV ? 50 : 5));
+const GLOBAL_MAX = Number(
+  process.env['RATE_LIMIT_GLOBAL_MAX'] ?? (IS_DEV ? 2000 : 100),
+);
+
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 min
-  // SEC-P8-013: align with LOCKOUT_THRESHOLD (5) in auth.service.ts
-  max: 5,
+  // SEC-P8-013: prod aligns with LOCKOUT_THRESHOLD (5) in auth.service.ts.
+  // Dev allows ~50/15min so developers and demos don't hit the wall.
+  max: AUTH_MAX,
   standardHeaders: true,
   legacyHeaders: false,
   message: errorEnvelope(
@@ -101,7 +112,7 @@ const authLimiter = rateLimit({
 
 const globalLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 100,
+  max: GLOBAL_MAX,
   standardHeaders: true,
   legacyHeaders: false,
   message: errorEnvelope(ErrorCode.RATE_LIMITED, 'Too many requests.'),
