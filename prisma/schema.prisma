@@ -68,6 +68,12 @@ model Employee {
   employmentType    EmploymentType @default(Permanent)
   department        String?
   designation       String?
+  /// Optional personal information — nullable so existing rows are unaffected
+  phone             String?
+  /// Stored as a date column (time component ignored). YYYY-MM-DD.
+  dateOfBirth       DateTime?      @db.Date
+  /// One of: Male | Female | Other | PreferNotToSay — validated by Zod at the API layer.
+  gender            String?
   reportingManagerId String?
   reportingManager  Employee?      @relation("EmployeeManager", fields: [reportingManagerId], references: [id])
   reports           Employee[]     @relation("EmployeeManager")
@@ -132,6 +138,11 @@ model SalaryStructure {
   createdAt       DateTime @default(now())
   /// Optimistic concurrency token
   version         Int      @default(0)
+  /// Optional allowance component breakdown (nullable — existing rows unaffected).
+  /// When present: hraPaise + transportPaise + otherPaise == allowancesPaise (enforced at app layer).
+  hraPaise        Int?     /// HRA component in paise
+  transportPaise  Int?     /// Transport allowance in paise
+  otherPaise      Int?     /// Other allowances in paise
 
   @@index([employeeId, effectiveFrom(sort: Desc)])
   @@map("salary_structures")

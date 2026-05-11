@@ -96,6 +96,9 @@ type EmployeeWithSalary = {
   code: string;
   name: string;
   email: string;
+  phone: string | null;
+  dateOfBirth: Date | null;
+  gender: string | null;
   role: string;
   status: string;
   employmentType: string;
@@ -114,6 +117,9 @@ type EmployeeWithSalary = {
     basicPaise: number;
     allowancesPaise: number;
     effectiveFrom: Date;
+    hraPaise: number | null;
+    transportPaise: number | null;
+    otherPaise: number | null;
   }>;
 };
 
@@ -135,6 +141,9 @@ function toEmployeeDetail(
     code: emp.code,
     name: emp.name,
     email: emp.email,
+    phone: emp.phone ?? null,
+    dateOfBirth: emp.dateOfBirth ? emp.dateOfBirth.toISOString().split('T')[0]! : null,
+    gender: (emp.gender ?? null) as EmployeeDetail['gender'],
     role: emp.role as EmployeeDetail['role'],
     status: mapStatus(emp.status),
     employmentType: emp.employmentType as EmployeeDetail['employmentType'],
@@ -150,6 +159,9 @@ function toEmployeeDetail(
           basic_paise: activeSalary.basicPaise,
           allowances_paise: activeSalary.allowancesPaise,
           effectiveFrom: activeSalary.effectiveFrom.toISOString().split('T')[0]!,
+          hra_paise: activeSalary.hraPaise ?? null,
+          transport_paise: activeSalary.transportPaise ?? null,
+          other_paise: activeSalary.otherPaise ?? null,
         }
       : null,
     mustResetPassword: emp.mustResetPassword,
@@ -170,6 +182,14 @@ async function fetchEmployeeDetail(id: string) {
       salaryStructures: {
         orderBy: { effectiveFrom: 'desc' },
         take: 1,
+        select: {
+          basicPaise: true,
+          allowancesPaise: true,
+          effectiveFrom: true,
+          hraPaise: true,
+          transportPaise: true,
+          otherPaise: true,
+        },
       },
     },
   });
@@ -192,13 +212,23 @@ router.post(
     const body = req.body as {
       name: string;
       email: string;
+      phone?: string | null;
+      dateOfBirth?: string | null;
+      gender?: string | null;
       role: string;
       department: string;
       designation: string;
       employmentType: string;
       reportingManagerId: string | null;
       joinDate: string;
-      salaryStructure: { basic_paise: number; allowances_paise: number; effectiveFrom: string };
+      salaryStructure: {
+        basic_paise: number;
+        allowances_paise: number;
+        effectiveFrom: string;
+        hra_paise?: number | null;
+        transport_paise?: number | null;
+        other_paise?: number | null;
+      };
     };
     const actor = req.user!;
     const ip = clientIp(req);
@@ -232,6 +262,35 @@ router.post(
         return;
       }
 
+      // Validate allowance component breakdown when any component field is provided
+      const sal = body.salaryStructure;
+      const componentFieldsPresent = [sal.hra_paise, sal.transport_paise, sal.other_paise].filter(
+        (v) => v !== undefined && v !== null,
+      );
+      if (componentFieldsPresent.length > 0) {
+        if (componentFieldsPresent.length !== 3) {
+          res.status(400).json(
+            errorEnvelope(
+              ErrorCode.VALIDATION_FAILED,
+              'When providing allowance breakdown, all three fields (hra_paise, transport_paise, other_paise) must be present.',
+              { details: { salaryStructure: ['hra_paise, transport_paise, and other_paise must all be provided together.'] } },
+            ),
+          );
+          return;
+        }
+        const componentSum = (sal.hra_paise ?? 0) + (sal.transport_paise ?? 0) + (sal.other_paise ?? 0);
+        if (componentSum !== sal.allowances_paise) {
+          res.status(400).json(
+            errorEnvelope(
+              ErrorCode.VALIDATION_FAILED,
+              `Allowance components sum (${componentSum} paise) must equal allowances_paise (${sal.allowances_paise} paise).`,
+              { details: { salaryStructure: [`hra_paise + transport_paise + other_paise must equal allowances_paise.`] } },
+            ),
+          );
+          return;
+        }
+      }
+
       const joinDate = new Date(body.joinDate);
       const now = new Date();
       const year = now.getFullYear();
@@ -258,6 +317,9 @@ router.post(
             employmentType: body.employmentType as never,
             department: body.department,
             designation: body.designation,
+            phone: body.phone ?? null,
+            dateOfBirth: body.dateOfBirth ? new Date(body.dateOfBirth) : null,
+            gender: body.gender ?? null,
             reportingManagerId: body.reportingManagerId ?? null,
             joinDate,
             mustResetPassword: true,
@@ -272,6 +334,9 @@ router.post(
             basicPaise: body.salaryStructure.basic_paise,
             allowancesPaise: body.salaryStructure.allowances_paise,
             effectiveFrom: new Date(body.salaryStructure.effectiveFrom),
+            hraPaise: body.salaryStructure.hra_paise ?? null,
+            transportPaise: body.salaryStructure.transport_paise ?? null,
+            otherPaise: body.salaryStructure.other_paise ?? null,
             version: 0,
           },
         });
@@ -597,6 +662,9 @@ router.patch(
     const { id } = req.params as { id: string };
     const body = req.body as {
       name?: string;
+      phone?: string | null;
+      dateOfBirth?: string | null;
+      gender?: string | null;
       role?: string;
       department?: string;
       designation?: string;
@@ -627,6 +695,9 @@ router.patch(
 
       const beforeSnapshot = {
         name: current.name,
+        phone: current.phone,
+        dateOfBirth: current.dateOfBirth,
+        gender: current.gender,
         role: current.role,
         department: current.department,
         designation: current.designation,
@@ -639,6 +710,10 @@ router.patch(
         version: { increment: 1 },
       };
       if (body.name !== undefined) updateData['name'] = body.name;
+      if (body.phone !== undefined) updateData['phone'] = body.phone ?? null;
+      if (body.dateOfBirth !== undefined)
+        updateData['dateOfBirth'] = body.dateOfBirth ? new Date(body.dateOfBirth) : null;
+      if (body.gender !== undefined) updateData['gender'] = body.gender ?? null;
       if (body.role !== undefined) updateData['role'] = body.role;
       if (body.department !== undefined) updateData['department'] = body.department;
       if (body.designation !== undefined) updateData['designation'] = body.designation;
@@ -667,6 +742,9 @@ router.patch(
           before: beforeSnapshot,
           after: {
             name: u.name,
+            phone: u.phone,
+            dateOfBirth: u.dateOfBirth ? u.dateOfBirth.toISOString().split('T')[0] : null,
+            gender: u.gender,
             role: u.role,
             department: u.department,
             designation: u.designation,
@@ -701,6 +779,9 @@ router.patch(
       basic_paise: number;
       allowances_paise: number;
       effectiveFrom: string;
+      hra_paise?: number | null;
+      transport_paise?: number | null;
+      other_paise?: number | null;
       version: number;
     };
     const actor = req.user!;
@@ -724,6 +805,34 @@ router.patch(
         return;
       }
 
+      // Validate allowance component breakdown when any component field is provided
+      const componentFieldsPresent = [body.hra_paise, body.transport_paise, body.other_paise].filter(
+        (v) => v !== undefined && v !== null,
+      );
+      if (componentFieldsPresent.length > 0) {
+        if (componentFieldsPresent.length !== 3) {
+          res.status(400).json(
+            errorEnvelope(
+              ErrorCode.VALIDATION_FAILED,
+              'When providing allowance breakdown, all three fields (hra_paise, transport_paise, other_paise) must be present.',
+              { details: { salaryStructure: ['hra_paise, transport_paise, and other_paise must all be provided together.'] } },
+            ),
+          );
+          return;
+        }
+        const componentSum = (body.hra_paise ?? 0) + (body.transport_paise ?? 0) + (body.other_paise ?? 0);
+        if (componentSum !== body.allowances_paise) {
+          res.status(400).json(
+            errorEnvelope(
+              ErrorCode.VALIDATION_FAILED,
+              `Allowance components sum (${componentSum} paise) must equal allowances_paise (${body.allowances_paise} paise).`,
+              { details: { salaryStructure: ['hra_paise + transport_paise + other_paise must equal allowances_paise.'] } },
+            ),
+          );
+          return;
+        }
+      }
+
       const currentSalary = current.salaryStructures?.[0] ?? null;
 
       const updated = await prisma.$transaction(async (tx) => {
@@ -734,6 +843,9 @@ router.patch(
             basicPaise: body.basic_paise,
             allowancesPaise: body.allowances_paise,
             effectiveFrom: new Date(body.effectiveFrom),
+            hraPaise: body.hra_paise ?? null,
+            transportPaise: body.transport_paise ?? null,
+            otherPaise: body.other_paise ?? null,
             version: 0,
           },
         });
