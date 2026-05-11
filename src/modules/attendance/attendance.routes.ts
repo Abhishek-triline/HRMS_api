@@ -26,6 +26,7 @@ import { getAttendanceConfig } from '../../lib/config.js';
 import {
   recordCheckIn,
   recordCheckOut,
+  undoCheckOutForEmployee,
   findOpenAttendance,
   formatAttendanceRecord,
   mapAttendanceStatusToDb,
@@ -100,6 +101,41 @@ attendanceRouter.post(
       res
         .status(500)
         .json(errorEnvelope(ErrorCode.INTERNAL_ERROR, 'Failed to record check-out.'));
+    }
+  },
+);
+
+// ── POST /attendance/check-out/undo ──────────────────────────────────────────
+
+attendanceRouter.post(
+  '/check-out/undo',
+  requireSession(),
+  async (req: Request, res: Response): Promise<void> => {
+    const user = req.user!;
+    const now = new Date();
+
+    try {
+      const result = await prisma.$transaction(async (tx) => {
+        return undoCheckOutForEmployee(user.id, now, tx, { role: user.role, ip: req.ip ?? null });
+      });
+
+      res.status(200).json({
+        data: {
+          record: formatAttendanceRecord(result.record),
+          lateMarkDeductionApplied: result.lateMarkDeductionApplied,
+          lateMonthCount: result.lateMonthCount,
+        },
+      });
+    } catch (err: unknown) {
+      const e = err as { httpStatus?: number; code?: string; message?: string };
+      if (e.httpStatus === 409 && e.code) {
+        res.status(409).json(errorEnvelope(e.code, e.message ?? 'Conflict'));
+        return;
+      }
+      logger.error({ err, userId: user.id }, 'attendance.check-out.undo: error');
+      res
+        .status(500)
+        .json(errorEnvelope(ErrorCode.INTERNAL_ERROR, 'Failed to undo check-out.'));
     }
   },
 );

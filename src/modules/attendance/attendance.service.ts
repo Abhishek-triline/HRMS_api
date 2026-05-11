@@ -571,6 +571,132 @@ export async function recordCheckOut(
   return { record, hoursWorkedMinutes };
 }
 
+// ── Undo check-out ────────────────────────────────────────────────────────────
+
+/**
+ * Undo a check-out for today. Allowed within 5 minutes of the check-out
+ * (product decision — no BL rule constrains the window, so 5 min is used).
+ *
+ * Logic:
+ *   1. Find today's system row.
+ *   2. If no row or no check-in → 409 NOT_CHECKED_IN.
+ *   3. If no check-out → already Working; idempotent return.
+ *   4. If check-out was > 5 minutes ago → 409 UNDO_WINDOW_EXPIRED.
+ *   5. If check-out is from a prior day → 409 UNDO_OUTSIDE_DAY.
+ *   6. Clear checkOutTime + hoursWorkedMinutes, increment version.
+ *   7. Audit attendance.check-out.undo.
+ *   8. Return CheckInResult shape.
+ */
+export async function undoCheckOutForEmployee(
+  employeeId: string,
+  now: Date,
+  tx: Prisma.TransactionClient,
+  auditCtx: AuditCtx = {},
+): Promise<CheckInResult> {
+  const dateOnly = new Date(now);
+  dateOnly.setUTCHours(0, 0, 0, 0);
+
+  const existing = await tx.attendanceRecord.findUnique({
+    where: {
+      employeeId_date_source: {
+        employeeId,
+        date: dateOnly,
+        source: 'system',
+      },
+    },
+  });
+
+  // No record or no check-in → cannot undo
+  if (!existing || !existing.checkInTime) {
+    const err = Object.assign(new Error('No check-in to undo'), {
+      httpStatus: 409,
+      code: 'NOT_CHECKED_IN',
+    });
+    throw err;
+  }
+
+  // Already in Working state — idempotent
+  if (!existing.checkOutTime) {
+    const year = now.getUTCFullYear();
+    const month = now.getUTCMonth() + 1;
+    const lateLedger = await tx.attendanceLateLedger.findUnique({
+      where: { employeeId_year_month: { employeeId, year, month } },
+    });
+    return {
+      record: existing,
+      lateMarkDeductionApplied: false,
+      lateMonthCount: lateLedger?.count ?? 0,
+    };
+  }
+
+  // Guard: record must be from today
+  const recordDateMs = existing.date.getTime();
+  const todayMs = dateOnly.getTime();
+  if (recordDateMs !== todayMs) {
+    const err = Object.assign(new Error('Cannot undo check-out from a previous day.'), {
+      httpStatus: 409,
+      code: 'UNDO_OUTSIDE_DAY',
+    });
+    throw err;
+  }
+
+  // Guard: undo window — must be within 5 minutes of check-out
+  const minutesSinceCheckOut = (now.getTime() - existing.checkOutTime.getTime()) / 60_000;
+  if (minutesSinceCheckOut > 5) {
+    const err = Object.assign(
+      new Error('Undo window expired — contact your manager for a regularisation.'),
+      { httpStatus: 409, code: 'UNDO_WINDOW_EXPIRED' },
+    );
+    throw err;
+  }
+
+  // Capture before-snapshot for audit
+  const prevCheckOutTime = existing.checkOutTime;
+  const prevHoursWorkedMinutes = existing.hoursWorkedMinutes;
+
+  // Clear the check-out fields; do NOT touch status, late, lateMonthCount, lopApplied
+  const record = await tx.attendanceRecord.update({
+    where: { id: existing.id },
+    data: {
+      checkOutTime: null,
+      hoursWorkedMinutes: null,
+      version: { increment: 1 },
+    },
+  });
+
+  // Audit
+  await audit({
+    tx,
+    actorId: employeeId,
+    actorRole: auditCtx.role ?? 'Employee',
+    actorIp: auditCtx.ip ?? null,
+    action: 'attendance.check-out.undo',
+    targetType: 'AttendanceRecord',
+    targetId: record.id,
+    module: 'Attendance',
+    before: {
+      checkOutTime: prevCheckOutTime.toISOString(),
+      hoursWorkedMinutes: prevHoursWorkedMinutes,
+    },
+    after: {
+      checkOutTime: null,
+      hoursWorkedMinutes: null,
+    },
+  });
+
+  const year = now.getUTCFullYear();
+  const month = now.getUTCMonth() + 1;
+  const lateLedger = await tx.attendanceLateLedger.findUnique({
+    where: { employeeId_year_month: { employeeId, year, month } },
+  });
+
+  return {
+    record,
+    lateMarkDeductionApplied: false,
+    lateMonthCount: lateLedger?.count ?? 0,
+  };
+}
+
 // ── Today's open attendance ────────────────────────────────────────────────────
 
 /**
