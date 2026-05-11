@@ -19,7 +19,9 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-dotenv.config({ path: path.resolve(__dirname, '../../../.env') });
+// Load apps/api/.env — the env file lives next to the API code.
+// __dirname here is apps/api/prisma/, so '../.env' resolves to apps/api/.env.
+dotenv.config({ path: path.resolve(__dirname, '../.env') });
 
 const prisma = new PrismaClient({ log: ['warn', 'error'] });
 
