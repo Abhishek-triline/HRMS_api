@@ -234,16 +234,47 @@ router.post(
     const ip = clientIp(req);
 
     try {
-      // Validate reportingManagerId exists if provided
+      // Validate reportingManagerId — existence, role, and status (BL-015 / BL-017 / BL-022)
       if (body.reportingManagerId) {
         const mgr = await prisma.employee.findUnique({
           where: { id: body.reportingManagerId },
+          select: { id: true, role: true, status: true },
         });
         if (!mgr) {
           res.status(400).json(
             errorEnvelope(ErrorCode.VALIDATION_FAILED, 'reportingManagerId does not exist.', {
               details: { reportingManagerId: ['Employee not found.'] },
             }),
+          );
+          return;
+        }
+        if (mgr.role !== 'Manager' && mgr.role !== 'Admin') {
+          res.status(400).json(
+            errorEnvelope(
+              ErrorCode.VALIDATION_FAILED,
+              'Reporting manager must have role Manager or Admin.',
+              {
+                details: {
+                  reportingManagerId: [
+                    `Must be a Manager or Admin (got ${mgr.role}).`,
+                  ],
+                },
+              },
+            ),
+          );
+          return;
+        }
+        if (mgr.status === 'Exited' || mgr.status === 'Inactive') {
+          res.status(400).json(
+            errorEnvelope(
+              ErrorCode.VALIDATION_FAILED,
+              'Reporting manager must be Active or OnNotice.',
+              {
+                details: {
+                  reportingManagerId: ['Cannot assign an Exited or Inactive employee.'],
+                },
+              },
+            ),
           );
           return;
         }
@@ -510,7 +541,9 @@ router.get(
       }
 
       if (query.role) {
-        where['role'] = query.role;
+        // Support comma-separated multi-role filter (e.g. "Manager,Admin")
+        const roles = query.role.split(',').map((r) => r.trim()).filter(Boolean);
+        where['role'] = roles.length === 1 ? roles[0] : { in: roles };
       }
 
       if (query.department) {
@@ -670,6 +703,7 @@ router.patch(
       designation?: string;
       employmentType?: string;
       joinDate?: string;
+      reportingManagerId?: string | null;
       version: number;
     };
     const actor = req.user!;
@@ -693,6 +727,69 @@ router.patch(
         return;
       }
 
+      // Validate reportingManagerId — existence, role, and status (BL-015 / BL-017 / BL-022)
+      const managerChanging = body.reportingManagerId !== undefined;
+      const newManagerId = managerChanging ? (body.reportingManagerId ?? null) : undefined;
+
+      if (managerChanging && newManagerId !== null) {
+        const mgr = await prisma.employee.findUnique({
+          where: { id: newManagerId },
+          select: { id: true, role: true, status: true },
+        });
+        if (!mgr) {
+          res.status(400).json(
+            errorEnvelope(ErrorCode.VALIDATION_FAILED, 'reportingManagerId does not exist.', {
+              details: { reportingManagerId: ['Employee not found.'] },
+            }),
+          );
+          return;
+        }
+        if (mgr.role !== 'Manager' && mgr.role !== 'Admin') {
+          res.status(400).json(
+            errorEnvelope(
+              ErrorCode.VALIDATION_FAILED,
+              'Reporting manager must have role Manager or Admin.',
+              {
+                details: {
+                  reportingManagerId: [
+                    `Must be a Manager or Admin (got ${mgr.role}).`,
+                  ],
+                },
+              },
+            ),
+          );
+          return;
+        }
+        if (mgr.status === 'Exited' || mgr.status === 'Inactive') {
+          res.status(400).json(
+            errorEnvelope(
+              ErrorCode.VALIDATION_FAILED,
+              'Reporting manager must be Active or OnNotice.',
+              {
+                details: {
+                  reportingManagerId: ['Cannot assign an Exited or Inactive employee.'],
+                },
+              },
+            ),
+          );
+          return;
+        }
+
+        // BL-005: circular reporting chain detection
+        // newManagerId is non-null here (guarded above); cast for TypeScript
+        const cycle = await wouldCreateCycle(id, newManagerId as string);
+        if (cycle) {
+          res.status(409).json(
+            errorEnvelope(
+              ErrorCode.CIRCULAR_REPORTING,
+              'Assigning this manager would create a circular reporting chain (BL-005).',
+              { ruleId: 'BL-005', details: { reportingManagerId: newManagerId } },
+            ),
+          );
+          return;
+        }
+      }
+
       const beforeSnapshot = {
         name: current.name,
         phone: current.phone,
@@ -703,6 +800,7 @@ router.patch(
         designation: current.designation,
         employmentType: current.employmentType,
         joinDate: current.joinDate.toISOString().split('T')[0],
+        reportingManagerId: current.reportingManagerId,
         version: current.version,
       };
 
@@ -719,8 +817,37 @@ router.patch(
       if (body.designation !== undefined) updateData['designation'] = body.designation;
       if (body.employmentType !== undefined) updateData['employmentType'] = body.employmentType;
       if (body.joinDate !== undefined) updateData['joinDate'] = new Date(body.joinDate);
+      if (managerChanging) {
+        updateData['reportingManagerId'] = newManagerId ?? null;
+        if (current.reportingManagerId !== null) {
+          // Track the previous manager so queries can surface past-team history
+          updateData['previousReportingManagerId'] = current.reportingManagerId;
+        }
+      }
+
+      const now = new Date();
 
       const updated = await prisma.$transaction(async (tx) => {
+        // If the reporting manager changed, maintain ReportingManagerHistory (BL-007)
+        if (managerChanging) {
+          // Close the currently open history row
+          await tx.reportingManagerHistory.updateMany({
+            where: { employeeId: id, toDate: null },
+            data: { toDate: now, reason: 'Reassigned' },
+          });
+
+          // Open a new history row for the incoming manager
+          await tx.reportingManagerHistory.create({
+            data: {
+              employeeId: id,
+              managerId: newManagerId ?? null,
+              fromDate: now,
+              toDate: null,
+              reason: 'Reassigned',
+            },
+          });
+        }
+
         const u = await tx.employee.update({
           where: { id },
           data: updateData as never,
@@ -750,6 +877,7 @@ router.patch(
             designation: u.designation,
             employmentType: u.employmentType,
             joinDate: u.joinDate.toISOString().split('T')[0],
+            reportingManagerId: u.reportingManagerId,
             version: u.version,
           },
         });
