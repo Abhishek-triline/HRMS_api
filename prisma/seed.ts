@@ -1,15 +1,18 @@
 /**
- * Nexora HRMS — Database seed (Phase 0 + Phase 2 + Phase 3)
+ * Nexora HRMS — Database seed (Schema v2)
  *
- * Idempotent: safe to run multiple times.
- * Creates:
- *   1. Configuration rows (all Phase-0 configurable defaults)
- *   2. Default admin employee — admin@triline.co.in / admin@123
- *      code EMP-2024-0001, mustResetPassword=false
- *   3. 6 LeaveType rows with proper flags + caps (Phase 2)
- *   4. LeaveQuota rows for 4 employment types × 4 accrual types (Phase 2)
- *   5. LeaveBalance rows for the admin for the current year (Phase 2)
- *   6. Holiday calendar for the current year (Phase 3)
+ * Idempotent: safe to re-run. Uses upsert for master tables (key on `name`)
+ * and findUnique-then-create for accounts (key on `email`).
+ *
+ * Seeds, in order:
+ *   1. Configuration rows (BL defaults)
+ *   2. Master tables — Role, EmploymentType, Department, Designation, Gender,
+ *      AuditModule, LeaveType (with FROZEN IDs per HRMS_Schema_v2_Plan §2)
+ *   3. LeaveQuota rows (4 employment types × 4 accrual leave types)
+ *   4. Holiday calendar (current calendar year)
+ *   5. Default admin + 3 demo accounts (manager / employee / payroll)
+ *   6. SalaryStructure + ReportingManagerHistory for each demo employee
+ *   7. LeaveBalance rows for each demo employee × leave type × current year
  */
 
 import { PrismaClient } from '@prisma/client';
@@ -19,8 +22,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-// Load apps/api/.env — the env file lives next to the API code.
-// __dirname here is apps/api/prisma/, so '../.env' resolves to apps/api/.env.
+// Load apps/api/.env (env file colocated with the API).
 dotenv.config({ path: path.resolve(__dirname, '../.env') });
 
 const prisma = new PrismaClient({ log: ['warn', 'error'] });
@@ -38,135 +40,66 @@ const CONFIG_DEFAULTS: Array<{ key: string; value: unknown }> = [
   { key: 'NOTIFICATION_RETENTION_DAYS', value: 90 },
   { key: 'STANDARD_TAX_REFERENCE_RATE', value: 0.095 },
   { key: 'TAX_GROSS_TAXABLE_BASIS', value: 'GrossMinusStandardDeduction' },
-  // Leave Encashment window config (BL-LE-04)
+  // Leave Encashment window (BL-LE-04)
   { key: 'ENCASHMENT_WINDOW_START_MONTH', value: 12 },
   { key: 'ENCASHMENT_WINDOW_END_MONTH',   value: 1  },
   { key: 'ENCASHMENT_WINDOW_END_DAY',     value: 15 },
   { key: 'ENCASHMENT_MAX_PERCENT',        value: 50 },
 ];
 
-// ── Admin defaults (override via env) ────────────────────────────────────────
+// ── Master table seeds — FROZEN IDs per HRMS_Schema_v2_Plan.md §2 ──────────────
+//
+// Frozen IDs use INSERT ... ON DUPLICATE KEY UPDATE so re-running the seed
+// keeps IDs stable. Production-relevant masters must keep their IDs because
+// other tables' INT FK columns reference them by ID.
 
-const ADMIN_EMAIL = process.env['SEED_ADMIN_EMAIL'] ?? 'admin@triline.co.in';
-const ADMIN_PASSWORD = process.env['SEED_ADMIN_PASSWORD'] ?? 'admin@123';
+const ROLES = [
+  { id: 1, name: 'Employee' },
+  { id: 2, name: 'Manager' },
+  { id: 3, name: 'PayrollOfficer' },
+  { id: 4, name: 'Admin' },
+];
 
-async function seedConfiguration(): Promise<void> {
-  let created = 0;
-  let skipped = 0;
+const EMPLOYMENT_TYPES = [
+  { id: 1, name: 'Permanent' },
+  { id: 2, name: 'Contract' },
+  { id: 3, name: 'Probation' },
+  { id: 4, name: 'Intern' },
+];
 
-  for (const { key, value } of CONFIG_DEFAULTS) {
-    const existing = await prisma.configuration.findUnique({ where: { key } });
-    if (existing) {
-      skipped++;
-    } else {
-      await prisma.configuration.create({
-        data: { key, value: value as never, updatedBy: 'seed' },
-      });
-      created++;
-      console.log(`  [config] Created: ${key} = ${JSON.stringify(value)}`);
-    }
-  }
+const GENDERS = [
+  { id: 1, name: 'Male' },
+  { id: 2, name: 'Female' },
+  { id: 3, name: 'Other' },
+  { id: 4, name: 'PreferNotToSay' },
+];
 
-  if (skipped > 0) {
-    console.log(`  [config] Skipped ${skipped} existing configuration rows.`);
-  }
-  console.log(`  [config] Created ${created} new configuration rows.`);
-}
+const AUDIT_MODULES = [
+  { id: 1, name: 'auth' },
+  { id: 2, name: 'employees' },
+  { id: 3, name: 'leave' },
+  { id: 4, name: 'payroll' },
+  { id: 5, name: 'attendance' },
+  { id: 6, name: 'performance' },
+  { id: 7, name: 'notifications' },
+  { id: 8, name: 'audit' },
+  { id: 9, name: 'configuration' },
+];
 
-async function seedAdmin(): Promise<void> {
-  const existing = await prisma.employee.findUnique({ where: { email: ADMIN_EMAIL } });
+const DEFAULT_DEPARTMENTS = ['Engineering', 'Design', 'HR', 'Finance', 'Operations', 'Product', 'Sales'];
+const DEFAULT_DESIGNATIONS = [
+  'Software Engineer',
+  'Engineering Manager',
+  'Head of People',
+  'Payroll Officer',
+  'Senior Designer',
+  'Product Manager',
+];
 
-  if (existing) {
-    console.log(`  [admin] Already exists (${ADMIN_EMAIL}) — skipping employee row.`);
+// ── Leave types — also frozen IDs ─────────────────────────────────────────────
 
-    // Phase 1: idempotently add SalaryStructure and ReportingManagerHistory if missing
-    const hasSalary = await prisma.salaryStructure.findFirst({
-      where: { employeeId: existing.id },
-    });
-    if (!hasSalary) {
-      await prisma.salaryStructure.create({
-        data: {
-          employeeId: existing.id,
-          basicPaise: 0,
-          allowancesPaise: 0,
-          effectiveFrom: existing.joinDate,
-          version: 0,
-        },
-      });
-      console.log(`  [admin] Created initial SalaryStructure for admin.`);
-    }
-
-    const hasHistory = await prisma.reportingManagerHistory.findFirst({
-      where: { employeeId: existing.id },
-    });
-    if (!hasHistory) {
-      await prisma.reportingManagerHistory.create({
-        data: {
-          employeeId: existing.id,
-          managerId: null,
-          fromDate: existing.joinDate,
-          toDate: null,
-          reason: 'Initial',
-        },
-      });
-      console.log(`  [admin] Created initial ReportingManagerHistory for admin.`);
-    }
-
-    return;
-  }
-
-  const passwordHash = await argon2.hash(ADMIN_PASSWORD, { type: argon2.argon2id });
-  const joinDate = new Date('2024-01-01');
-
-  const admin = await prisma.employee.create({
-    data: {
-      code: 'EMP-2024-0001',
-      email: ADMIN_EMAIL,
-      name: 'Priya Sharma',
-      passwordHash,
-      role: 'Admin',
-      status: 'Active',
-      employmentType: 'Permanent',
-      department: 'HR',
-      designation: 'Head of People',
-      reportingManagerId: null,
-      joinDate,
-      exitDate: null,
-      mustResetPassword: false,
-      version: 0,
-    },
-  });
-
-  // Phase 1: initial salary structure (zeroed — Admin may update)
-  await prisma.salaryStructure.create({
-    data: {
-      employeeId: admin.id,
-      basicPaise: 0,
-      allowancesPaise: 0,
-      effectiveFrom: joinDate,
-      version: 0,
-    },
-  });
-
-  // Phase 1: initial reporting manager history row
-  await prisma.reportingManagerHistory.create({
-    data: {
-      employeeId: admin.id,
-      managerId: null,
-      fromDate: joinDate,
-      toDate: null,
-      reason: 'Initial',
-    },
-  });
-
-  console.log(`  [admin] Created admin employee: ${ADMIN_EMAIL}`);
-  console.log(`  [admin] Code: EMP-2024-0001, Name: Priya Sharma`);
-  console.log(`  [admin] IMPORTANT: Change the password immediately in production.`);
-}
-
-// ── Leave type definitions (Phase 2) ─────────────────────────────────────────
-
-interface LeaveTypeDef {
+interface LeaveTypeSeed {
+  id: number;
   name: string;
   isEventBased: boolean;
   requiresAdminApproval: boolean;
@@ -174,292 +107,278 @@ interface LeaveTypeDef {
   maxDaysPerEvent: number | null;
 }
 
-const LEAVE_TYPES: LeaveTypeDef[] = [
-  {
-    name: 'Annual',
-    isEventBased: false,
-    requiresAdminApproval: false,
-    carryForwardCap: 10,
-    maxDaysPerEvent: null,
-  },
-  {
-    name: 'Sick',
-    isEventBased: false,
-    requiresAdminApproval: false,
-    carryForwardCap: 0,   // BL-012: Sick does NOT carry forward
-    maxDaysPerEvent: null,
-  },
-  {
-    name: 'Casual',
-    isEventBased: false,
-    requiresAdminApproval: false,
-    carryForwardCap: 5,
-    maxDaysPerEvent: null,
-  },
-  {
-    name: 'Unpaid',
-    isEventBased: false,
-    requiresAdminApproval: false,
-    carryForwardCap: 0,
-    maxDaysPerEvent: null,
-  },
-  {
-    name: 'Maternity',
-    isEventBased: true,
-    requiresAdminApproval: true,
-    carryForwardCap: null,
-    maxDaysPerEvent: 182, // 26 weeks (BL-015)
-  },
-  {
-    name: 'Paternity',
-    isEventBased: true,
-    requiresAdminApproval: true,
-    carryForwardCap: null,
-    maxDaysPerEvent: 10,  // 10 working days (BL-016)
-  },
+const LEAVE_TYPES: LeaveTypeSeed[] = [
+  { id: 1, name: 'Annual',    isEventBased: false, requiresAdminApproval: false, carryForwardCap: 10,  maxDaysPerEvent: null },
+  { id: 2, name: 'Sick',      isEventBased: false, requiresAdminApproval: false, carryForwardCap: 0,   maxDaysPerEvent: null },
+  { id: 3, name: 'Casual',    isEventBased: false, requiresAdminApproval: false, carryForwardCap: 5,   maxDaysPerEvent: null },
+  { id: 4, name: 'Unpaid',    isEventBased: false, requiresAdminApproval: false, carryForwardCap: 0,   maxDaysPerEvent: null },
+  { id: 5, name: 'Maternity', isEventBased: true,  requiresAdminApproval: true,  carryForwardCap: null, maxDaysPerEvent: 182 },
+  { id: 6, name: 'Paternity', isEventBased: true,  requiresAdminApproval: true,  carryForwardCap: null, maxDaysPerEvent: 10 },
 ];
 
-// ── Leave quotas — days per year per employment type (Phase 2) ────────────────
+// ── Leave quotas (employmentTypeId × leaveTypeName) ──────────────────────────
 
-interface QuotaDef {
-  leaveTypeName: string;
-  employmentType: string;
-  daysPerYear: number;
-}
-
-// Maternity/Paternity have no quota rows (event-based, no annual limit).
-// Unpaid daysPerYear = 0 (no annual cap; server allows any duration at request time).
-const LEAVE_QUOTAS: QuotaDef[] = [
+interface QuotaSeed { leaveTypeId: number; employmentTypeId: number; daysPerYear: number }
+const LEAVE_QUOTAS: QuotaSeed[] = [
   // Annual
-  { leaveTypeName: 'Annual', employmentType: 'Permanent', daysPerYear: 18 },
-  { leaveTypeName: 'Annual', employmentType: 'Contract',  daysPerYear: 12 },
-  { leaveTypeName: 'Annual', employmentType: 'Probation', daysPerYear: 6  },
-  { leaveTypeName: 'Annual', employmentType: 'Intern',    daysPerYear: 3  },
+  { leaveTypeId: 1, employmentTypeId: 1, daysPerYear: 18 }, // Permanent
+  { leaveTypeId: 1, employmentTypeId: 2, daysPerYear: 12 }, // Contract
+  { leaveTypeId: 1, employmentTypeId: 3, daysPerYear: 6  }, // Probation
+  { leaveTypeId: 1, employmentTypeId: 4, daysPerYear: 3  }, // Intern
   // Sick
-  { leaveTypeName: 'Sick',   employmentType: 'Permanent', daysPerYear: 10 },
-  { leaveTypeName: 'Sick',   employmentType: 'Contract',  daysPerYear: 7  },
-  { leaveTypeName: 'Sick',   employmentType: 'Probation', daysPerYear: 5  },
-  { leaveTypeName: 'Sick',   employmentType: 'Intern',    daysPerYear: 3  },
-  // Casual — Test Cases § 1.1 sets the seed reference at 6 for Permanent.
-  { leaveTypeName: 'Casual', employmentType: 'Permanent', daysPerYear: 6  },
-  { leaveTypeName: 'Casual', employmentType: 'Contract',  daysPerYear: 4  },
-  { leaveTypeName: 'Casual', employmentType: 'Probation', daysPerYear: 3  },
-  { leaveTypeName: 'Casual', employmentType: 'Intern',    daysPerYear: 2  },
-  // Unpaid — represented as 0 (no annual limit; handled at request time)
-  { leaveTypeName: 'Unpaid', employmentType: 'Permanent', daysPerYear: 0  },
-  { leaveTypeName: 'Unpaid', employmentType: 'Contract',  daysPerYear: 0  },
-  { leaveTypeName: 'Unpaid', employmentType: 'Probation', daysPerYear: 0  },
-  { leaveTypeName: 'Unpaid', employmentType: 'Intern',    daysPerYear: 0  },
+  { leaveTypeId: 2, employmentTypeId: 1, daysPerYear: 10 },
+  { leaveTypeId: 2, employmentTypeId: 2, daysPerYear: 7  },
+  { leaveTypeId: 2, employmentTypeId: 3, daysPerYear: 5  },
+  { leaveTypeId: 2, employmentTypeId: 4, daysPerYear: 3  },
+  // Casual
+  { leaveTypeId: 3, employmentTypeId: 1, daysPerYear: 8  },
+  { leaveTypeId: 3, employmentTypeId: 2, daysPerYear: 6  },
+  { leaveTypeId: 3, employmentTypeId: 3, daysPerYear: 4  },
+  { leaveTypeId: 3, employmentTypeId: 4, daysPerYear: 2  },
+  // Unpaid — no annual cap (daysPerYear = 0)
+  { leaveTypeId: 4, employmentTypeId: 1, daysPerYear: 0  },
+  { leaveTypeId: 4, employmentTypeId: 2, daysPerYear: 0  },
+  { leaveTypeId: 4, employmentTypeId: 3, daysPerYear: 0  },
+  { leaveTypeId: 4, employmentTypeId: 4, daysPerYear: 0  },
 ];
 
-async function seedLeaveTypes(): Promise<void> {
-  let created = 0;
-  let skipped = 0;
+// ── Holiday calendar (current year — placeholder set) ────────────────────────
 
-  for (const lt of LEAVE_TYPES) {
-    const existing = await prisma.leaveType.findUnique({ where: { name: lt.name } });
-    if (existing) {
-      skipped++;
-    } else {
-      await prisma.leaveType.create({ data: lt });
-      created++;
-      console.log(`  [leave-type] Created: ${lt.name}`);
-    }
-  }
-
-  if (skipped > 0) console.log(`  [leave-type] Skipped ${skipped} existing leave type rows.`);
-  console.log(`  [leave-type] Created ${created} new leave type rows.`);
-}
-
-async function seedLeaveQuotas(): Promise<void> {
-  let created = 0;
-  let skipped = 0;
-
-  for (const q of LEAVE_QUOTAS) {
-    const leaveType = await prisma.leaveType.findUnique({ where: { name: q.leaveTypeName } });
-    if (!leaveType) {
-      console.warn(`  [leave-quota] Leave type '${q.leaveTypeName}' not found — skipping quota.`);
-      continue;
-    }
-
-    const existing = await prisma.leaveQuota.findUnique({
-      where: {
-        leaveTypeId_employmentType: {
-          leaveTypeId: leaveType.id,
-          employmentType: q.employmentType as never,
-        },
-      },
-    });
-
-    if (existing) {
-      skipped++;
-    } else {
-      await prisma.leaveQuota.create({
-        data: {
-          leaveTypeId: leaveType.id,
-          employmentType: q.employmentType as never,
-          daysPerYear: q.daysPerYear,
-        },
-      });
-      created++;
-    }
-  }
-
-  if (skipped > 0) console.log(`  [leave-quota] Skipped ${skipped} existing quota rows.`);
-  console.log(`  [leave-quota] Created ${created} new quota rows.`);
-}
-
-async function seedAdminLeaveBalances(): Promise<void> {
-  const admin = await prisma.employee.findUnique({ where: { email: ADMIN_EMAIL } });
-  if (!admin) {
-    console.warn('  [leave-balance] Admin not found — skipping leave balance seed.');
-    return;
-  }
-
-  const year = new Date().getFullYear();
-  let created = 0;
-  let skipped = 0;
-
-  // Seed balances for all accrual leave types based on Permanent quotas
-  const accrualTypes = ['Annual', 'Sick', 'Casual', 'Unpaid'];
-
-  for (const typeName of accrualTypes) {
-    const leaveType = await prisma.leaveType.findUnique({ where: { name: typeName } });
-    if (!leaveType) continue;
-
-    const quota = await prisma.leaveQuota.findUnique({
-      where: {
-        leaveTypeId_employmentType: {
-          leaveTypeId: leaveType.id,
-          employmentType: 'Permanent',
-        },
-      },
-    });
-
-    const daysRemaining = quota?.daysPerYear ?? 0;
-
-    const existing = await prisma.leaveBalance.findUnique({
-      where: {
-        employeeId_leaveTypeId_year: {
-          employeeId: admin.id,
-          leaveTypeId: leaveType.id,
-          year,
-        },
-      },
-    });
-
-    if (existing) {
-      skipped++;
-    } else {
-      await prisma.leaveBalance.create({
-        data: {
-          employeeId: admin.id,
-          leaveTypeId: leaveType.id,
-          year,
-          daysRemaining,
-          daysUsed: 0,
-          version: 0,
-        },
-      });
-
-      // Ledger entry for the initial grant
-      if (daysRemaining > 0) {
-        await prisma.leaveBalanceLedger.create({
-          data: {
-            employeeId: admin.id,
-            leaveTypeId: leaveType.id,
-            year,
-            delta: daysRemaining,
-            reason: 'Initial',
-            relatedRequestId: null,
-            createdBy: null,
-          },
-        });
-      }
-
-      created++;
-      console.log(`  [leave-balance] Created ${typeName} balance for admin: ${daysRemaining} days (${year})`);
-    }
-  }
-
-  if (skipped > 0) console.log(`  [leave-balance] Skipped ${skipped} existing balance rows.`);
-  console.log(`  [leave-balance] Created ${created} new balance rows for admin.`);
-}
-
-// ── Holiday calendar (Phase 3) ────────────────────────────────────────────────
-
-interface HolidayDef {
-  month: number; // 1-indexed
-  day: number;
-  name: string;
-}
-
-// Test-case seed list (not load-bearing — precise names don't matter for tests)
-const SEED_HOLIDAYS: HolidayDef[] = [
-  { month: 1, day: 26, name: 'Republic Day' },
-  { month: 3, day: 3, name: 'Holi' },
-  { month: 4, day: 3, name: 'Good Friday' },
-  { month: 4, day: 20, name: 'Ram Navami' },
-  { month: 8, day: 15, name: 'Independence Day' },
-  { month: 11, day: 8, name: 'Diwali' },
+const HOLIDAY_SEEDS = [
+  { month: 1,  day: 26, name: 'Republic Day' },
+  { month: 3,  day: 3,  name: 'Holi' },
+  { month: 4,  day: 3,  name: 'Good Friday' },
+  { month: 8,  day: 15, name: 'Independence Day' },
+  { month: 10, day: 2,  name: 'Gandhi Jayanti' },
+  { month: 10, day: 31, name: 'Diwali' },
   { month: 12, day: 25, name: 'Christmas' },
 ];
 
-async function seedHolidays(): Promise<void> {
-  const year = new Date().getFullYear();
-  let created = 0;
-  let skipped = 0;
+// ── Demo account seeds ───────────────────────────────────────────────────────
 
-  for (const h of SEED_HOLIDAYS) {
-    // Use UTC date to match @db.Date storage
-    const date = new Date(Date.UTC(year, h.month - 1, h.day));
-
-    const existing = await prisma.holiday.findFirst({
-      where: { year, date },
-    });
-
-    if (existing) {
-      skipped++;
-    } else {
-      await prisma.holiday.create({
-        data: { year, date, name: h.name },
-      });
-      created++;
-      console.log(`  [holiday] Created: ${h.name} (${year}-${String(h.month).padStart(2, '0')}-${String(h.day).padStart(2, '0')})`);
-    }
-  }
-
-  if (skipped > 0) console.log(`  [holiday] Skipped ${skipped} existing holiday rows.`);
-  console.log(`  [holiday] Created ${created} new holiday rows for ${year}.`);
+interface DemoAccountSeed {
+  email: string;
+  name: string;
+  code: string;
+  roleId: number;
+  designationName: string;
+  departmentName: string;
+  employmentTypeId: number;
+  reportsToEmail: string | null;
 }
 
-async function main(): Promise<void> {
-  console.log('Nexora HRMS — Seed starting...\n');
+const ADMIN_EMAIL    = process.env['SEED_ADMIN_EMAIL']    ?? 'admin@triline.co.in';
+const ADMIN_PASSWORD = process.env['SEED_ADMIN_PASSWORD'] ?? 'admin@123';
+const COMMON_PASSWORD = ADMIN_PASSWORD; // demo accounts share the password for simplicity
 
-  console.log('Seeding configuration...');
+const DEMO_ACCOUNTS: DemoAccountSeed[] = [
+  { email: ADMIN_EMAIL,             name: 'Priya Sharma', code: 'EMP-2024-0001', roleId: 4, designationName: 'Head of People',     departmentName: 'HR',           employmentTypeId: 1, reportsToEmail: null              },
+  { email: 'manager@triline.co.in', name: 'Arjun Mehta',  code: 'EMP-2024-0002', roleId: 2, designationName: 'Engineering Manager', departmentName: 'Engineering', employmentTypeId: 1, reportsToEmail: ADMIN_EMAIL       },
+  { email: 'employee@triline.co.in', name: 'Kavya Reddy', code: 'EMP-2024-0003', roleId: 1, designationName: 'Software Engineer',   departmentName: 'Engineering', employmentTypeId: 1, reportsToEmail: 'manager@triline.co.in' },
+  { email: 'payroll@triline.co.in', name: 'Ravi Iyer',    code: 'EMP-2024-0004', roleId: 3, designationName: 'Payroll Officer',     departmentName: 'Finance',     employmentTypeId: 1, reportsToEmail: ADMIN_EMAIL       },
+];
+
+// ── Seed functions ───────────────────────────────────────────────────────────
+
+async function seedConfiguration(): Promise<void> {
+  let created = 0;
+  let skipped = 0;
+  for (const { key, value } of CONFIG_DEFAULTS) {
+    const existing = await prisma.configuration.findUnique({ where: { key } });
+    if (existing) { skipped++; continue; }
+    await prisma.configuration.create({ data: { key, value: value as never, updatedBy: 'seed' } });
+    created++;
+    console.log(`  [config] +${key} = ${JSON.stringify(value)}`);
+  }
+  console.log(`  [config] ${created} created, ${skipped} skipped`);
+}
+
+async function seedMasterById<T extends { id: number; name: string }>(
+  table: 'role' | 'employmentType' | 'gender' | 'auditModule',
+  rows: T[],
+): Promise<void> {
+  for (const r of rows) {
+    // Upsert by id keeps the frozen mapping stable across re-runs.
+    // @ts-expect-error — prisma narrows the model union dynamically; this loop
+    // calls upsert on whichever table the caller named.
+    await prisma[table].upsert({
+      where: { id: r.id },
+      create: { id: r.id, name: r.name },
+      update: { name: r.name },
+    });
+  }
+}
+
+async function seedDepartmentsAndDesignations(): Promise<void> {
+  for (const name of DEFAULT_DEPARTMENTS) {
+    await prisma.department.upsert({ where: { name }, create: { name }, update: {} });
+  }
+  for (const name of DEFAULT_DESIGNATIONS) {
+    await prisma.designation.upsert({ where: { name }, create: { name }, update: {} });
+  }
+}
+
+async function seedLeaveTypes(): Promise<void> {
+  for (const lt of LEAVE_TYPES) {
+    await prisma.leaveType.upsert({
+      where: { id: lt.id },
+      create: {
+        id: lt.id,
+        name: lt.name,
+        isEventBased: lt.isEventBased,
+        requiresAdminApproval: lt.requiresAdminApproval,
+        carryForwardCap: lt.carryForwardCap,
+        maxDaysPerEvent: lt.maxDaysPerEvent,
+      },
+      update: {
+        name: lt.name,
+        isEventBased: lt.isEventBased,
+        requiresAdminApproval: lt.requiresAdminApproval,
+        carryForwardCap: lt.carryForwardCap,
+        maxDaysPerEvent: lt.maxDaysPerEvent,
+      },
+    });
+  }
+}
+
+async function seedLeaveQuotas(): Promise<void> {
+  for (const q of LEAVE_QUOTAS) {
+    await prisma.leaveQuota.upsert({
+      where: { leaveTypeId_employmentTypeId: { leaveTypeId: q.leaveTypeId, employmentTypeId: q.employmentTypeId } },
+      create: q,
+      update: { daysPerYear: q.daysPerYear },
+    });
+  }
+}
+
+async function seedHolidays(year: number): Promise<void> {
+  for (const h of HOLIDAY_SEEDS) {
+    const date = new Date(Date.UTC(year, h.month - 1, h.day));
+    await prisma.holiday.upsert({
+      where: { date },
+      create: { date, name: h.name, year },
+      update: { name: h.name, year },
+    });
+  }
+}
+
+async function seedDemoAccounts(): Promise<void> {
+  const passwordHash = await argon2.hash(COMMON_PASSWORD, { type: argon2.argon2id });
+  const joinDate = new Date('2024-02-01');
+
+  // First pass: create accounts WITHOUT reportingManagerId so we can resolve emails later.
+  for (const acc of DEMO_ACCOUNTS) {
+    const existing = await prisma.employee.findUnique({ where: { email: acc.email } });
+    if (existing) { console.log(`  [demo] skip existing ${acc.email}`); continue; }
+
+    const dept = await prisma.department.findUnique({ where: { name: acc.departmentName } });
+    const desig = await prisma.designation.findUnique({ where: { name: acc.designationName } });
+
+    const emp = await prisma.employee.create({
+      data: {
+        code: acc.code,
+        email: acc.email,
+        name: acc.name,
+        passwordHash,
+        roleId: acc.roleId,
+        employmentTypeId: acc.employmentTypeId,
+        departmentId: dept?.id ?? null,
+        designationId: desig?.id ?? null,
+        statusId: 1, // Active
+        joinDate,
+        mustResetPassword: false,
+        version: 0,
+      },
+    });
+
+    // Initial salary structure (zero — Admin updates later).
+    await prisma.salaryStructure.create({
+      data: {
+        employeeId: emp.id,
+        basicPaise: 0,
+        allowancesPaise: 0,
+        effectiveFrom: joinDate,
+        version: 0,
+      },
+    });
+
+    // Reporting-manager history row (Initial — manager unresolved at this point).
+    await prisma.reportingManagerHistory.create({
+      data: {
+        employeeId: emp.id,
+        managerId: null,
+        fromDate: joinDate,
+        reasonId: 1, // Initial
+      },
+    });
+
+    console.log(`  [demo] + ${acc.email} (code=${acc.code})`);
+  }
+
+  // Second pass: now resolve reportingManagerId from email -> id.
+  for (const acc of DEMO_ACCOUNTS) {
+    if (!acc.reportsToEmail) continue;
+    const mgr = await prisma.employee.findUnique({ where: { email: acc.reportsToEmail } });
+    const emp = await prisma.employee.findUnique({ where: { email: acc.email } });
+    if (!mgr || !emp || emp.reportingManagerId === mgr.id) continue;
+    await prisma.employee.update({
+      where: { id: emp.id },
+      data: { reportingManagerId: mgr.id },
+    });
+    await prisma.reportingManagerHistory.updateMany({
+      where: { employeeId: emp.id, toDate: null },
+      data: { managerId: mgr.id },
+    });
+  }
+
+  // Third pass: seed LeaveBalance rows for current year × every accrual leave type.
+  const year = new Date().getUTCFullYear();
+  for (const acc of DEMO_ACCOUNTS) {
+    const emp = await prisma.employee.findUnique({ where: { email: acc.email } });
+    if (!emp) continue;
+    for (const lt of LEAVE_TYPES) {
+      if (lt.isEventBased) continue;
+      const quota = await prisma.leaveQuota.findUnique({
+        where: { leaveTypeId_employmentTypeId: { leaveTypeId: lt.id, employmentTypeId: emp.employmentTypeId } },
+      });
+      const days = quota?.daysPerYear ?? 0;
+      await prisma.leaveBalance.upsert({
+        where: { employeeId_leaveTypeId_year: { employeeId: emp.id, leaveTypeId: lt.id, year } },
+        create: { employeeId: emp.id, leaveTypeId: lt.id, year, daysRemaining: days, daysUsed: 0 },
+        update: {}, // don't clobber existing balance on re-seed
+      });
+    }
+  }
+}
+
+// ── Entry point ──────────────────────────────────────────────────────────────
+
+async function main() {
+  console.log('Seed: Schema v2');
+
+  console.log('• Configuration');
   await seedConfiguration();
 
-  console.log('\nSeeding default admin...');
-  await seedAdmin();
+  console.log('• Masters');
+  await seedMasterById('role',            ROLES);
+  await seedMasterById('employmentType',  EMPLOYMENT_TYPES);
+  await seedMasterById('gender',          GENDERS);
+  await seedMasterById('auditModule',     AUDIT_MODULES);
+  await seedDepartmentsAndDesignations();
 
-  console.log('\nSeeding leave types (Phase 2)...');
+  console.log('• Leave types + quotas');
   await seedLeaveTypes();
-
-  console.log('\nSeeding leave quotas (Phase 2)...');
   await seedLeaveQuotas();
 
-  console.log('\nSeeding admin leave balances (Phase 2)...');
-  await seedAdminLeaveBalances();
+  console.log('• Holidays');
+  await seedHolidays(new Date().getUTCFullYear());
 
-  console.log('\nSeeding holiday calendar (Phase 3)...');
-  await seedHolidays();
+  console.log('• Demo accounts');
+  await seedDemoAccounts();
 
-  console.log('\nSeed complete.');
+  console.log('Seed complete.');
 }
 
 main()
-  .catch((err: unknown) => {
-    console.error('Seed failed:', err);
-    process.exit(1);
-  })
-  .finally(() => prisma.$disconnect());
+  .catch((err) => { console.error(err); process.exit(1); })
+  .finally(async () => { await prisma.$disconnect(); });
