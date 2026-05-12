@@ -248,15 +248,27 @@ router.post(
           );
           return;
         }
-        if (mgr.role !== 'Manager' && mgr.role !== 'Admin') {
+        // Role-of-manager constraint depends on the role of the employee
+        // being created. Admins may only report to another Admin (or null —
+        // they're top of the tree). Manager/Employee/PayrollOfficer may
+        // report to a Manager or Admin.
+        const requireAdminManager = body.role === 'Admin';
+        const allowedMgrRoles = requireAdminManager
+          ? (['Admin'] as const)
+          : (['Manager', 'Admin'] as const);
+        if (!(allowedMgrRoles as readonly string[]).includes(mgr.role)) {
           res.status(400).json(
             errorEnvelope(
               ErrorCode.VALIDATION_FAILED,
-              'Reporting manager must have role Manager or Admin.',
+              requireAdminManager
+                ? 'An Admin can only report to another Admin.'
+                : 'Reporting manager must have role Manager or Admin.',
               {
                 details: {
                   reportingManagerId: [
-                    `Must be a Manager or Admin (got ${mgr.role}).`,
+                    requireAdminManager
+                      ? `An Admin can only report to another Admin (got ${mgr.role}).`
+                      : `Must be a Manager or Admin (got ${mgr.role}).`,
                   ],
                 },
               },
@@ -744,15 +756,29 @@ router.patch(
           );
           return;
         }
-        if (mgr.role !== 'Manager' && mgr.role !== 'Admin') {
+        // Role-of-manager constraint depends on the role of the employee
+        // being updated. Admins may only report to another Admin (or null).
+        // Other roles may report to a Manager or Admin. Use the incoming
+        // role if it's being updated in this same PATCH, else the current
+        // role on disk.
+        const effectiveRole = body.role ?? current.role;
+        const requireAdminManager = effectiveRole === 'Admin';
+        const allowedMgrRoles = requireAdminManager
+          ? (['Admin'] as const)
+          : (['Manager', 'Admin'] as const);
+        if (!(allowedMgrRoles as readonly string[]).includes(mgr.role)) {
           res.status(400).json(
             errorEnvelope(
               ErrorCode.VALIDATION_FAILED,
-              'Reporting manager must have role Manager or Admin.',
+              requireAdminManager
+                ? 'An Admin can only report to another Admin.'
+                : 'Reporting manager must have role Manager or Admin.',
               {
                 details: {
                   reportingManagerId: [
-                    `Must be a Manager or Admin (got ${mgr.role}).`,
+                    requireAdminManager
+                      ? `An Admin can only report to another Admin (got ${mgr.role}).`
+                      : `Must be a Manager or Admin (got ${mgr.role}).`,
                   ],
                 },
               },
