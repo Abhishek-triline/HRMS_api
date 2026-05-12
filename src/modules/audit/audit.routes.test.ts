@@ -71,8 +71,8 @@ vi.mock('../../middleware/requireSession.js', () => ({
 }));
 
 vi.mock('../../middleware/requireRole.js', () => ({
-  requireRole: (requiredRole: string) => (req: express.Request, res: express.Response, next: express.NextFunction) => {
-    if (!req.user || req.user.role !== requiredRole) {
+  requireRole: (..._requiredRoles: number[]) => (req: express.Request, res: express.Response, next: express.NextFunction) => {
+    if (!req.user || !_requiredRoles.includes(req.user.roleId)) {
       res.status(403).json({ error: { code: 'FORBIDDEN', message: 'You are not authorised for this action.' } });
       return;
     }

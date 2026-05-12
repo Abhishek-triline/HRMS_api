@@ -1,8 +1,12 @@
 /**
- * Leave Encashment service — BL-LE-01..14.
+ * Leave Encashment service — BL-LE-01..14, v2 schema (INT IDs, INT status codes).
  *
- * Pure-function module. All mutating functions accept a Prisma.TransactionClient
- * so they compose with the caller's transaction.
+ * v2 schema notes:
+ *   - All IDs are INT (number).
+ *   - LeaveEncashment.status is INT (LeaveEncashmentStatus constants).
+ *   - LeaveEncashment.routedToId (INT, not routedTo).
+ *   - No paidInPayslipId on LeaveEncashment; encashment FK lives on Payslip.encashmentId.
+ *   - employee.role → employee.roleId (INT).
  *
  * State machine:
  *   Pending → ManagerApproved → AdminFinalised → Paid
@@ -17,6 +21,14 @@ import { notify } from '../../lib/notifications.js';
 import { logger } from '../../lib/logger.js';
 import { resolveRouting, findDefaultAdmin } from './leave.service.js';
 import { generateEncashmentCode } from './encashmentCode.js';
+import {
+  LeaveEncashmentStatus,
+  LeaveTypeId,
+  RoleId,
+  RoutedTo,
+  EmployeeStatus,
+  type AuditActorRoleValue,
+} from '../../lib/statusInt.js';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -101,7 +113,7 @@ export function isInsideEncashmentWindow(
  * ManagerApproved, AdminFinalised, or Paid status (the "quota-consuming" states).
  */
 async function findApprovedEncashment(
-  employeeId: string,
+  employeeId: number,
   year: number,
   tx: Prisma.TransactionClient,
 ) {
@@ -109,7 +121,13 @@ async function findApprovedEncashment(
     where: {
       employeeId,
       year,
-      status: { in: ['ManagerApproved', 'AdminFinalised', 'Paid'] },
+      status: {
+        in: [
+          LeaveEncashmentStatus.ManagerApproved,
+          LeaveEncashmentStatus.AdminFinalised,
+          LeaveEncashmentStatus.Paid,
+        ],
+      },
     },
   });
 }
@@ -129,7 +147,7 @@ async function findApprovedEncashment(
  * Creates a Pending row and notifies the assigned approver.
  */
 export async function submitEncashmentRequest(
-  employeeId: string,
+  employeeId: number,
   daysRequested: number,
   year: number,
   tx: Prisma.TransactionClient,
@@ -140,10 +158,10 @@ export async function submitEncashmentRequest(
   // Check employee exists and is Active (BL-LE-13)
   const employee = await tx.employee.findUnique({
     where: { id: employeeId },
-    select: { id: true, status: true, role: true, name: true, code: true },
+    select: { id: true, status: true, roleId: true, name: true, code: true },
   });
   if (!employee) throw makeError(404, 'NOT_FOUND', 'Employee not found.');
-  if (employee.status === 'Exited') {
+  if (employee.status === EmployeeStatus.Exited) {
     throw makeError(409, 'VALIDATION_FAILED', 'Exited employees cannot submit encashment requests.', 'BL-LE-13');
   }
 
@@ -171,12 +189,11 @@ export async function submitEncashmentRequest(
   }
 
   // BL-LE-01: Annual only (defensive — service-level guard)
-  const annualType = await tx.leaveType.findUnique({ where: { name: 'Annual' } });
-  if (!annualType) throw makeError(400, 'ENCASHMENT_INVALID_LEAVE_TYPE', 'Annual leave type not configured.', 'BL-LE-01');
+  const annualLeaveTypeId = LeaveTypeId.Annual;
 
   // Soft balance check (hard clamp is at adminFinalise)
   const balance = await tx.leaveBalance.findUnique({
-    where: { employeeId_leaveTypeId_year: { employeeId, leaveTypeId: annualType.id, year } },
+    where: { employeeId_leaveTypeId_year: { employeeId, leaveTypeId: annualLeaveTypeId, year } },
   });
   if (!balance || balance.daysRemaining <= 0) {
     throw makeError(
@@ -188,7 +205,7 @@ export async function submitEncashmentRequest(
   }
 
   // Routing (BL-LE-05: mirrors leave routing — Annual goes to Manager or Admin)
-  const routing = await resolveRouting(employeeId, 'Annual', tx);
+  const routing = await resolveRouting(employeeId, annualLeaveTypeId, tx);
 
   // Generate code
   const code = await generateEncashmentCode(year, tx);
@@ -200,8 +217,8 @@ export async function submitEncashmentRequest(
       employeeId,
       year,
       daysRequested,
-      status: 'Pending',
-      routedTo: routing.routedTo,
+      status: LeaveEncashmentStatus.Pending,
+      routedToId: routing.routedToId,
       approverId: routing.approverId,
       version: 0,
     },
@@ -215,7 +232,7 @@ export async function submitEncashmentRequest(
   await audit({
     tx,
     actorId: employeeId,
-    actorRole: employee.role,
+    actorRole: employee.roleId as AuditActorRoleValue,
     actorIp,
     action: 'leave.encashment.request.create',
     targetType: 'LeaveEncashment',
@@ -226,17 +243,17 @@ export async function submitEncashmentRequest(
       code: encashment.code,
       year,
       daysRequested,
-      status: 'Pending',
-      routedTo: routing.routedTo,
+      status: LeaveEncashmentStatus.Pending,
+      routedToId: routing.routedToId,
       approverId: routing.approverId,
     },
   });
 
   // Notify approver(s)
-  let recipientIds: string | string[] = routing.approverId;
-  if (routing.routedTo === 'Admin') {
+  let recipientIds: number | number[] = routing.approverId;
+  if (routing.routedToId === RoutedTo.Admin) {
     const activeAdmins = await tx.employee.findMany({
-      where: { role: 'Admin', status: 'Active' },
+      where: { roleId: RoleId.Admin, status: EmployeeStatus.Active },
       select: { id: true },
     });
     recipientIds = activeAdmins.map((a) => a.id);
@@ -247,7 +264,7 @@ export async function submitEncashmentRequest(
     category: 'Leave',
     title: `New encashment request from ${encashment.employee.name}`,
     body: `${encashment.employee.name} has requested ${daysRequested} day(s) of Annual leave encashment for ${year}.`,
-    link: `/${routing.routedTo === 'Manager' ? 'manager' : 'admin'}/leave-encashment-queue/${encashment.id}`,
+    link: `/${routing.routedToId === RoutedTo.Manager ? 'manager' : 'admin'}/leave-encashment-queue/${encashment.id}`,
   });
 
   return formatEncashment(encashment);
@@ -261,11 +278,11 @@ export async function submitEncashmentRequest(
  * Reassigns approverId to Admin for the second step.
  */
 export async function managerApproveEncashment(
-  requestId: string,
-  approverId: string,
+  requestId: number,
+  approverId: number,
   note: string | undefined,
   tx: Prisma.TransactionClient,
-  actorRole: string,
+  actorRole: AuditActorRoleValue,
   actorIp: string | null = null,
 ): Promise<ReturnType<typeof formatEncashment>> {
   const enc = await tx.leaveEncashment.findUnique({
@@ -281,8 +298,11 @@ export async function managerApproveEncashment(
   if (enc.approverId !== approverId) {
     throw makeError(403, 'FORBIDDEN', 'You are not the assigned approver for this request.');
   }
-  if (enc.status !== 'Pending' && enc.status !== 'Escalated' as string) {
-    throw makeError(409, 'VALIDATION_FAILED', `Cannot approve an encashment with status '${enc.status}'.`);
+  if (
+    enc.status !== LeaveEncashmentStatus.Pending &&
+    enc.status !== LeaveEncashmentStatus.ManagerApproved
+  ) {
+    throw makeError(409, 'VALIDATION_FAILED', `Cannot approve an encashment with this status.`);
   }
 
   // Find Admin for the next routing step
@@ -293,12 +313,12 @@ export async function managerApproveEncashment(
   const updated = await tx.leaveEncashment.update({
     where: { id: requestId },
     data: {
-      status: 'ManagerApproved',
+      status: LeaveEncashmentStatus.ManagerApproved,
       decidedAt: new Date(),
       decidedBy: approverId,
       decisionNote: note ?? null,
       // Route to Admin for final step
-      routedTo: 'Admin',
+      routedToId: RoutedTo.Admin,
       approverId: admin.id,
       version: { increment: 1 },
     },
@@ -319,7 +339,7 @@ export async function managerApproveEncashment(
     module: 'leave',
     before,
     after: {
-      status: 'ManagerApproved',
+      status: LeaveEncashmentStatus.ManagerApproved,
       phase: 'manager',
       decidedBy: approverId,
       note: note ?? null,
@@ -328,7 +348,7 @@ export async function managerApproveEncashment(
 
   // Notify employee + all active Admins
   const activeAdmins = await tx.employee.findMany({
-    where: { role: 'Admin', status: 'Active' },
+    where: { roleId: RoleId.Admin, status: EmployeeStatus.Active },
     select: { id: true },
   });
 
@@ -366,16 +386,16 @@ export async function managerApproveEncashment(
  * BL-LE-13: refuses if employee is Exited.
  */
 export async function adminFinaliseEncashment(
-  requestId: string,
-  adminId: string,
+  requestId: number,
+  adminId: number,
   daysApprovedInput: number | undefined,
   note: string | undefined,
   tx: Prisma.TransactionClient,
-  actorRole: string,
+  actorRole: AuditActorRoleValue,
   actorIp: string | null = null,
 ): Promise<ReturnType<typeof formatEncashment>> {
   // Lock the row via SELECT FOR UPDATE (BL-LE-03 concurrent finalise guard)
-  const rows = await tx.$queryRaw<Array<{ id: string }>>`
+  const rows = await tx.$queryRaw<Array<{ id: number }>>`
     SELECT id FROM leave_encashments WHERE id = ${requestId} FOR UPDATE
   `;
   if (!rows.length) throw makeError(404, 'NOT_FOUND', 'Encashment request not found.');
@@ -383,7 +403,7 @@ export async function adminFinaliseEncashment(
   const enc = await tx.leaveEncashment.findUnique({
     where: { id: requestId },
     include: {
-      employee: { select: { name: true, code: true, status: true, role: true } },
+      employee: { select: { name: true, code: true, status: true, roleId: true } },
     },
   });
   if (!enc) throw makeError(404, 'NOT_FOUND', 'Encashment request not found.');
@@ -391,17 +411,17 @@ export async function adminFinaliseEncashment(
   // Defence-in-depth: verify DB actor role
   const actor = await tx.employee.findUnique({
     where: { id: adminId },
-    select: { id: true, role: true, status: true },
+    select: { id: true, roleId: true, status: true },
   });
-  if (!actor || actor.role !== 'Admin') {
+  if (!actor || actor.roleId !== RoleId.Admin) {
     throw makeError(403, 'FORBIDDEN', 'Only Admin can finalise encashment requests.');
   }
-  if (actor.status === 'Exited') {
+  if (actor.status === EmployeeStatus.Exited) {
     throw makeError(403, 'FORBIDDEN', 'An exited admin cannot perform this action.');
   }
 
   // BL-LE-13: refuse if employee is Exited
-  if (enc.employee.status === 'Exited') {
+  if (enc.employee.status === EmployeeStatus.Exited) {
     throw makeError(
       409,
       'VALIDATION_FAILED',
@@ -410,20 +430,17 @@ export async function adminFinaliseEncashment(
     );
   }
 
-  if (enc.status !== 'ManagerApproved') {
-    throw makeError(409, 'VALIDATION_FAILED', `Cannot finalise encashment with status '${enc.status}'.`);
+  if (enc.status !== LeaveEncashmentStatus.ManagerApproved) {
+    throw makeError(409, 'VALIDATION_FAILED', `Cannot finalise encashment with this status.`);
   }
 
-  // Get Annual leave type
-  const annualType = await tx.leaveType.findUnique({ where: { name: 'Annual' } });
-  if (!annualType) throw makeError(400, 'ENCASHMENT_INVALID_LEAVE_TYPE', 'Annual leave type not configured.');
-
-  // Get current balance
+  // Get current balance using LeaveTypeId.Annual
+  const annualLeaveTypeId = LeaveTypeId.Annual;
   const balance = await tx.leaveBalance.findUnique({
     where: {
       employeeId_leaveTypeId_year: {
         employeeId: enc.employeeId,
-        leaveTypeId: annualType.id,
+        leaveTypeId: annualLeaveTypeId,
         year: enc.year,
       },
     },
@@ -451,11 +468,6 @@ export async function adminFinaliseEncashment(
   }
 
   // BL-LE-07: lock rate from current SalaryStructure
-  // Rate = floor((basicPaise + daPaise) / workingDays)
-  // We store the per-day rate snapshot here; the payroll engine will recompute
-  // using the actual paying month's workingDays (BL-LE-07 — paying month wins).
-  // We still lock basicPaise + daPaise here so the rate snapshot is meaningful
-  // for display; the engine updates ratePerDayPaise + amountPaise at payment time.
   const today = new Date();
   const salary = await tx.salaryStructure.findFirst({
     where: {
@@ -489,8 +501,8 @@ export async function adminFinaliseEncashment(
   if (!balance) {
     // Create balance row at zero then update — handles edge case
     await tx.leaveBalance.upsert({
-      where: { employeeId_leaveTypeId_year: { employeeId: enc.employeeId, leaveTypeId: annualType.id, year: enc.year } },
-      create: { employeeId: enc.employeeId, leaveTypeId: annualType.id, year: enc.year, daysRemaining: 0, daysEncashed: daysApproved, version: 0 },
+      where: { employeeId_leaveTypeId_year: { employeeId: enc.employeeId, leaveTypeId: annualLeaveTypeId, year: enc.year } },
+      create: { employeeId: enc.employeeId, leaveTypeId: annualLeaveTypeId, year: enc.year, daysRemaining: 0, daysEncashed: daysApproved, version: 0 },
       update: {},
     });
   } else {
@@ -498,7 +510,7 @@ export async function adminFinaliseEncashment(
       where: {
         employeeId_leaveTypeId_year: {
           employeeId: enc.employeeId,
-          leaveTypeId: annualType.id,
+          leaveTypeId: annualLeaveTypeId,
           year: enc.year,
         },
       },
@@ -513,14 +525,14 @@ export async function adminFinaliseEncashment(
   const updated = await tx.leaveEncashment.update({
     where: { id: requestId },
     data: {
-      status: 'AdminFinalised',
+      status: LeaveEncashmentStatus.AdminFinalised,
       daysApproved,
       ratePerDayPaise: lockedRate,
       amountPaise: lockedAmount,
       decidedAt: new Date(),
       decidedBy: adminId,
       decisionNote: note ?? null,
-      routedTo: 'Admin',
+      routedToId: RoutedTo.Admin,
       approverId: adminId,
       version: { increment: 1 },
     },
@@ -541,7 +553,7 @@ export async function adminFinaliseEncashment(
     module: 'leave',
     before,
     after: {
-      status: 'AdminFinalised',
+      status: LeaveEncashmentStatus.AdminFinalised,
       phase: 'admin',
       daysApproved,
       ratePerDayPaise: lockedRate,
@@ -565,7 +577,7 @@ export async function adminFinaliseEncashment(
 
   // Notify all PayrollOfficers (BL-LE-14)
   const payrollOfficers = await tx.employee.findMany({
-    where: { role: 'PayrollOfficer', status: 'Active' },
+    where: { roleId: RoleId.PayrollOfficer, status: EmployeeStatus.Active },
     select: { id: true },
   });
   if (payrollOfficers.length > 0) {
@@ -589,11 +601,11 @@ export async function adminFinaliseEncashment(
  * Manager OR Admin path. No balance change.
  */
 export async function rejectEncashment(
-  requestId: string,
-  actorId: string,
+  requestId: number,
+  actorId: number,
   note: string,
   tx: Prisma.TransactionClient,
-  actorRole: string,
+  actorRole: AuditActorRoleValue,
   actorIp: string | null = null,
 ): Promise<ReturnType<typeof formatEncashment>> {
   const enc = await tx.leaveEncashment.findUnique({
@@ -605,12 +617,16 @@ export async function rejectEncashment(
   });
   if (!enc) throw makeError(404, 'NOT_FOUND', 'Encashment request not found.');
 
-  if (!['Pending', 'ManagerApproved', 'Escalated'].includes(enc.status as string)) {
-    throw makeError(409, 'VALIDATION_FAILED', `Cannot reject encashment with status '${enc.status}'.`);
+  const rejectableStatuses = [
+    LeaveEncashmentStatus.Pending,
+    LeaveEncashmentStatus.ManagerApproved,
+  ];
+  if (!(rejectableStatuses as number[]).includes(enc.status)) {
+    throw makeError(409, 'VALIDATION_FAILED', `Cannot reject encashment with this status.`);
   }
 
   // Access: only the assigned approver OR any Admin
-  if (actorRole !== 'Admin' && enc.approverId !== actorId) {
+  if (actorRole !== RoleId.Admin && enc.approverId !== actorId) {
     throw makeError(403, 'FORBIDDEN', 'You are not authorised to reject this request.');
   }
 
@@ -619,7 +635,7 @@ export async function rejectEncashment(
   const updated = await tx.leaveEncashment.update({
     where: { id: requestId },
     data: {
-      status: 'Rejected',
+      status: LeaveEncashmentStatus.Rejected,
       decidedAt: new Date(),
       decidedBy: actorId,
       decisionNote: note,
@@ -641,7 +657,7 @@ export async function rejectEncashment(
     targetId: requestId,
     module: 'leave',
     before,
-    after: { status: 'Rejected', note },
+    after: { status: LeaveEncashmentStatus.Rejected, note },
   });
 
   await notify({
@@ -666,9 +682,9 @@ export async function rejectEncashment(
  * No balance change (balance was not yet deducted — deduction only at AdminFinalised).
  */
 export async function cancelEncashment(
-  requestId: string,
-  actorId: string,
-  actorRole: string,
+  requestId: number,
+  actorId: number,
+  actorRole: AuditActorRoleValue,
   tx: Prisma.TransactionClient,
   actorIp: string | null = null,
   note?: string,
@@ -682,20 +698,20 @@ export async function cancelEncashment(
   });
   if (!enc) throw makeError(404, 'NOT_FOUND', 'Encashment request not found.');
 
-  const isAdmin = actorRole === 'Admin';
+  const isAdmin = actorRole === RoleId.Admin;
   const isOwner = enc.employeeId === actorId;
 
-  if (enc.status === 'Paid') {
+  if (enc.status === LeaveEncashmentStatus.Paid) {
     throw makeError(409, 'VALIDATION_FAILED', 'Cannot cancel a Paid encashment. Use payslip reversal.');
   }
 
   // AdminFinalised can only be cancelled by Admin
-  if (enc.status === 'AdminFinalised' && !isAdmin) {
+  if (enc.status === LeaveEncashmentStatus.AdminFinalised && !isAdmin) {
     throw makeError(403, 'FORBIDDEN', 'Only Admin can cancel a finalised encashment.');
   }
 
   // Employee-self can only cancel Pending (before ManagerApproved)
-  if (!isAdmin && isOwner && enc.status !== 'Pending') {
+  if (!isAdmin && isOwner && enc.status !== LeaveEncashmentStatus.Pending) {
     throw makeError(403, 'FORBIDDEN', 'You can only cancel your own encashment request while it is Pending.');
   }
 
@@ -704,24 +720,22 @@ export async function cancelEncashment(
   }
 
   // If AdminFinalised, we need to RESTORE the balance (since deduction happened at AdminFinalised)
-  if (enc.status === 'AdminFinalised' && enc.daysApproved) {
-    const annualType = await tx.leaveType.findUnique({ where: { name: 'Annual' } });
-    if (annualType) {
-      await tx.leaveBalance.update({
-        where: {
-          employeeId_leaveTypeId_year: {
-            employeeId: enc.employeeId,
-            leaveTypeId: annualType.id,
-            year: enc.year,
-          },
+  if (enc.status === LeaveEncashmentStatus.AdminFinalised && enc.daysApproved) {
+    const annualLeaveTypeId = LeaveTypeId.Annual;
+    await tx.leaveBalance.update({
+      where: {
+        employeeId_leaveTypeId_year: {
+          employeeId: enc.employeeId,
+          leaveTypeId: annualLeaveTypeId,
+          year: enc.year,
         },
-        data: {
-          daysRemaining: { increment: enc.daysApproved },
-          daysEncashed: { decrement: enc.daysApproved },
-          version: { increment: 1 },
-        },
-      });
-    }
+      },
+      data: {
+        daysRemaining: { increment: enc.daysApproved },
+        daysEncashed: { decrement: enc.daysApproved },
+        version: { increment: 1 },
+      },
+    });
   }
 
   const before = { status: enc.status, version: enc.version };
@@ -729,7 +743,7 @@ export async function cancelEncashment(
   const updated = await tx.leaveEncashment.update({
     where: { id: requestId },
     data: {
-      status: 'Cancelled',
+      status: LeaveEncashmentStatus.Cancelled,
       cancelledAt: new Date(),
       cancelledBy: actorId,
       decisionNote: note ?? enc.decisionNote,
@@ -752,9 +766,9 @@ export async function cancelEncashment(
     module: 'leave',
     before,
     after: {
-      status: 'Cancelled',
+      status: LeaveEncashmentStatus.Cancelled,
       cancelledBy: actorId,
-      balanceRestored: enc.status === 'AdminFinalised' ? (enc.daysApproved ?? 0) : 0,
+      balanceRestored: enc.status === LeaveEncashmentStatus.AdminFinalised ? (enc.daysApproved ?? 0) : 0,
     },
   });
 
@@ -775,9 +789,11 @@ export async function cancelEncashment(
 /**
  * Find an AdminFinalised (not yet Paid) encashment for the given employee/year.
  * Used by the payroll engine (BL-LE-09).
+ * Note: In v2 schema, "paid" is tracked via Payslip.encashmentId (FK on Payslip side).
+ * We filter by status=AdminFinalised.
  */
 export async function findUnpaidAdminFinalisedForEmployee(
-  employeeId: string,
+  employeeId: number,
   year: number,
   tx: Prisma.TransactionClient,
 ) {
@@ -785,22 +801,22 @@ export async function findUnpaidAdminFinalisedForEmployee(
     where: {
       employeeId,
       year,
-      status: 'AdminFinalised',
-      paidInPayslipId: null,
+      status: LeaveEncashmentStatus.AdminFinalised,
     },
   });
 }
 
 /**
- * Mark an encashment as Paid and stamp the payslip FK.
+ * Mark an encashment as Paid.
  * Called by the payroll engine inside the run transaction (BL-LE-09).
  *
  * Also updates ratePerDayPaise and amountPaise to reflect the actual
  * paying-month values (BL-LE-07: paying month wins over locked snapshot).
+ * Note: In v2 schema, the Payslip.encashmentId FK tracks the association.
  */
 export async function markEncashmentPaid(
-  encashmentId: string,
-  payslipId: string,
+  encashmentId: number,
+  payslipId: number,
   actualRatePerDay: number,
   actualAmount: number,
   tx: Prisma.TransactionClient,
@@ -808,8 +824,7 @@ export async function markEncashmentPaid(
   await tx.leaveEncashment.update({
     where: { id: encashmentId },
     data: {
-      status: 'Paid',
-      paidInPayslipId: payslipId,
+      status: LeaveEncashmentStatus.Paid,
       paidAt: new Date(),
       // BL-LE-07: update with actual paying-month rate so audit trail is accurate
       ratePerDayPaise: actualRatePerDay,
@@ -827,9 +842,9 @@ export async function markEncashmentPaid(
     targetType: 'LeaveEncashment',
     targetId: encashmentId,
     module: 'payroll',
-    before: { status: 'AdminFinalised' },
+    before: { status: LeaveEncashmentStatus.AdminFinalised },
     after: {
-      status: 'Paid',
+      status: LeaveEncashmentStatus.Paid,
       paidInPayslipId: payslipId,
       actualRatePerDay,
       actualAmount,
@@ -843,8 +858,8 @@ export async function markEncashmentPaid(
  * Called by the reversal handler.
  */
 export async function markEncashmentReversed(
-  encashmentId: string,
-  reversalPayslipId: string,
+  encashmentId: number,
+  reversalPayslipId: number,
   tx: Prisma.TransactionClient,
 ): Promise<void> {
   // We do NOT change status back from Paid — the encashment stays Paid.
@@ -858,7 +873,7 @@ export async function markEncashmentReversed(
     targetType: 'LeaveEncashment',
     targetId: encashmentId,
     module: 'payroll',
-    before: { status: 'Paid' },
+    before: { status: LeaveEncashmentStatus.Paid },
     after: {
       reversalPayslipId,
       note: 'Payment reversed via payslip reversal. Leave balance NOT restored (BL-LE-11).',
@@ -870,7 +885,7 @@ export async function markEncashmentReversed(
 
 /**
  * Escalate stale Pending encashments where:
- *   - routedTo = Manager AND createdAt + 5 working days < now()
+ *   - routedToId = Manager AND createdAt + 5 working days < now()
  *   - OR the approver is Exited
  * Re-routes to Admin. Returns the count escalated.
  */
@@ -883,7 +898,7 @@ export async function escalateStaleEncashments(
   const { addWorkingDays } = await import('./workingDays.js');
 
   const pending = await tx.leaveEncashment.findMany({
-    where: { status: 'Pending', routedTo: 'Manager' },
+    where: { status: LeaveEncashmentStatus.Pending, routedToId: RoutedTo.Manager },
     include: { approver: { select: { id: true, status: true } } },
   });
 
@@ -893,7 +908,7 @@ export async function escalateStaleEncashments(
   for (const enc of pending) {
     const slaDeadline = addWorkingDays(enc.createdAt, 5);
     const slaBreach = now > slaDeadline;
-    const approverExited = enc.approver?.status === 'Exited';
+    const approverExited = enc.approver?.status === EmployeeStatus.Exited;
 
     if (!slaBreach && !approverExited) continue;
 
@@ -901,7 +916,7 @@ export async function escalateStaleEncashments(
       where: { id: enc.id },
       data: {
         escalatedAt: now,
-        routedTo: 'Admin',
+        routedToId: RoutedTo.Admin,
         approverId: admin.id,
         version: { increment: 1 },
       },
@@ -916,9 +931,9 @@ export async function escalateStaleEncashments(
       targetType: 'LeaveEncashment',
       targetId: enc.id,
       module: 'leave',
-      before: { routedTo: enc.routedTo, approverId: enc.approverId, escalatedAt: null },
+      before: { routedToId: enc.routedToId, approverId: enc.approverId, escalatedAt: null },
       after: {
-        routedTo: 'Admin',
+        routedToId: RoutedTo.Admin,
         approverId: admin.id,
         escalatedAt: now.toISOString(),
         reason: approverExited ? 'approver_exited' : 'sla_breach',
@@ -926,7 +941,7 @@ export async function escalateStaleEncashments(
     });
 
     const activeAdmins = await tx.employee.findMany({
-      where: { role: 'Admin', status: 'Active' },
+      where: { roleId: RoleId.Admin, status: EmployeeStatus.Active },
       select: { id: true },
     });
     await notify({
@@ -948,27 +963,26 @@ export async function escalateStaleEncashments(
 // ── Format helper ─────────────────────────────────────────────────────────────
 
 export function formatEncashment(enc: {
-  id: string;
+  id: number;
   code: string;
-  employeeId: string;
+  employeeId: number;
   employee: { name: string; code: string };
   year: number;
   daysRequested: number;
   daysApproved: number | null;
   ratePerDayPaise: number | null;
   amountPaise: number | null;
-  status: string;
-  routedTo: string;
-  approverId: string | null;
+  status: number;
+  routedToId: number;
+  approverId: number | null;
   approver?: { name: string } | null;
   decidedAt: Date | null;
-  decidedBy: string | null;
+  decidedBy: number | null;
   decisionNote: string | null;
   escalatedAt: Date | null;
-  paidInPayslipId: string | null;
   paidAt: Date | null;
   cancelledAt: Date | null;
-  cancelledBy: string | null;
+  cancelledBy: number | null;
   createdAt: Date;
   updatedAt: Date;
   version: number;
@@ -984,15 +998,14 @@ export function formatEncashment(enc: {
     daysApproved: enc.daysApproved,
     ratePerDayPaise: enc.ratePerDayPaise,
     amountPaise: enc.amountPaise,
-    status: enc.status as import('@nexora/contracts/leave-encashment').LeaveEncashmentStatus,
-    routedTo: enc.routedTo as 'Manager' | 'Admin',
+    status: enc.status,
+    routedToId: enc.routedToId,
     approverId: enc.approverId,
     approverName: enc.approver?.name ?? null,
     decidedAt: enc.decidedAt?.toISOString() ?? null,
     decidedBy: enc.decidedBy,
     decisionNote: enc.decisionNote,
     escalatedAt: enc.escalatedAt?.toISOString() ?? null,
-    paidInPayslipId: enc.paidInPayslipId,
     paidAt: enc.paidAt?.toISOString() ?? null,
     cancelledAt: enc.cancelledAt?.toISOString() ?? null,
     cancelledBy: enc.cancelledBy,

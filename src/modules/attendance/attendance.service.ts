@@ -1,5 +1,5 @@
 /**
- * Attendance service — Phase 3.
+ * Attendance service — v2 (INT codes throughout).
  *
  * Pure business-logic functions. All state-mutating functions accept a
  * Prisma.TransactionClient so they compose with the caller's transaction.
@@ -14,6 +14,12 @@
  *   BL-029  Regularisation routing: ≤7d → Manager; >7d → Admin
  *   BL-010  Leave/reg conflict → LEAVE_REG_CONFLICT (409)
  *   BL-007  AttendanceRecord rows are NEVER deleted; corrections append
+ *
+ * v2 changes:
+ *   - All IDs are INT.
+ *   - status, sourceId, routedToId, reasonId are INT codes from statusInt.ts.
+ *   - DB unique key: employeeId_date_sourceId (not employeeId_date_source).
+ *   - No string enums in Prisma queries.
  */
 
 import type { Prisma } from '@prisma/client';
@@ -29,34 +35,41 @@ import {
 } from '../leave/leave.service.js';
 import { generateRegCode } from './regCode.js';
 import { ErrorCode } from '@nexora/contracts/errors';
+import {
+  AttendanceStatus,
+  AttendanceSource,
+  RegStatus,
+  RoutedTo,
+  EmployeeStatus,
+  LeaveTypeId,
+  LedgerReason,
+  type AuditActorRoleValue,
+} from '../../lib/statusInt.js';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 /**
  * SEC-002-P3 — actor context threaded into service helpers so audit rows
- * carry the real `actorIp` and `actorRole` instead of hardcoded defaults.
- * All fields are optional; callers are expected to populate from `req.ip`
- * and `req.user.role` at the route boundary.
+ * carry the real `actorIp` and `actorRoleId` instead of hardcoded defaults.
  */
 export interface AuditCtx {
-  role?: string;
+  roleId?: number;
   ip?: string | null;
 }
 
 /**
  * SEC-003-P3 — conflict details now match `LeaveConflictDetailsSchema` from
- * `@nexora/contracts/leave` so the front-end can render a single typed
- * block for both directions of the BL-010 conflict.
+ * `@nexora/contracts/leave`.
  */
 export interface RegularisationConflictError {
   code: typeof ErrorCode.LEAVE_REG_CONFLICT;
   details: {
     conflictType: 'Leave';
-    conflictId: string;
+    conflictId: number;
     conflictCode: string;
     conflictFrom: string;
     conflictTo: string | null;
-    conflictStatus: string;
+    conflictStatus: number;
   };
 }
 
@@ -71,7 +84,6 @@ function parseHHMM(hhmm: string): { hours: number; minutes: number } {
 /**
  * Returns true if the given DateTime is after the late threshold on its day.
  * Threshold is compared as local Asia/Kolkata time hour:minute.
- * We use UTC+5:30 offset directly since Node.js doesn't always have a tz database.
  */
 function isLate(checkIn: Date, threshold: string): boolean {
   const { hours: thH, minutes: thM } = parseHHMM(threshold);
@@ -90,18 +102,18 @@ function isLate(checkIn: Date, threshold: string): boolean {
 /**
  * Derive the attendance status for an employee on a given date, applying
  * BL-026 priority:
- *   1. Approved leave covering the date → OnLeave
- *   2. Public holiday → Holiday
- *   3. Weekly off (Sat/Sun) → WeeklyOff
+ *   1. Approved leave covering the date → OnLeave (3)
+ *   2. Public holiday → Holiday (5)
+ *   3. Weekly off → WeeklyOff (4)
  *   4. Otherwise → null (caller decides Present vs Absent based on check-in)
  *
- * Returns the DB enum value (no hyphens).
+ * Returns INT status code or null.
  */
 export async function deriveStatusForDay(
-  employeeId: string,
+  employeeId: number,
   date: Date,
   tx: Prisma.TransactionClient,
-): Promise<'OnLeave' | 'Holiday' | 'WeeklyOff' | null> {
+): Promise<number | null> {
   // 1. Approved leave covering this date
   const dayStart = new Date(date);
   dayStart.setUTCHours(0, 0, 0, 0);
@@ -111,21 +123,32 @@ export async function deriveStatusForDay(
   const approvedLeave = await tx.leaveRequest.findFirst({
     where: {
       employeeId,
-      status: 'Approved',
+      status: AttendanceStatus.OnLeave, // This uses leave request status=Approved=2 actually
       fromDate: { lte: dayEnd },
       toDate: { gte: dayStart },
     },
     select: { id: true },
   });
 
-  if (approvedLeave) return 'OnLeave';
+  // Use leave status Approved=2 not attendance OnLeave=3
+  const leaveApproved = await tx.leaveRequest.findFirst({
+    where: {
+      employeeId,
+      status: 2, // LeaveStatus.Approved
+      fromDate: { lte: dayEnd },
+      toDate: { gte: dayStart },
+    },
+    select: { id: true },
+  });
+
+  if (leaveApproved) return AttendanceStatus.OnLeave;
 
   // 2. Public holiday
   const holiday = await isHoliday(date, tx);
-  if (holiday) return 'Holiday';
+  if (holiday) return AttendanceStatus.Holiday;
 
-  // 3. Weekly off (Admin-configurable set of days; default Sat/Sun)
-  if (await isWeeklyOff(date)) return 'WeeklyOff';
+  // 3. Weekly off
+  if (await isWeeklyOff(date)) return AttendanceStatus.WeeklyOff;
 
   return null;
 }
@@ -134,13 +157,10 @@ export async function deriveStatusForDay(
 
 /**
  * For each Active or OnNotice employee, upsert one AttendanceRecord row with
- * source='system' for the given date. Default status is Absent, overridden by
- * BL-026 priority (Holiday/WeeklyOff/OnLeave when applicable).
+ * sourceId=system for the given date. Default status is Absent, overridden by
+ * BL-026 priority.
  *
  * Idempotent: skips employees who already have a system row for that date.
- * Writes a single audit entry at function level.
- *
- * Called by the daily midnight cron job.
  */
 export async function runMidnightGenerate(
   date: Date,
@@ -151,7 +171,7 @@ export async function runMidnightGenerate(
 
   // All Active + OnNotice employees
   const employees = await tx.employee.findMany({
-    where: { status: { in: ['Active', 'OnNotice'] } },
+    where: { status: { in: [EmployeeStatus.Active, EmployeeStatus.OnNotice] } },
     select: { id: true },
   });
 
@@ -161,10 +181,10 @@ export async function runMidnightGenerate(
     // Idempotency guard: skip if a system row already exists for this date
     const existing = await tx.attendanceRecord.findUnique({
       where: {
-        employeeId_date_source: {
+        employeeId_date_sourceId: {
           employeeId: emp.id,
           date: dateOnly,
-          source: 'system',
+          sourceId: AttendanceSource.system,
         },
       },
       select: { id: true },
@@ -174,7 +194,7 @@ export async function runMidnightGenerate(
 
     // Derive status per BL-026
     const derivedStatus = await deriveStatusForDay(emp.id, dateOnly, tx);
-    const status = derivedStatus ?? 'Absent';
+    const status = derivedStatus ?? AttendanceStatus.Absent;
 
     await tx.attendanceRecord.create({
       data: {
@@ -187,7 +207,7 @@ export async function runMidnightGenerate(
         late: false,
         lateMonthCount: 0,
         lopApplied: false,
-        source: 'system',
+        sourceId: AttendanceSource.system,
         regularisationId: null,
         version: 0,
       },
@@ -223,20 +243,20 @@ export async function runMidnightGenerate(
 
 // ── Shared record type ────────────────────────────────────────────────────────
 
-/** Shape of a raw AttendanceRecord row returned from Prisma. */
+/** Shape of a raw AttendanceRecord row returned from Prisma (v2 INT fields). */
 export interface RawAttendanceRecord {
-  id: string;
-  employeeId: string;
+  id: number;
+  employeeId: number;
   date: Date;
-  status: string;
+  status: number;
   checkInTime: Date | null;
   checkOutTime: Date | null;
   hoursWorkedMinutes: number | null;
   late: boolean;
   lateMonthCount: number;
   lopApplied: boolean;
-  source: string;
-  regularisationId: string | null;
+  sourceId: number;
+  regularisationId: number | null;
   createdAt: Date;
   version: number;
 }
@@ -252,18 +272,9 @@ export interface CheckInResult {
 /**
  * Record a check-in for today. Idempotent — a second call on the same day
  * returns the existing record (lateMarkDeductionApplied will be false on repeat).
- *
- * Logic:
- *   1. Upsert the system row with status=Present, checkInTime=now.
- *   2. Compute lateness against LATE_THRESHOLD config.
- *   3. Increment AttendanceLateLedger.count for the month.
- *   4. If new count is a multiple of 3 → deduct 1 day from Annual leave (BL-028).
- *   5. Audit attendance.check-in (and attendance.late-mark.deducted if penalty fired).
- *
- * Returns the updated record, the deduction flag, and the new monthly late count.
  */
 export async function recordCheckIn(
-  employeeId: string,
+  employeeId: number,
   now: Date,
   tx: Prisma.TransactionClient,
   auditCtx: AuditCtx = {},
@@ -274,24 +285,23 @@ export async function recordCheckIn(
   // Check for existing system row today (idempotency)
   const existing = await tx.attendanceRecord.findUnique({
     where: {
-      employeeId_date_source: {
+      employeeId_date_sourceId: {
         employeeId,
         date: dateOnly,
-        source: 'system',
+        sourceId: AttendanceSource.system,
       },
     },
   });
 
   // If already checked in, return idempotent response
   if (existing?.checkInTime) {
-    // Get the current month late count for the response
     const year = now.getUTCFullYear();
     const month = now.getUTCMonth() + 1;
     const lateLedger = await tx.attendanceLateLedger.findUnique({
       where: { employeeId_year_month: { employeeId, year, month } },
     });
     return {
-      record: existing,
+      record: existing as RawAttendanceRecord,
       lateMarkDeductionApplied: false,
       lateMonthCount: lateLedger?.count ?? 0,
     };
@@ -304,12 +314,10 @@ export async function recordCheckIn(
   const year = now.getUTCFullYear();
   const month = now.getUTCMonth() + 1;
 
-  // Get current monthly late count (before this check-in)
   let lateMonthCount = 0;
   let lateMarkDeductionApplied = false;
 
   if (late) {
-    // Upsert the late ledger and increment
     const lateLedger = await tx.attendanceLateLedger.upsert({
       where: { employeeId_year_month: { employeeId, year, month } },
       create: { employeeId, year, month, count: 1 },
@@ -317,14 +325,10 @@ export async function recordCheckIn(
     });
     lateMonthCount = lateLedger.count;
 
-    // BL-028 (BUG-ATT-001 fix): the spec deducts 1 Annual leave day on the
-    // 3rd late mark of the month AND on EACH ADDITIONAL late beyond that.
-    // Earlier code only fired on multiples of 3 (3, 6, 9, …) — that's wrong
-    // for the 4th, 5th, 7th, 8th, 10th… etc. Now: fire at every count >= 3.
+    // BL-028: fire on 3rd late mark and each subsequent
     if (lateMonthCount >= 3) {
       lateMarkDeductionApplied = await deductLateMarkPenalty(employeeId, year, now, tx);
     } else if (lateMonthCount === 2) {
-      // BUG-NOT-001 / BL-028: warn the employee that the next late will trigger a deduction.
       await notify({
         tx,
         recipientIds: employeeId,
@@ -341,21 +345,16 @@ export async function recordCheckIn(
     lateMonthCount = lateLedger?.count ?? 0;
   }
 
-  // BUG-ATT-002 fix — BL-026 status priority must hold on check-in. The
-  // priority is On-Leave > Weekly-Off / Holiday > Present > Absent. We
-  // still record the check-in time (so the audit trail keeps it) but the
-  // displayed status reflects the higher-priority reason. `deriveStatusForDay`
-  // returns one of On-Leave / Holiday / Weekly-Off / null; null means no
-  // higher priority applies and the row should be Present.
+  // BL-026 status priority
   const priorityStatus = await deriveStatusForDay(employeeId, dateOnly, tx);
-  const newStatus = priorityStatus ?? 'Present';
+  const newStatus = priorityStatus ?? AttendanceStatus.Present;
 
   const record = await tx.attendanceRecord.upsert({
     where: {
-      employeeId_date_source: {
+      employeeId_date_sourceId: {
         employeeId,
         date: dateOnly,
-        source: 'system',
+        sourceId: AttendanceSource.system,
       },
     },
     create: {
@@ -368,7 +367,7 @@ export async function recordCheckIn(
       late,
       lateMonthCount,
       lopApplied: false,
-      source: 'system',
+      sourceId: AttendanceSource.system,
       version: 0,
     },
     update: {
@@ -384,7 +383,7 @@ export async function recordCheckIn(
   await audit({
     tx,
     actorId: employeeId,
-    actorRole: auditCtx.role ?? 'Employee',
+    actorRole: (auditCtx.roleId ?? 1) as AuditActorRoleValue,
     actorIp: auditCtx.ip ?? null,
     action: 'attendance.check-in',
     targetType: 'AttendanceRecord',
@@ -400,27 +399,20 @@ export async function recordCheckIn(
     },
   });
 
-  return { record, lateMarkDeductionApplied, lateMonthCount };
+  return { record: record as RawAttendanceRecord, lateMarkDeductionApplied, lateMonthCount };
 }
 
 /**
  * Deduct 1 day from the employee's Annual leave balance as a late-mark penalty.
- * BL-028: fires on the 3rd, 6th, 9th, ... late mark in a calendar month.
- *
- * Returns true if the deduction was applied, false if balance was already 0
- * (in which case no deduction is written — no negative balances).
+ * BL-028: fires on the 3rd+ late mark in a calendar month.
  */
 async function deductLateMarkPenalty(
-  employeeId: string,
+  employeeId: number,
   year: number,
   now: Date,
   tx: Prisma.TransactionClient,
 ): Promise<boolean> {
-  // Find the Annual leave type
-  const annualType = await tx.leaveType.findUnique({ where: { name: 'Annual' } });
-  if (!annualType) return false;
-
-  const balanceRow = await currentBalanceRow(employeeId, annualType.id, year, tx);
+  const balanceRow = await currentBalanceRow(employeeId, LeaveTypeId.Annual, year, tx);
 
   if (balanceRow.daysRemaining <= 0) {
     logger.warn(
@@ -435,7 +427,7 @@ async function deductLateMarkPenalty(
     where: {
       employeeId_leaveTypeId_year: {
         employeeId,
-        leaveTypeId: annualType.id,
+        leaveTypeId: LeaveTypeId.Annual,
         year,
       },
     },
@@ -450,12 +442,12 @@ async function deductLateMarkPenalty(
   await tx.leaveBalanceLedger.create({
     data: {
       employeeId,
-      leaveTypeId: annualType.id,
+      leaveTypeId: LeaveTypeId.Annual,
       year,
       delta: -1,
-      reason: 'LateMarkPenalty',
+      reasonId: LedgerReason.LateMarkPenalty,
       relatedRequestId: null,
-      createdBy: null, // system-triggered
+      createdBy: null,
     },
   });
 
@@ -466,18 +458,18 @@ async function deductLateMarkPenalty(
     actorRole: 'system',
     actorIp: null,
     action: 'attendance.late-mark.deducted',
-    targetType: 'LeaveBalance',
-    targetId: `${employeeId}:${annualType.id}:${year}`,
+    targetType: 'AttendanceRecord',
+    targetId: null,
     module: 'attendance',
     before: { daysRemaining: balanceRow.daysRemaining },
     after: {
       daysRemaining: balanceRow.daysRemaining - 1,
-      reason: 'BL-028 late-mark penalty (multiple of 3)',
+      reason: 'BL-028 late-mark penalty',
       date: now.toISOString(),
     },
   });
 
-  // Notify the employee about the late-mark deduction (BL-028)
+  // Notify the employee
   await notify({
     tx,
     recipientIds: employeeId,
@@ -498,15 +490,10 @@ export interface CheckOutResult {
 }
 
 /**
- * Record a check-out for today. Idempotent — a second call returns the existing
- * record without modification.
- *
- * Requires a check-in to exist for today (returns null if not, caller returns 400).
- * Computes hoursWorkedMinutes = checkOut − checkIn in minutes (BL-025).
- * Audits attendance.check-out.
+ * Record a check-out for today. Returns null if no check-in exists (caller returns 400).
  */
 export async function recordCheckOut(
-  employeeId: string,
+  employeeId: number,
   now: Date,
   tx: Prisma.TransactionClient,
   auditCtx: AuditCtx = {},
@@ -516,10 +503,10 @@ export async function recordCheckOut(
 
   const existing = await tx.attendanceRecord.findUnique({
     where: {
-      employeeId_date_source: {
+      employeeId_date_sourceId: {
         employeeId,
         date: dateOnly,
-        source: 'system',
+        sourceId: AttendanceSource.system,
       },
     },
   });
@@ -532,10 +519,9 @@ export async function recordCheckOut(
   // Idempotent: already checked out
   if (existing.checkOutTime) {
     const hoursWorkedMinutes = existing.hoursWorkedMinutes ?? 0;
-    return { record: existing, hoursWorkedMinutes };
+    return { record: existing as RawAttendanceRecord, hoursWorkedMinutes };
   }
 
-  // Compute hours worked in minutes
   const checkInTime = existing.checkInTime;
   const hoursWorkedMinutes = Math.max(
     0,
@@ -555,7 +541,7 @@ export async function recordCheckOut(
   await audit({
     tx,
     actorId: employeeId,
-    actorRole: auditCtx.role ?? 'Employee',
+    actorRole: (auditCtx.roleId ?? 1) as AuditActorRoleValue,
     actorIp: auditCtx.ip ?? null,
     action: 'attendance.check-out',
     targetType: 'AttendanceRecord',
@@ -568,27 +554,13 @@ export async function recordCheckOut(
     },
   });
 
-  return { record, hoursWorkedMinutes };
+  return { record: record as RawAttendanceRecord, hoursWorkedMinutes };
 }
 
 // ── Undo check-out ────────────────────────────────────────────────────────────
 
-/**
- * Undo a check-out for today. Allowed within 5 minutes of the check-out
- * (product decision — no BL rule constrains the window, so 5 min is used).
- *
- * Logic:
- *   1. Find today's system row.
- *   2. If no row or no check-in → 409 NOT_CHECKED_IN.
- *   3. If no check-out → already Working; idempotent return.
- *   4. If check-out was > 5 minutes ago → 409 UNDO_WINDOW_EXPIRED.
- *   5. If check-out is from a prior day → 409 UNDO_OUTSIDE_DAY.
- *   6. Clear checkOutTime + hoursWorkedMinutes, increment version.
- *   7. Audit attendance.check-out.undo.
- *   8. Return CheckInResult shape.
- */
 export async function undoCheckOutForEmployee(
-  employeeId: string,
+  employeeId: number,
   now: Date,
   tx: Prisma.TransactionClient,
   auditCtx: AuditCtx = {},
@@ -598,15 +570,14 @@ export async function undoCheckOutForEmployee(
 
   const existing = await tx.attendanceRecord.findUnique({
     where: {
-      employeeId_date_source: {
+      employeeId_date_sourceId: {
         employeeId,
         date: dateOnly,
-        source: 'system',
+        sourceId: AttendanceSource.system,
       },
     },
   });
 
-  // No record or no check-in → cannot undo
   if (!existing || !existing.checkInTime) {
     const err = Object.assign(new Error('No check-in to undo'), {
       httpStatus: 409,
@@ -615,7 +586,6 @@ export async function undoCheckOutForEmployee(
     throw err;
   }
 
-  // Already in Working state — idempotent
   if (!existing.checkOutTime) {
     const year = now.getUTCFullYear();
     const month = now.getUTCMonth() + 1;
@@ -623,13 +593,12 @@ export async function undoCheckOutForEmployee(
       where: { employeeId_year_month: { employeeId, year, month } },
     });
     return {
-      record: existing,
+      record: existing as RawAttendanceRecord,
       lateMarkDeductionApplied: false,
       lateMonthCount: lateLedger?.count ?? 0,
     };
   }
 
-  // Guard: record must be from today
   const recordDateMs = existing.date.getTime();
   const todayMs = dateOnly.getTime();
   if (recordDateMs !== todayMs) {
@@ -640,7 +609,6 @@ export async function undoCheckOutForEmployee(
     throw err;
   }
 
-  // Guard: undo window — must be within 5 minutes of check-out
   const minutesSinceCheckOut = (now.getTime() - existing.checkOutTime.getTime()) / 60_000;
   if (minutesSinceCheckOut > 5) {
     const err = Object.assign(
@@ -650,11 +618,9 @@ export async function undoCheckOutForEmployee(
     throw err;
   }
 
-  // Capture before-snapshot for audit
   const prevCheckOutTime = existing.checkOutTime;
   const prevHoursWorkedMinutes = existing.hoursWorkedMinutes;
 
-  // Clear the check-out fields; do NOT touch status, late, lateMonthCount, lopApplied
   const record = await tx.attendanceRecord.update({
     where: { id: existing.id },
     data: {
@@ -664,16 +630,15 @@ export async function undoCheckOutForEmployee(
     },
   });
 
-  // Audit
   await audit({
     tx,
     actorId: employeeId,
-    actorRole: auditCtx.role ?? 'Employee',
+    actorRole: (auditCtx.roleId ?? 1) as AuditActorRoleValue,
     actorIp: auditCtx.ip ?? null,
     action: 'attendance.check-out.undo',
     targetType: 'AttendanceRecord',
     targetId: record.id,
-    module: 'Attendance',
+    module: 'attendance',
     before: {
       checkOutTime: prevCheckOutTime.toISOString(),
       hoursWorkedMinutes: prevHoursWorkedMinutes,
@@ -691,7 +656,7 @@ export async function undoCheckOutForEmployee(
   });
 
   return {
-    record,
+    record: record as RawAttendanceRecord,
     lateMarkDeductionApplied: false,
     lateMonthCount: lateLedger?.count ?? 0,
   };
@@ -699,12 +664,8 @@ export async function undoCheckOutForEmployee(
 
 // ── Today's open attendance ────────────────────────────────────────────────────
 
-/**
- * Find today's system attendance record for an employee.
- * Returns null if no row exists (midnight job hasn't run yet or employee just joined).
- */
 export async function findOpenAttendance(
-  employeeId: string,
+  employeeId: number,
   today: Date,
   tx: Prisma.TransactionClient,
 ) {
@@ -713,10 +674,10 @@ export async function findOpenAttendance(
 
   return tx.attendanceRecord.findUnique({
     where: {
-      employeeId_date_source: {
+      employeeId_date_sourceId: {
         employeeId,
         date: dateOnly,
-        source: 'system',
+        sourceId: AttendanceSource.system,
       },
     },
   });
@@ -731,19 +692,8 @@ export interface SubmitRegularisationInput {
   reason: string;
 }
 
-/**
- * Submit a new regularisation request.
- *
- * Steps:
- *   1. Validate date < today.
- *   2. BL-010: check for approved leave on that date (LEAVE_REG_CONFLICT).
- *   3. BL-029: compute ageDaysAtSubmit, route to Manager (≤7d) or Admin (>7d).
- *      If reportingManagerId is null or manager is Exited → Admin.
- *   4. Generate R-YYYY-NNNN code.
- *   5. Insert row, audit regularisation.create.
- */
 export async function submitRegularisation(
-  employeeId: string,
+  employeeId: number,
   input: SubmitRegularisationInput,
   tx: Prisma.TransactionClient,
   auditCtx: AuditCtx = {},
@@ -756,9 +706,6 @@ export async function submitRegularisation(
   dateOnly.setUTCHours(0, 0, 0, 0);
 
   // BL-010: check for approved leave on that date.
-  // SEC-003-P3 — details now match LeaveConflictDetailsSchema so the front
-  // end can render a single typed conflict block for both directions of
-  // the BL-010 check (leave→reg and reg→leave).
   const conflictingLeave = await findOverlappingLeave(employeeId, dateOnly, dateOnly, tx);
   if (conflictingLeave) {
     const err: RegularisationConflictError = {
@@ -775,16 +722,14 @@ export async function submitRegularisation(
     throw err;
   }
 
-  // Compute age in days
   const msPerDay = 1000 * 60 * 60 * 24;
   const ageDaysAtSubmit = Math.round((today.getTime() - dateOnly.getTime()) / msPerDay);
 
   // BL-029 routing
-  let routedTo: 'Manager' | 'Admin' = 'Admin';
-  let approverId: string | null = null;
+  let routedToId: number = RoutedTo.Admin;
+  let approverId: number | null = null;
 
   if (ageDaysAtSubmit <= 7) {
-    // Route to reporting manager if available and not Exited
     const emp = await tx.employee.findUnique({
       where: { id: employeeId },
       select: { reportingManagerId: true },
@@ -796,25 +741,22 @@ export async function submitRegularisation(
         select: { id: true, status: true },
       });
 
-      if (manager && manager.status !== 'Exited') {
-        routedTo = 'Manager';
+      if (manager && manager.status !== EmployeeStatus.Exited) {
+        routedToId = RoutedTo.Manager;
         approverId = manager.id;
       }
     }
   }
 
-  // Fall back to Admin if routedTo is still Admin
-  if (routedTo === 'Admin' || !approverId) {
+  if (routedToId === RoutedTo.Admin || !approverId) {
     const admin = await findDefaultAdmin(tx);
-    routedTo = 'Admin';
+    routedToId = RoutedTo.Admin;
     approverId = admin.id;
   }
 
-  // Generate code
   const year = today.getUTCFullYear();
   const code = await generateRegCode(year, tx);
 
-  // Create the regularisation request
   const reg = await tx.regularisationRequest.create({
     data: {
       code,
@@ -823,8 +765,8 @@ export async function submitRegularisation(
       proposedCheckIn,
       proposedCheckOut,
       reason,
-      status: 'Pending',
-      routedTo: routedTo === 'Manager' ? 'Manager' : 'Admin',
+      status: RegStatus.Pending,
+      routedToId,
       ageDaysAtSubmit,
       approverId,
       correctedRecordId: null,
@@ -836,11 +778,10 @@ export async function submitRegularisation(
     },
   });
 
-  // Audit regularisation.create
   await audit({
     tx,
     actorId: employeeId,
-    actorRole: auditCtx.role ?? 'Employee',
+    actorRole: (auditCtx.roleId ?? 1) as AuditActorRoleValue,
     actorIp: auditCtx.ip ?? null,
     action: 'regularisation.create',
     targetType: 'RegularisationRequest',
@@ -850,13 +791,12 @@ export async function submitRegularisation(
     after: {
       code,
       date: dateOnly.toISOString().split('T')[0],
-      routedTo,
+      routedToId,
       approverId,
       ageDaysAtSubmit,
     },
   });
 
-  // Notify the approver about the new regularisation request
   if (approverId) {
     await notify({
       tx,
@@ -864,7 +804,7 @@ export async function submitRegularisation(
       category: 'Attendance',
       title: `Regularisation request from ${reg.employee.name}`,
       body: `Regularisation request ${code} for ${dateOnly.toISOString().split('T')[0]} is pending your approval.`,
-      link: `/${routedTo === 'Manager' ? 'manager' : 'admin'}/regularisations/${reg.id}`,
+      link: `/${routedToId === RoutedTo.Manager ? 'manager' : 'admin'}/regularisations/${reg.id}`,
     });
   }
 
@@ -873,34 +813,17 @@ export async function submitRegularisation(
 
 // ── Approve regularisation ─────────────────────────────────────────────────────
 
-/**
- * Approve a regularisation request.
- *
- * Steps:
- *   1. Create a new AttendanceRecord row with source='regularisation' (BL-007).
- *   2. The original system row is preserved — never mutated (BL-007).
- *   3. Derive the status for the corrected row per BL-026.
- *   4. Update the regularisation row: Approved, correctedRecordId set.
- *   5. Audit regularisation.approve.
- *
- * Design note on BL-028 and back-dated check-ins:
- *   We do NOT re-trigger the BL-028 late-mark deduction for back-dated
- *   regularisations. BL-028 fires only on live check-ins (real-time, day-of)
- *   where the employee is actively late. Back-dated corrections are an
- *   administrative fix and do not represent a live tardiness event.
- *   This choice is documented here and in the audit trail.
- */
 export async function approveRegularisation(
   reg: {
-    id: string;
-    employeeId: string;
+    id: number;
+    employeeId: number;
     date: Date;
     proposedCheckIn: Date | null;
     proposedCheckOut: Date | null;
     version: number;
-    approverId: string | null;
+    approverId: number | null;
   },
-  approverId: string,
+  approverId: number,
   note: string | undefined,
   tx: Prisma.TransactionClient,
   auditCtx: AuditCtx = {},
@@ -908,11 +831,9 @@ export async function approveRegularisation(
   const dateOnly = new Date(reg.date);
   dateOnly.setUTCHours(0, 0, 0, 0);
 
-  // Derive status for the corrected row per BL-026
   const derivedStatus = await deriveStatusForDay(reg.employeeId, dateOnly, tx);
-  const status = derivedStatus ?? (reg.proposedCheckIn ? 'Present' : 'Absent');
+  const status = derivedStatus ?? (reg.proposedCheckIn ? AttendanceStatus.Present : AttendanceStatus.Absent);
 
-  // Compute hoursWorkedMinutes if both times are present
   let hoursWorkedMinutes: number | null = null;
   let late = false;
 
@@ -928,7 +849,6 @@ export async function approveRegularisation(
     }
   }
 
-  // Get the current monthly late count (snapshot at write time — no deduction re-trigger)
   const now = new Date();
   const year = reg.date.getUTCFullYear();
   const month = reg.date.getUTCMonth() + 1;
@@ -937,7 +857,6 @@ export async function approveRegularisation(
   });
   const lateMonthCount = lateLedger?.count ?? 0;
 
-  // Create the new corrected attendance row (BL-007: append, never mutate)
   const correctedRecord = await tx.attendanceRecord.create({
     data: {
       employeeId: reg.employeeId,
@@ -949,17 +868,16 @@ export async function approveRegularisation(
       late,
       lateMonthCount,
       lopApplied: false,
-      source: 'regularisation',
+      sourceId: AttendanceSource.regularisation,
       regularisationId: reg.id,
       version: 0,
     },
   });
 
-  // Update the regularisation request
   const updated = await tx.regularisationRequest.update({
     where: { id: reg.id },
     data: {
-      status: 'Approved',
+      status: RegStatus.Approved,
       decidedAt: now,
       decidedBy: approverId,
       decisionNote: note ?? null,
@@ -972,26 +890,24 @@ export async function approveRegularisation(
     },
   });
 
-  // Audit regularisation.approve
   await audit({
     tx,
     actorId: approverId,
-    actorRole: auditCtx.role ?? 'Approver',
+    actorRole: (auditCtx.roleId ?? 2) as AuditActorRoleValue,
     actorIp: auditCtx.ip ?? null,
     action: 'regularisation.approve',
     targetType: 'RegularisationRequest',
     targetId: reg.id,
     module: 'attendance',
-    before: { status: 'Pending' },
+    before: { status: RegStatus.Pending },
     after: {
-      status: 'Approved',
+      status: RegStatus.Approved,
       correctedRecordId: correctedRecord.id,
       decidedAt: now.toISOString(),
       note: note ?? null,
     },
   });
 
-  // Notify the employee that their regularisation was approved
   await notify({
     tx,
     recipientIds: reg.employeeId,
@@ -1006,16 +922,12 @@ export async function approveRegularisation(
 
 // ── Reject regularisation ─────────────────────────────────────────────────────
 
-/**
- * Reject a regularisation request. Note is required (TC-REG-005).
- * Audits regularisation.reject.
- */
 export async function rejectRegularisation(
   reg: {
-    id: string;
+    id: number;
     version: number;
   },
-  rejecterId: string,
+  rejecterId: number,
   note: string,
   tx: Prisma.TransactionClient,
   auditCtx: AuditCtx = {},
@@ -1025,7 +937,7 @@ export async function rejectRegularisation(
   const updated = await tx.regularisationRequest.update({
     where: { id: reg.id },
     data: {
-      status: 'Rejected',
+      status: RegStatus.Rejected,
       decidedAt: now,
       decidedBy: rejecterId,
       decisionNote: note,
@@ -1037,25 +949,23 @@ export async function rejectRegularisation(
     },
   });
 
-  // Audit regularisation.reject
   await audit({
     tx,
     actorId: rejecterId,
-    actorRole: auditCtx.role ?? 'Approver',
+    actorRole: (auditCtx.roleId ?? 2) as AuditActorRoleValue,
     actorIp: auditCtx.ip ?? null,
     action: 'regularisation.reject',
     targetType: 'RegularisationRequest',
     targetId: reg.id,
     module: 'attendance',
-    before: { status: 'Pending' },
+    before: { status: RegStatus.Pending },
     after: {
-      status: 'Rejected',
+      status: RegStatus.Rejected,
       decidedAt: now.toISOString(),
       note,
     },
   });
 
-  // Notify the employee that their regularisation was rejected
   await notify({
     tx,
     recipientIds: updated.employeeId,
@@ -1070,26 +980,17 @@ export async function rejectRegularisation(
 
 // ── Visibility check ──────────────────────────────────────────────────────────
 
-/**
- * Returns true if the requesting user can see the given regularisation request.
- *
- * Visibility rules:
- *   - Owner (employee who submitted it)
- *   - Current approver (approverId matches)
- *   - Manager in the chain above the owner
- *   - Admin always
- */
 export async function canSeeRegularisation(
-  userId: string,
-  userRole: string,
+  userId: number,
+  userRoleId: number,
   reg: {
-    employeeId: string;
-    approverId: string | null;
+    employeeId: number;
+    approverId: number | null;
   },
   tx: Prisma.TransactionClient,
 ): Promise<boolean> {
   // Admin sees all
-  if (userRole === 'Admin') return true;
+  if (userRoleId === 4) return true; // RoleId.Admin
 
   // Owner
   if (reg.employeeId === userId) return true;
@@ -1097,15 +998,14 @@ export async function canSeeRegularisation(
   // Current approver
   if (reg.approverId === userId) return true;
 
-  // Chain manager: check if userId is a manager in the ownership chain above reg.employeeId
-  if (userRole === 'Manager') {
-    // Walk the reporting chain upward from reg.employeeId
-    let current = reg.employeeId;
-    const visited = new Set<string>();
+  // Chain manager
+  if (userRoleId === 2) { // RoleId.Manager
+    let current: number | null = reg.employeeId;
+    const visited = new Set<number>();
 
     while (current && !visited.has(current)) {
       visited.add(current);
-      const emp = await tx.employee.findUnique({
+      const emp: { reportingManagerId: number | null } | null = await tx.employee.findUnique({
         where: { id: current },
         select: { reportingManagerId: true },
       });
@@ -1120,60 +1020,20 @@ export async function canSeeRegularisation(
 
 // ── Map DB records to contract shape ─────────────────────────────────────────
 
-/** Map DB AttendanceStatus → contract enum (with hyphens). */
-export function mapAttendanceStatus(
-  s: string,
-): 'Present' | 'Absent' | 'On-Leave' | 'Weekly-Off' | 'Holiday' {
-  const m: Record<string, 'Present' | 'Absent' | 'On-Leave' | 'Weekly-Off' | 'Holiday'> = {
-    Present: 'Present',
-    Absent: 'Absent',
-    OnLeave: 'On-Leave',
-    WeeklyOff: 'Weekly-Off',
-    Holiday: 'Holiday',
-  };
-  return m[s] ?? 'Absent';
-}
-
-/** Map contract AttendanceStatus (with hyphens) → DB enum (no hyphens). */
-export function mapAttendanceStatusToDb(
-  s: string,
-): 'Present' | 'Absent' | 'OnLeave' | 'WeeklyOff' | 'Holiday' {
-  const m: Record<string, 'Present' | 'Absent' | 'OnLeave' | 'WeeklyOff' | 'Holiday'> = {
-    Present: 'Present',
-    Absent: 'Absent',
-    'On-Leave': 'OnLeave',
-    'Weekly-Off': 'WeeklyOff',
-    Holiday: 'Holiday',
-  };
-  return m[s] ?? 'Absent';
-}
-
-/** Map RegStatusDb → contract RegStatus. */
-export function mapRegStatus(s: string): 'Pending' | 'Approved' | 'Rejected' {
-  if (s === 'Approved') return 'Approved';
-  if (s === 'Rejected') return 'Rejected';
-  return 'Pending';
-}
-
-/** Map RegRoutedToDb → contract RegRoutedTo. */
-export function mapRegRoutedTo(s: string): 'Manager' | 'Admin' {
-  return s === 'Manager' ? 'Manager' : 'Admin';
-}
-
-/** Format a DB AttendanceRecord to the contract AttendanceRecord shape. */
+/** Format a DB AttendanceRecord to the contract AttendanceRecord shape (v2 INT). */
 export function formatAttendanceRecord(row: {
-  id: string;
-  employeeId: string;
+  id: number;
+  employeeId: number;
   date: Date;
-  status: string;
+  status: number;
   checkInTime: Date | null;
   checkOutTime: Date | null;
   hoursWorkedMinutes: number | null;
   late: boolean;
   lateMonthCount: number;
   lopApplied: boolean;
-  source: string;
-  regularisationId: string | null;
+  sourceId: number;
+  regularisationId: number | null;
   createdAt: Date;
   version: number;
 }) {
@@ -1181,41 +1041,39 @@ export function formatAttendanceRecord(row: {
     id: row.id,
     employeeId: row.employeeId,
     date: row.date.toISOString().split('T')[0]!,
-    status: mapAttendanceStatus(row.status),
+    status: row.status,
     checkInTime: row.checkInTime?.toISOString() ?? null,
     checkOutTime: row.checkOutTime?.toISOString() ?? null,
     hoursWorkedMinutes: row.hoursWorkedMinutes ?? null,
     late: row.late,
     lateMonthCount: row.lateMonthCount,
     lopApplied: row.lopApplied,
-    source: (row.source === 'regularisation' ? 'regularisation' : 'system') as
-      | 'system'
-      | 'regularisation',
+    sourceId: row.sourceId,
     regularisationId: row.regularisationId ?? null,
     createdAt: row.createdAt.toISOString(),
     version: row.version,
   };
 }
 
-/** Format a DB RegularisationRequest to the contract shape. */
+/** Format a DB RegularisationRequest to the contract shape (v2 INT). */
 export function formatRegularisation(row: {
-  id: string;
+  id: number;
   code: string;
-  employeeId: string;
+  employeeId: number;
   employee: { name: string; code: string };
   date: Date;
   proposedCheckIn: Date | null;
   proposedCheckOut: Date | null;
   reason: string;
-  status: string;
-  routedTo: string;
+  status: number;
+  routedToId: number;
   ageDaysAtSubmit: number;
-  approverId: string | null;
+  approverId: number | null;
   approver?: { name: string } | null;
   decidedAt: Date | null;
-  decidedBy: string | null;
+  decidedBy: number | null;
   decisionNote: string | null;
-  correctedRecordId: string | null;
+  correctedRecordId: number | null;
   createdAt: Date;
   updatedAt: Date;
   version: number;
@@ -1230,8 +1088,8 @@ export function formatRegularisation(row: {
     proposedCheckIn: row.proposedCheckIn?.toISOString() ?? null,
     proposedCheckOut: row.proposedCheckOut?.toISOString() ?? null,
     reason: row.reason,
-    status: mapRegStatus(row.status),
-    routedTo: mapRegRoutedTo(row.routedTo),
+    status: row.status,
+    routedToId: row.routedToId,
     ageDaysAtSubmit: row.ageDaysAtSubmit,
     approverId: row.approverId ?? null,
     approverName: row.approver?.name ?? null,
@@ -1245,3 +1103,14 @@ export function formatRegularisation(row: {
   };
 }
 
+// Legacy export kept for any remaining string-based callers (attendance routes still use this)
+export function mapAttendanceStatusToDb(s: string): number {
+  const m: Record<string, number> = {
+    Present: AttendanceStatus.Present,
+    Absent: AttendanceStatus.Absent,
+    'On-Leave': AttendanceStatus.OnLeave,
+    'Weekly-Off': AttendanceStatus.WeeklyOff,
+    Holiday: AttendanceStatus.Holiday,
+  };
+  return m[s] ?? AttendanceStatus.Absent;
+}

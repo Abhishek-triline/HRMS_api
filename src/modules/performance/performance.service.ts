@@ -1,17 +1,21 @@
 /**
- * Performance Reviews service — Phase 5.
+ * Performance Reviews service — v2 schema (INT IDs, INT status codes).
  *
  * Business rules enforced here:
- *   BL-037  Mid-cycle joiners excluded from rating; created with isMidCycleJoiner=true.
+ *   BL-037  Mid-cycle joiners excluded: employeeId joined after fyStart → skip.
  *   BL-038  Goals: Manager creates; Employee proposes during self-review window.
  *   BL-039  Self-rating locked after selfReviewDeadline.
  *   BL-040  Manager-rating deadline + managerOverrodeSelf flag.
  *   BL-041  Cycle closure locks all reviews; CYCLE_CLOSED on subsequent mutations.
  *   BL-042  Manager-change mid-cycle: propagate to open reviews.
  *
- * Option B admin self-review (Implementation Plan § 9):
- *   Admins have managerId = peer Admin (from adminPeerReviewers map).
- *   Admins not in the map get managerId=null and surface in missing-reviews.
+ * v2 schema notes:
+ *   - All IDs are INT (number).
+ *   - PerformanceCycle.status is INT (CycleStatus constants).
+ *   - Goal.outcomeId is INT (GoalOutcome constants).
+ *   - No isMidCycleJoiner, selfSubmittedAt, managerSubmittedAt on PerformanceReview.
+ *   - No participants field on PerformanceCycle.
+ *   - PerformanceCycle relations: creator / closer (not createdByEmployee / closedByEmployee).
  */
 
 import type { Prisma } from '@prisma/client';
@@ -21,6 +25,12 @@ import { notify } from '../../lib/notifications.js';
 import { ErrorCode, errorEnvelope } from '@nexora/contracts/errors';
 import type { ErrorEnvelope } from '@nexora/contracts/errors';
 import type { CreateCycleRequest } from '@nexora/contracts/performance';
+import {
+  CycleStatus,
+  GoalOutcome,
+  RoleId,
+  type AuditActorRoleValue,
+} from '../../lib/statusInt.js';
 
 /** Discriminated union for service results. */
 export type ServiceError = { error: ErrorEnvelope; status: number };
@@ -45,50 +55,56 @@ export function generateCycleCode(fyStart: Date): string {
 
 // ── DB → Contract status mapping ─────────────────────────────────────────────
 
-/** Map DB enum (no hyphens) → contract enum (with hyphens). */
-export function mapCycleStatus(s: string): 'Open' | 'Self-Review' | 'Manager-Review' | 'Closed' {
-  const m: Record<string, 'Open' | 'Self-Review' | 'Manager-Review' | 'Closed'> = {
-    Open: 'Open',
-    SelfReview: 'Self-Review',
-    ManagerReview: 'Manager-Review',
-    Closed: 'Closed',
+/** Map INT status → contract string. */
+export function mapCycleStatus(s: number): 'Open' | 'Self-Review' | 'Manager-Review' | 'Closed' {
+  const m: Record<number, 'Open' | 'Self-Review' | 'Manager-Review' | 'Closed'> = {
+    [CycleStatus.Open]: 'Open',
+    [CycleStatus.SelfReview]: 'Self-Review',
+    [CycleStatus.ManagerReview]: 'Manager-Review',
+    [CycleStatus.Closed]: 'Closed',
   };
   return m[s] ?? 'Open';
 }
 
-/** Map contract enum → DB enum. */
-export function mapCycleStatusToDB(s: string): 'Open' | 'SelfReview' | 'ManagerReview' | 'Closed' {
-  const m: Record<string, 'Open' | 'SelfReview' | 'ManagerReview' | 'Closed'> = {
-    'Open': 'Open',
-    'Self-Review': 'SelfReview',
-    'Manager-Review': 'ManagerReview',
-    'Closed': 'Closed',
+/** Map contract string → INT status. */
+export function mapCycleStatusToDB(s: string): number {
+  const m: Record<string, number> = {
+    'Open': CycleStatus.Open,
+    'Self-Review': CycleStatus.SelfReview,
+    'Manager-Review': CycleStatus.ManagerReview,
+    'Closed': CycleStatus.Closed,
   };
-  return m[s] ?? 'Open';
+  return m[s] ?? CycleStatus.Open;
 }
 
-/** Map DB goal outcome → contract outcome. */
-export function mapGoalOutcome(s: string): 'Met' | 'Partial' | 'Missed' | 'Pending' {
-  const m: Record<string, 'Met' | 'Partial' | 'Missed' | 'Pending'> = {
-    Met: 'Met',
-    Partial: 'Partial',
-    Missed: 'Missed',
-    Pending: 'Pending',
+/** Map INT outcomeId → contract string. */
+export function mapGoalOutcome(id: number): 'Met' | 'Partial' | 'Missed' | 'Pending' {
+  const m: Record<number, 'Met' | 'Partial' | 'Missed' | 'Pending'> = {
+    [GoalOutcome.Pending]: 'Pending',
+    [GoalOutcome.Met]: 'Met',
+    [GoalOutcome.Partial]: 'Partial',
+    [GoalOutcome.Missed]: 'Missed',
   };
-  return m[s] ?? 'Pending';
+  return m[id] ?? 'Pending';
 }
 
-/** Map contract goal outcome → DB enum. */
-export function mapGoalOutcomeToDB(s: string): 'Met' | 'Partial' | 'Missed' | 'Pending' {
-  return mapGoalOutcome(s);
+/** Map contract string → INT outcomeId. */
+export function mapGoalOutcomeToDB(s: string): number {
+  const m: Record<string, number> = {
+    Pending: GoalOutcome.Pending,
+    Met: GoalOutcome.Met,
+    Partial: GoalOutcome.Partial,
+    Missed: GoalOutcome.Missed,
+  };
+  return m[s] ?? GoalOutcome.Pending;
 }
 
 // ── Row shapes ───────────────────────────────────────────────────────────────
 
 type CycleWithRelations = Prisma.PerformanceCycleGetPayload<{
   include: {
-    createdByEmployee: { select: { name: true } };
-    closedByEmployee: { select: { name: true } };
+    creator: { select: { name: true } };
+    closer: { select: { name: true } };
   };
 }>;
 
@@ -104,7 +120,14 @@ type ReviewWithRelations = Prisma.PerformanceReviewGetPayload<{
         managerReviewDeadline: true;
       };
     };
-    employee: { select: { name: true; code: true; department: true; designation: true } };
+    employee: {
+      select: {
+        name: true;
+        code: true;
+        department: { select: { name: true } };
+        designation: { select: { name: true } };
+      };
+    };
     manager: { select: { name: true } };
     previousManager: { select: { name: true } };
     goals: true;
@@ -124,10 +147,9 @@ export function shapeCycle(row: CycleWithRelations) {
     managerReviewDeadline: row.managerReviewDeadline.toISOString().split('T')[0]!,
     closedAt: row.closedAt ? row.closedAt.toISOString() : null,
     closedBy: row.closedBy ?? null,
-    closedByName: row.closedByEmployee?.name ?? null,
+    closedByName: row.closer?.name ?? null,
     createdBy: row.createdBy,
-    createdByName: row.createdByEmployee.name,
-    participants: row.participants,
+    createdByName: row.creator.name,
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),
     version: row.version,
@@ -148,9 +170,8 @@ export function shapeReviewSummary(row: ReviewWithRelations) {
     managerRating: row.managerRating ?? null,
     managerOverrodeSelf: row.managerOverrodeSelf,
     finalRating: row.finalRating ?? null,
-    isMidCycleJoiner: row.isMidCycleJoiner,
-    department: row.employee.department ?? null,
-    designation: row.employee.designation ?? null,
+    department: row.employee.department?.name ?? null,
+    designation: row.employee.designation?.name ?? null,
   };
 }
 
@@ -171,23 +192,20 @@ export function shapeReviewDetail(row: ReviewWithRelations) {
       id: g.id,
       reviewId: g.reviewId,
       text: g.text,
-      outcome: mapGoalOutcome(g.outcome),
+      outcome: mapGoalOutcome(g.outcomeId),
       proposedByEmployee: g.proposedByEmployee,
       createdAt: g.createdAt.toISOString(),
       version: g.version,
     })),
     selfRating: row.selfRating ?? null,
     selfNote: row.selfNote ?? null,
-    selfSubmittedAt: row.selfSubmittedAt ? row.selfSubmittedAt.toISOString() : null,
     managerRating: row.managerRating ?? null,
     managerNote: row.managerNote ?? null,
-    managerSubmittedAt: row.managerSubmittedAt ? row.managerSubmittedAt.toISOString() : null,
     managerOverrodeSelf: row.managerOverrodeSelf,
     finalRating: row.finalRating ?? null,
     lockedAt: row.lockedAt ? row.lockedAt.toISOString() : null,
-    isMidCycleJoiner: row.isMidCycleJoiner,
-    department: row.employee.department ?? null,
-    designation: row.employee.designation ?? null,
+    department: row.employee.department?.name ?? null,
+    designation: row.employee.designation?.name ?? null,
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),
     version: row.version,
@@ -197,9 +215,9 @@ export function shapeReviewDetail(row: ReviewWithRelations) {
 // ── include blocks ───────────────────────────────────────────────────────────
 
 export const cycleInclude = {
-  createdByEmployee: { select: { name: true } },
-  closedByEmployee: { select: { name: true } },
-} as const;
+  creator: { select: { name: true } },
+  closer: { select: { name: true } },
+} as const satisfies Prisma.PerformanceCycleInclude;
 
 export const reviewInclude = {
   cycle: {
@@ -212,18 +230,25 @@ export const reviewInclude = {
       managerReviewDeadline: true,
     },
   },
-  employee: { select: { name: true, code: true, department: true, designation: true } },
+  employee: {
+    select: {
+      name: true,
+      code: true,
+      department: { select: { name: true } },
+      designation: { select: { name: true } },
+    },
+  },
   manager: { select: { name: true } },
   previousManager: { select: { name: true } },
   goals: true,
-} as const;
+} as const satisfies Prisma.PerformanceReviewInclude;
 
 // ── createCycle ──────────────────────────────────────────────────────────────
 
 export async function createCycle(
   input: CreateCycleRequest,
-  actorId: string,
-  actorRole: string,
+  actorId: number,
+  actorRole: AuditActorRoleValue,
   actorIp: string | null,
   tx: Prisma.TransactionClient,
 ) {
@@ -285,13 +310,13 @@ export async function createCycle(
   // Identify participants: Active employees whose joinDate <= fyStart (BL-037)
   const participants = await tx.employee.findMany({
     where: {
-      status: 'Active',
+      status: 1, // EmployeeStatus.Active
       joinDate: { lte: fyStart },
     },
     select: {
       id: true,
       name: true,
-      role: true,
+      roleId: true,
       reportingManagerId: true,
     },
   });
@@ -299,7 +324,7 @@ export async function createCycle(
   // Mid-cycle joiners: Active employees who joined AFTER fyStart but before or on today
   const midCycleJoiners = await tx.employee.findMany({
     where: {
-      status: 'Active',
+      status: 1, // EmployeeStatus.Active
       joinDate: { gt: fyStart, lte: today },
     },
     select: {
@@ -314,30 +339,29 @@ export async function createCycle(
       code,
       fyStart,
       fyEnd,
-      status: 'Open',
+      status: CycleStatus.Open,
       selfReviewDeadline: selfDeadline,
       managerReviewDeadline: managerDeadline,
       createdBy: actorId,
-      participants: participants.length,
       version: 0,
     },
     include: cycleInclude,
   });
 
-  // Build adminPeerReviewers lookup (Option B)
-  const peerMap: Record<string, string> = input.adminPeerReviewers ?? {};
+  // Build adminPeerReviewers lookup (Option B) — keys are number strings
+  const peerMap: Record<string, number> = input.adminPeerReviewers ?? {};
 
   // Create review rows for participants
   for (const emp of participants) {
-    let managerId: string | null = null;
+    let managerId: number | null = null;
 
-    if (emp.role === 'Admin') {
+    if (emp.roleId === RoleId.Admin) {
       // Option B: Admin peer review — look up the peer from the map
-      const peerId = peerMap[emp.id];
-      if (peerId) {
+      const peerId = peerMap[String(emp.id)];
+      if (peerId !== undefined) {
         // Validate the peer is an Active Admin
         const peer = await tx.employee.findFirst({
-          where: { id: peerId, role: 'Admin', status: 'Active' },
+          where: { id: peerId, roleId: RoleId.Admin, status: 1 },
           select: { id: true },
         });
         managerId = peer ? peer.id : null;
@@ -353,20 +377,18 @@ export async function createCycle(
         cycleId: cycle.id,
         employeeId: emp.id,
         managerId,
-        isMidCycleJoiner: false,
         version: 0,
       },
     });
   }
 
-  // Create review rows for mid-cycle joiners (isMidCycleJoiner=true, managerId=null)
+  // Create review rows for mid-cycle joiners (managerId=null)
   for (const emp of midCycleJoiners) {
     await tx.performanceReview.create({
       data: {
         cycleId: cycle.id,
         employeeId: emp.id,
         managerId: null,
-        isMidCycleJoiner: true,
         version: 0,
       },
     });
@@ -392,11 +414,10 @@ export async function createCycle(
     },
   });
 
-  // Notify each participant (not mid-cycle joiners) about the new cycle
-  // and their self-review deadline. Fetch review IDs for per-employee links.
+  // Notify each participant about the new cycle and their self-review deadline.
   if (participants.length > 0) {
     const reviews = await tx.performanceReview.findMany({
-      where: { cycleId: cycle.id, isMidCycleJoiner: false },
+      where: { cycleId: cycle.id },
       select: { id: true, employeeId: true },
     });
     const reviewByEmployee = new Map(reviews.map((r) => [r.employeeId, r.id]));
@@ -431,10 +452,10 @@ export async function createCycle(
 // ── closeCycle ───────────────────────────────────────────────────────────────
 
 export async function closeCycle(
-  cycleId: string,
+  cycleId: number,
   expectedVersion: number,
-  actorId: string,
-  actorRole: string,
+  actorId: number,
+  actorRole: AuditActorRoleValue,
   actorIp: string | null,
   tx: Prisma.TransactionClient,
 ) {
@@ -447,7 +468,7 @@ export async function closeCycle(
     return { error: errorEnvelope(ErrorCode.NOT_FOUND, 'Cycle not found.'), status: 404 };
   }
 
-  if (cycle.status === 'Closed') {
+  if (cycle.status === CycleStatus.Closed) {
     return {
       error: errorEnvelope(
         ErrorCode.CYCLE_CLOSED,
@@ -494,7 +515,7 @@ export async function closeCycle(
   const updated = await tx.performanceCycle.update({
     where: { id: cycleId },
     data: {
-      status: 'Closed',
+      status: CycleStatus.Closed,
       closedAt: now,
       closedBy: actorId,
       version: { increment: 1 },
@@ -538,10 +559,10 @@ export async function closeCycle(
 // ── createGoal ───────────────────────────────────────────────────────────────
 
 export async function createGoal(
-  reviewId: string,
+  reviewId: number,
   text: string,
-  actorId: string,
-  actorRole: string,
+  actorId: number,
+  actorRole: AuditActorRoleValue,
   actorIp: string | null,
   tx: Prisma.TransactionClient,
 ) {
@@ -554,7 +575,7 @@ export async function createGoal(
     return { error: errorEnvelope(ErrorCode.NOT_FOUND, 'Review not found.'), status: 404 };
   }
 
-  if (review.cycle.status === 'Closed') {
+  if (review.cycle.status === CycleStatus.Closed) {
     return {
       error: errorEnvelope(
         ErrorCode.CYCLE_CLOSED,
@@ -565,20 +586,8 @@ export async function createGoal(
     };
   }
 
-  // Mid-cycle joiners are skipped (BL-037)
-  if (review.isMidCycleJoiner) {
-    return {
-      error: errorEnvelope(
-        ErrorCode.CYCLE_PHASE,
-        'This employee is a mid-cycle joiner and is excluded from this cycle.',
-        { ruleId: 'BL-037' },
-      ),
-      status: 409,
-    };
-  }
-
   // Only the assigned manager or Admin may create goals
-  if (actorRole !== 'Admin' && review.managerId !== actorId) {
+  if (actorRole !== RoleId.Admin && review.managerId !== actorId) {
     return {
       error: errorEnvelope(
         ErrorCode.FORBIDDEN,
@@ -605,7 +614,7 @@ export async function createGoal(
     data: {
       reviewId,
       text,
-      outcome: 'Pending',
+      outcomeId: GoalOutcome.Pending,
       proposedByEmployee: false,
       version: 0,
     },
@@ -621,7 +630,7 @@ export async function createGoal(
     targetId: goal.id,
     module: 'performance',
     before: null,
-    after: { reviewId, text, outcome: 'Pending', proposedByEmployee: false },
+    after: { reviewId, text, outcomeId: GoalOutcome.Pending, proposedByEmployee: false },
   });
 
   return {
@@ -630,7 +639,7 @@ export async function createGoal(
         id: goal.id,
         reviewId: goal.reviewId,
         text: goal.text,
-        outcome: mapGoalOutcome(goal.outcome) as 'Met' | 'Partial' | 'Missed' | 'Pending',
+        outcome: mapGoalOutcome(goal.outcomeId),
         proposedByEmployee: goal.proposedByEmployee,
         createdAt: goal.createdAt.toISOString(),
         version: goal.version,
@@ -642,10 +651,10 @@ export async function createGoal(
 // ── proposeGoal ──────────────────────────────────────────────────────────────
 
 export async function proposeGoal(
-  reviewId: string,
+  reviewId: number,
   text: string,
-  actorId: string,
-  actorRole: string,
+  actorId: number,
+  actorRole: AuditActorRoleValue,
   actorIp: string | null,
   tx: Prisma.TransactionClient,
 ) {
@@ -669,7 +678,7 @@ export async function proposeGoal(
     };
   }
 
-  if (review.cycle.status === 'Closed') {
+  if (review.cycle.status === CycleStatus.Closed) {
     return {
       error: errorEnvelope(
         ErrorCode.CYCLE_CLOSED,
@@ -680,24 +689,12 @@ export async function proposeGoal(
     };
   }
 
-  // Mid-cycle joiners are excluded (BL-037)
-  if (review.isMidCycleJoiner) {
-    return {
-      error: errorEnvelope(
-        ErrorCode.CYCLE_PHASE,
-        'Mid-cycle joiners are excluded from this cycle.',
-        { ruleId: 'BL-037' },
-      ),
-      status: 409,
-    };
-  }
-
   // BL-038: Employee may only propose during SelfReview phase or within [fyStart, selfReviewDeadline]
   const now = new Date();
   const selfDeadline = review.cycle.selfReviewDeadline;
   const fyStart = review.cycle.fyStart;
 
-  const inSelfReviewPhase = review.cycle.status === 'SelfReview';
+  const inSelfReviewPhase = review.cycle.status === CycleStatus.SelfReview;
   const inSelfWindow = now >= fyStart && now <= selfDeadline;
 
   if (!inSelfReviewPhase && !inSelfWindow) {
@@ -728,7 +725,7 @@ export async function proposeGoal(
     data: {
       reviewId,
       text,
-      outcome: 'Pending',
+      outcomeId: GoalOutcome.Pending,
       proposedByEmployee: true,
       version: 0,
     },
@@ -744,7 +741,7 @@ export async function proposeGoal(
     targetId: goal.id,
     module: 'performance',
     before: null,
-    after: { reviewId, text, outcome: 'Pending', proposedByEmployee: true },
+    after: { reviewId, text, outcomeId: GoalOutcome.Pending, proposedByEmployee: true },
   });
 
   return {
@@ -753,7 +750,7 @@ export async function proposeGoal(
         id: goal.id,
         reviewId: goal.reviewId,
         text: goal.text,
-        outcome: mapGoalOutcome(goal.outcome) as 'Met' | 'Partial' | 'Missed' | 'Pending',
+        outcome: mapGoalOutcome(goal.outcomeId),
         proposedByEmployee: goal.proposedByEmployee,
         createdAt: goal.createdAt.toISOString(),
         version: goal.version,
@@ -765,12 +762,12 @@ export async function proposeGoal(
 // ── submitSelfRating ─────────────────────────────────────────────────────────
 
 export async function submitSelfRating(
-  reviewId: string,
+  reviewId: number,
   selfRating: number,
   selfNote: string | undefined,
   expectedVersion: number,
-  actorId: string,
-  actorRole: string,
+  actorId: number,
+  actorRole: AuditActorRoleValue,
   actorIp: string | null,
   tx: Prisma.TransactionClient,
 ) {
@@ -794,24 +791,12 @@ export async function submitSelfRating(
     };
   }
 
-  if (review.cycle.status === 'Closed') {
+  if (review.cycle.status === CycleStatus.Closed) {
     return {
       error: errorEnvelope(
         ErrorCode.CYCLE_CLOSED,
         'Cannot submit self-rating on a closed cycle.',
         { ruleId: 'BL-041' },
-      ),
-      status: 409,
-    };
-  }
-
-  // Mid-cycle joiners excluded (BL-037)
-  if (review.isMidCycleJoiner) {
-    return {
-      error: errorEnvelope(
-        ErrorCode.CYCLE_PHASE,
-        'Mid-cycle joiners are excluded from this cycle.',
-        { ruleId: 'BL-037' },
       ),
       status: 409,
     };
@@ -848,7 +833,6 @@ export async function submitSelfRating(
   const beforeSnapshot = {
     selfRating: review.selfRating,
     selfNote: review.selfNote,
-    selfSubmittedAt: review.selfSubmittedAt,
     version: review.version,
   };
 
@@ -857,7 +841,6 @@ export async function submitSelfRating(
     data: {
       selfRating,
       selfNote: selfNote ?? null,
-      selfSubmittedAt: now,
       version: { increment: 1 },
     },
     include: reviewInclude,
@@ -873,7 +856,7 @@ export async function submitSelfRating(
     targetId: reviewId,
     module: 'performance',
     before: beforeSnapshot,
-    after: { selfRating, selfNote: selfNote ?? null, selfSubmittedAt: now.toISOString() },
+    after: { selfRating, selfNote: selfNote ?? null },
   });
 
   // Notify the assigned manager that the employee submitted their self-rating
@@ -894,13 +877,13 @@ export async function submitSelfRating(
 // ── submitManagerRating ──────────────────────────────────────────────────────
 
 export async function submitManagerRating(
-  reviewId: string,
+  reviewId: number,
   managerRating: number,
   managerNote: string | undefined,
-  goals: Array<{ id: string; outcome: string }> | undefined,
+  goals: Array<{ id: number; outcomeId: number }> | undefined,
   expectedVersion: number,
-  actorId: string,
-  actorRole: string,
+  actorId: number,
+  actorRole: AuditActorRoleValue,
   actorIp: string | null,
   tx: Prisma.TransactionClient,
 ) {
@@ -914,7 +897,7 @@ export async function submitManagerRating(
   }
 
   // BL-042: current managerId OR Admin may submit
-  if (actorRole !== 'Admin' && review.managerId !== actorId) {
+  if (actorRole !== RoleId.Admin && review.managerId !== actorId) {
     return {
       error: errorEnvelope(
         ErrorCode.FORBIDDEN,
@@ -925,24 +908,12 @@ export async function submitManagerRating(
     };
   }
 
-  if (review.cycle.status === 'Closed') {
+  if (review.cycle.status === CycleStatus.Closed) {
     return {
       error: errorEnvelope(
         ErrorCode.CYCLE_CLOSED,
         'Cannot submit manager rating on a closed cycle.',
         { ruleId: 'BL-041' },
-      ),
-      status: 409,
-    };
-  }
-
-  // Mid-cycle joiners excluded (BL-037)
-  if (review.isMidCycleJoiner) {
-    return {
-      error: errorEnvelope(
-        ErrorCode.CYCLE_PHASE,
-        'Mid-cycle joiners are excluded from this cycle.',
-        { ruleId: 'BL-037' },
       ),
       status: 409,
     };
@@ -983,23 +954,17 @@ export async function submitManagerRating(
   const beforeSnapshot = {
     managerRating: review.managerRating,
     managerNote: review.managerNote,
-    managerSubmittedAt: review.managerSubmittedAt,
     managerOverrodeSelf: review.managerOverrodeSelf,
     version: review.version,
   };
 
   // Apply goal outcome updates if provided.
-  // SEC-002-P5 fix — every goal update is constrained to THIS review.
-  // Without the `reviewId` clause a malicious manager could pass goal IDs
-  // from a different review they have access to and falsify outcomes on
-  // a colleague's record. `updateMany` returns count=0 when the goal
-  // doesn't belong to this review; we treat that as a hard error.
   if (goals && goals.length > 0) {
     for (const g of goals) {
       const result = await tx.goal.updateMany({
         where: { id: g.id, reviewId },
         data: {
-          outcome: mapGoalOutcomeToDB(g.outcome),
+          outcomeId: g.outcomeId,
           version: { increment: 1 },
         },
       });
@@ -1019,7 +984,6 @@ export async function submitManagerRating(
     data: {
       managerRating,
       managerNote: managerNote ?? null,
-      managerSubmittedAt: now,
       managerOverrodeSelf,
       version: { increment: 1 },
     },
@@ -1039,7 +1003,6 @@ export async function submitManagerRating(
     after: {
       managerRating,
       managerNote: managerNote ?? null,
-      managerSubmittedAt: now.toISOString(),
       managerOverrodeSelf,
       goalsUpdated: goals?.length ?? 0,
     },
@@ -1061,23 +1024,23 @@ export async function submitManagerRating(
 // ── handleManagerChange (BL-042) ─────────────────────────────────────────────
 
 /**
- * Called from the reassign-manager handler (Phase 1) after the employee record
- * update. Updates every open PerformanceReview for this employee to point to the
- * new manager. Writes a performance.review.manager-change audit entry per review.
+ * Called from the reassign-manager handler after the employee record update.
+ * Updates every open PerformanceReview for this employee to point to the new manager.
+ * Writes a performance.review.manager-change audit entry per review.
  */
 export async function handleManagerChange(
-  employeeId: string,
-  oldManagerId: string | null,
-  newManagerId: string | null,
-  actorId: string,
-  actorRole: string,
+  employeeId: number,
+  oldManagerId: number | null,
+  newManagerId: number | null,
+  actorId: number,
+  actorRole: AuditActorRoleValue,
   actorIp: string | null,
   tx: Prisma.TransactionClient,
 ): Promise<void> {
   const activeReviews = await tx.performanceReview.findMany({
     where: {
       employeeId,
-      cycle: { status: { not: 'Closed' } },
+      cycle: { status: { not: CycleStatus.Closed } },
     },
     select: { id: true, managerId: true, version: true },
   });
@@ -1124,7 +1087,7 @@ export async function handleManagerChange(
 
     // Notify old manager and new manager about the review reassignment (BL-042)
     const notifyIds = [r.managerId, newManagerId].filter(
-      (id): id is string => id !== null && id !== undefined,
+      (id): id is number => id !== null && id !== undefined,
     );
     if (notifyIds.length > 0) {
       const reviewedByMsg = newManagerName ? ` to ${newManagerName}` : '';
@@ -1143,7 +1106,7 @@ export async function handleManagerChange(
 // ── Fetch helpers ────────────────────────────────────────────────────────────
 
 /** Fetch a single cycle with all relations. Returns null if not found. */
-export async function fetchCycleById(id: string) {
+export async function fetchCycleById(id: number) {
   return prisma.performanceCycle.findUnique({
     where: { id },
     include: cycleInclude,
@@ -1151,7 +1114,7 @@ export async function fetchCycleById(id: string) {
 }
 
 /** Fetch a single review with all relations. Returns null if not found. */
-export async function fetchReviewById(id: string) {
+export async function fetchReviewById(id: number) {
   return prisma.performanceReview.findUnique({
     where: { id },
     include: reviewInclude,

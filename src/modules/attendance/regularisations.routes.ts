@@ -1,5 +1,5 @@
 /**
- * Regularisation routes — Phase 3.
+ * Regularisation routes — Phase 3 (v2 INT schema).
  *
  * Mounted at /api/v1/regularisations
  *
@@ -15,7 +15,6 @@ import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { prisma } from '../../lib/prisma.js';
 import { requireSession } from '../../middleware/requireSession.js';
-import { requireRole } from '../../middleware/requireRole.js';
 import { validateBody } from '../../middleware/validateBody.js';
 import { validateQuery } from '../../middleware/validateQuery.js';
 import { errorEnvelope, ErrorCode } from '@nexora/contracts/errors';
@@ -35,6 +34,10 @@ import {
   canSeeRegularisation,
   formatRegularisation,
 } from './attendance.service.js';
+import {
+  RoleId,
+  RegStatus,
+} from '../../lib/statusInt.js';
 
 export const regularisationsRouter = Router();
 
@@ -55,8 +58,6 @@ function parseTimeOnDate(timeHHMM: string, dateStr: string): Date {
   const [hStr, mStr] = timeHHMM.split(':');
   const h = parseInt(hStr ?? '0', 10);
   const m = parseInt(mStr ?? '0', 10);
-  // dateStr is YYYY-MM-DD; build a full ISO-8601 string in IST offset (+05:30)
-  // so the resulting Date is correctly stored as UTC.
   const isoStr = `${dateStr}T${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:00+05:30`;
   return new Date(isoStr);
 }
@@ -76,7 +77,6 @@ regularisationsRouter.post(
       reason: string;
     };
 
-    // Validate date < today
     const today = new Date();
     today.setUTCHours(0, 0, 0, 0);
     const requestedDate = new Date(body.date);
@@ -93,7 +93,6 @@ regularisationsRouter.post(
       return;
     }
 
-    // Parse proposed times onto the date
     const proposedCheckIn = body.proposedCheckIn
       ? parseTimeOnDate(body.proposedCheckIn, body.date)
       : null;
@@ -101,7 +100,6 @@ regularisationsRouter.post(
       ? parseTimeOnDate(body.proposedCheckOut, body.date)
       : null;
 
-    // Validate check-in < check-out if both provided
     if (proposedCheckIn && proposedCheckOut && proposedCheckOut <= proposedCheckIn) {
       res.status(400).json(
         errorEnvelope(
@@ -124,18 +122,13 @@ regularisationsRouter.post(
             reason: body.reason,
           },
           tx,
-          { role: user.role, ip: req.ip ?? null },
+          { roleId: user.roleId, ip: req.ip ?? null },
         );
       });
 
-      res.status(201).json({
-        data: {
-          regularisation: formatRegularisation(reg),
-        },
-      });
+      res.status(201).json({ data: { regularisation: formatRegularisation(reg) } });
     } catch (err: unknown) {
       if (isRegConflict(err)) {
-        // BL-010: leave/reg conflict with specific code (DN-19)
         res.status(409).json(
           errorEnvelope(
             ErrorCode.LEAVE_REG_CONFLICT,
@@ -146,9 +139,7 @@ regularisationsRouter.post(
         return;
       }
       logger.error({ err, userId: user.id }, 'regularisations.create: error');
-      res
-        .status(500)
-        .json(errorEnvelope(ErrorCode.INTERNAL_ERROR, 'Failed to submit regularisation.'));
+      res.status(500).json(errorEnvelope(ErrorCode.INTERNAL_ERROR, 'Failed to submit regularisation.'));
     }
   },
 );
@@ -162,9 +153,9 @@ regularisationsRouter.get(
   async (req: Request, res: Response): Promise<void> => {
     const user = req.user!;
     const q = req.query as unknown as {
-      status?: string;
-      routedTo?: string;
-      employeeId?: string;
+      status?: number;
+      routedToId?: number;
+      employeeId?: number;
       fromDate?: string;
       toDate?: string;
       cursor?: string;
@@ -173,35 +164,21 @@ regularisationsRouter.get(
 
     try {
       const limit = Number(q.limit ?? 20);
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any -- dynamic Prisma where building
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const where: Record<string, any> = {};
 
-      // Scoping rules per role (BL-004 / SEC-001-P2 pattern):
-      //   Employee → only own requests
-      //   Manager  → own + subordinates' requests routed to Manager AND approverId=self
-      //   Admin    → all, optional ?routedTo=Admin filter
-      //   PayrollOfficer → only own (same as Employee)
-      if (user.role === 'Admin') {
-        // Admin sees all; optional routedTo filter
-        if (q.routedTo) {
-          where['routedTo'] = q.routedTo;
-        }
-        if (q.employeeId) {
-          where['employeeId'] = q.employeeId;
-        }
-      } else if (user.role === 'Manager') {
-        // SEC-001-P3 fix — when ?employeeId is supplied, the previous code
-        // dropped the approverId guard and exposed Admin-routed corrections
-        // belonging to a subordinate. Tighten: filtering by self returns
-        // own requests; filtering by a subordinate returns only the rows
-        // where this manager IS the assigned approver. Anything else 404s.
+      if (user.roleId === RoleId.Admin) {
+        if (q.routedToId) where['routedToId'] = Number(q.routedToId);
+        if (q.employeeId) where['employeeId'] = Number(q.employeeId);
+      } else if (user.roleId === RoleId.Manager) {
         const subIds = await getSubordinateIds(user.id);
         if (q.employeeId) {
-          if (q.employeeId === user.id) {
+          const empId = Number(q.employeeId);
+          if (empId === user.id) {
             where['employeeId'] = user.id;
-          } else if (subIds.includes(q.employeeId)) {
+          } else if (subIds.includes(empId)) {
             where['AND'] = [
-              { employeeId: q.employeeId },
+              { employeeId: empId },
               { approverId: user.id },
             ];
           } else {
@@ -209,23 +186,16 @@ regularisationsRouter.get(
             return;
           }
         } else {
-          // Own requests OR subordinates' requests where approverId = self
           where['OR'] = [
             { employeeId: user.id },
-            {
-              employeeId: { in: subIds },
-              approverId: user.id,
-            },
+            { employeeId: { in: subIds }, approverId: user.id },
           ];
         }
       } else {
-        // Employee / PayrollOfficer — only own requests
         where['employeeId'] = user.id;
       }
 
-      if (q.status) {
-        where['status'] = q.status;
-      }
+      if (q.status) where['status'] = Number(q.status);
 
       if (q.fromDate || q.toDate) {
         where['date'] = {};
@@ -233,11 +203,13 @@ regularisationsRouter.get(
         if (q.toDate) where['date']['lte'] = new Date(q.toDate);
       }
 
+      const cursorId = q.cursor && !isNaN(Number(q.cursor)) ? Number(q.cursor) : undefined;
+
       const rows = await prisma.regularisationRequest.findMany({
         where,
         orderBy: { createdAt: 'desc' },
         take: limit + 1,
-        ...(q.cursor ? { cursor: { id: q.cursor }, skip: 1 } : {}),
+        ...(cursorId !== undefined ? { cursor: { id: cursorId }, skip: 1 } : {}),
         include: {
           employee: { select: { name: true, code: true } },
           approver: { select: { name: true } },
@@ -246,7 +218,7 @@ regularisationsRouter.get(
 
       const hasMore = rows.length > limit;
       const items = hasMore ? rows.slice(0, limit) : rows;
-      const nextCursor = hasMore ? items[items.length - 1]!.id : null;
+      const nextCursor = hasMore ? String(items[items.length - 1]!.id) : null;
 
       res.status(200).json({
         data: items.map((r) => ({
@@ -256,8 +228,8 @@ regularisationsRouter.get(
           employeeName: r.employee.name,
           employeeCode: r.employee.code,
           date: r.date.toISOString().split('T')[0]!,
-          status: r.status as 'Pending' | 'Approved' | 'Rejected',
-          routedTo: r.routedTo as 'Manager' | 'Admin',
+          status: r.status,
+          routedToId: r.routedToId,
           ageDaysAtSubmit: r.ageDaysAtSubmit,
           approverName: r.approver?.name ?? null,
           createdAt: r.createdAt.toISOString(),
@@ -266,9 +238,7 @@ regularisationsRouter.get(
       });
     } catch (err: unknown) {
       logger.error({ err, userId: user.id }, 'regularisations.list: error');
-      res
-        .status(500)
-        .json(errorEnvelope(ErrorCode.INTERNAL_ERROR, 'Failed to load regularisations.'));
+      res.status(500).json(errorEnvelope(ErrorCode.INTERNAL_ERROR, 'Failed to load regularisations.'));
     }
   },
 );
@@ -280,7 +250,12 @@ regularisationsRouter.get(
   requireSession(),
   async (req: Request, res: Response): Promise<void> => {
     const user = req.user!;
-    const { id } = req.params;
+    const id = Number(req.params['id']);
+
+    if (isNaN(id)) {
+      res.status(404).json(errorEnvelope(ErrorCode.NOT_FOUND, 'Regularisation not found.'));
+      return;
+    }
 
     try {
       const reg = await prisma.regularisationRequest.findUnique({
@@ -296,13 +271,11 @@ regularisationsRouter.get(
         return;
       }
 
-      // Ownership / visibility check
       const visible = await prisma.$transaction(async (tx) => {
-        return canSeeRegularisation(user.id, user.role, reg, tx);
+        return canSeeRegularisation(user.id, user.roleId, reg, tx);
       });
 
       if (!visible) {
-        // Return 404 to avoid leaking existence (HRMS_API.md § 1)
         res.status(404).json(errorEnvelope(ErrorCode.NOT_FOUND, 'Regularisation not found.'));
         return;
       }
@@ -310,9 +283,7 @@ regularisationsRouter.get(
       res.status(200).json({ data: formatRegularisation(reg) });
     } catch (err: unknown) {
       logger.error({ err, regId: id, userId: user.id }, 'regularisations.get: error');
-      res
-        .status(500)
-        .json(errorEnvelope(ErrorCode.INTERNAL_ERROR, 'Failed to load regularisation.'));
+      res.status(500).json(errorEnvelope(ErrorCode.INTERNAL_ERROR, 'Failed to load regularisation.'));
     }
   },
 );
@@ -325,8 +296,13 @@ regularisationsRouter.post(
   validateBody(ApproveRegularisationRequestSchema),
   async (req: Request, res: Response): Promise<void> => {
     const user = req.user!;
-    const { id } = req.params;
+    const id = Number(req.params['id']);
     const body = req.body as { note?: string; version: number };
+
+    if (isNaN(id)) {
+      res.status(404).json(errorEnvelope(ErrorCode.NOT_FOUND, 'Regularisation not found.'));
+      return;
+    }
 
     try {
       const reg = await prisma.regularisationRequest.findUnique({
@@ -342,10 +318,8 @@ regularisationsRouter.post(
         return;
       }
 
-      // Authorisation: (Manager AND approverId == self) OR Admin
-      const isAdmin = user.role === 'Admin';
-      const isAssignedManager =
-        user.role === 'Manager' && reg.approverId === user.id;
+      const isAdmin = user.roleId === RoleId.Admin;
+      const isAssignedManager = user.roleId === RoleId.Manager && reg.approverId === user.id;
 
       if (!isAdmin && !isAssignedManager) {
         res.status(403).json(
@@ -354,18 +328,16 @@ regularisationsRouter.post(
         return;
       }
 
-      // Status check: only Pending can be approved
-      if (reg.status !== 'Pending') {
+      if (reg.status !== RegStatus.Pending) {
         res.status(400).json(
           errorEnvelope(
             ErrorCode.VALIDATION_FAILED,
-            `Regularisation is already ${reg.status.toLowerCase()} and cannot be approved.`,
+            `Regularisation has status ${reg.status} and cannot be approved.`,
           ),
         );
         return;
       }
 
-      // Optimistic concurrency check (BL-034)
       if (reg.version !== body.version) {
         res.status(409).json(
           errorEnvelope(
@@ -391,16 +363,14 @@ regularisationsRouter.post(
           user.id,
           body.note,
           tx,
-          { role: user.role, ip: req.ip ?? null },
+          { roleId: user.roleId, ip: req.ip ?? null },
         );
       });
 
       res.status(200).json({ data: formatRegularisation(updated) });
     } catch (err: unknown) {
       logger.error({ err, regId: id, userId: user.id }, 'regularisations.approve: error');
-      res
-        .status(500)
-        .json(errorEnvelope(ErrorCode.INTERNAL_ERROR, 'Failed to approve regularisation.'));
+      res.status(500).json(errorEnvelope(ErrorCode.INTERNAL_ERROR, 'Failed to approve regularisation.'));
     }
   },
 );
@@ -413,8 +383,13 @@ regularisationsRouter.post(
   validateBody(RejectRegularisationRequestSchema),
   async (req: Request, res: Response): Promise<void> => {
     const user = req.user!;
-    const { id } = req.params;
+    const id = Number(req.params['id']);
     const body = req.body as { note: string; version: number };
+
+    if (isNaN(id)) {
+      res.status(404).json(errorEnvelope(ErrorCode.NOT_FOUND, 'Regularisation not found.'));
+      return;
+    }
 
     try {
       const reg = await prisma.regularisationRequest.findUnique({
@@ -430,10 +405,8 @@ regularisationsRouter.post(
         return;
       }
 
-      // Authorisation: (Manager AND approverId == self) OR Admin
-      const isAdmin = user.role === 'Admin';
-      const isAssignedManager =
-        user.role === 'Manager' && reg.approverId === user.id;
+      const isAdmin = user.roleId === RoleId.Admin;
+      const isAssignedManager = user.roleId === RoleId.Manager && reg.approverId === user.id;
 
       if (!isAdmin && !isAssignedManager) {
         res.status(403).json(
@@ -442,18 +415,16 @@ regularisationsRouter.post(
         return;
       }
 
-      // Status check: only Pending can be rejected
-      if (reg.status !== 'Pending') {
+      if (reg.status !== RegStatus.Pending) {
         res.status(400).json(
           errorEnvelope(
             ErrorCode.VALIDATION_FAILED,
-            `Regularisation is already ${reg.status.toLowerCase()} and cannot be rejected.`,
+            `Regularisation has status ${reg.status} and cannot be rejected.`,
           ),
         );
         return;
       }
 
-      // Optimistic concurrency check (BL-034)
       if (reg.version !== body.version) {
         res.status(409).json(
           errorEnvelope(
@@ -471,16 +442,14 @@ regularisationsRouter.post(
           user.id,
           body.note,
           tx,
-          { role: user.role, ip: req.ip ?? null },
+          { roleId: user.roleId, ip: req.ip ?? null },
         );
       });
 
       res.status(200).json({ data: formatRegularisation(updated) });
     } catch (err: unknown) {
       logger.error({ err, regId: id, userId: user.id }, 'regularisations.reject: error');
-      res
-        .status(500)
-        .json(errorEnvelope(ErrorCode.INTERNAL_ERROR, 'Failed to reject regularisation.'));
+      res.status(500).json(errorEnvelope(ErrorCode.INTERNAL_ERROR, 'Failed to reject regularisation.'));
     }
   },
 );

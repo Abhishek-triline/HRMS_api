@@ -55,8 +55,8 @@ import { audit } from '../../../lib/audit.js';
 /** Build a minimal AttendanceRecord-like object for the mock. */
 function makeRecord(overrides: Record<string, unknown> = {}) {
   const base = {
-    id: 'rec-001',
-    employeeId: 'emp-001',
+    id: 1,
+    employeeId: 1001,
     date: new Date('2026-05-11T00:00:00.000Z'),
     status: 'Present',
     checkInTime: new Date('2026-05-11T03:30:00.000Z'), // 09:00 IST
@@ -106,12 +106,12 @@ describe('undoCheckOutForEmployee', () => {
     const rec = makeRecord({ checkOutTime, hoursWorkedMinutes: 130 });
     const tx = makeTx(rec);
 
-    const result = await undoCheckOutForEmployee('emp-001', NOW, tx as never);
+    const result = await undoCheckOutForEmployee(1001, NOW, tx as never);
 
     // update was called with the right nulls
     expect(tx.attendanceRecord.update).toHaveBeenCalledWith(
       expect.objectContaining({
-        where: { id: 'rec-001' },
+        where: { id: 1 },
         data: expect.objectContaining({
           checkOutTime: null,
           hoursWorkedMinutes: null,
@@ -129,7 +129,7 @@ describe('undoCheckOutForEmployee', () => {
       expect.objectContaining({
         action: 'attendance.check-out.undo',
         targetType: 'AttendanceRecord',
-        targetId: 'rec-001',
+        targetId: 1,
         before: expect.objectContaining({ checkOutTime: checkOutTime.toISOString() }),
         after: expect.objectContaining({ checkOutTime: null }),
       }),
@@ -142,14 +142,14 @@ describe('undoCheckOutForEmployee', () => {
     const rec = makeRecord({ checkInTime: null });
     const tx = makeTx(rec);
 
-    await expect(undoCheckOutForEmployee('emp-001', NOW, tx as never)).rejects.toMatchObject({
+    await expect(undoCheckOutForEmployee(1001, NOW, tx as never)).rejects.toMatchObject({
       httpStatus: 409,
       code: 'NOT_CHECKED_IN',
     });
 
     // Also covers the case where no record exists at all
     const txNull = makeTx(null);
-    await expect(undoCheckOutForEmployee('emp-001', NOW, txNull as never)).rejects.toMatchObject({
+    await expect(undoCheckOutForEmployee(1001, NOW, txNull as never)).rejects.toMatchObject({
       httpStatus: 409,
       code: 'NOT_CHECKED_IN',
     });
@@ -161,7 +161,7 @@ describe('undoCheckOutForEmployee', () => {
     const rec = makeRecord({ checkOutTime: null, hoursWorkedMinutes: null });
     const tx = makeTx(rec);
 
-    const result = await undoCheckOutForEmployee('emp-001', NOW, tx as never);
+    const result = await undoCheckOutForEmployee(1001, NOW, tx as never);
 
     expect(tx.attendanceRecord.update).not.toHaveBeenCalled();
     expect(result.record).toBe(rec);
@@ -175,7 +175,7 @@ describe('undoCheckOutForEmployee', () => {
     const rec = makeRecord({ checkOutTime, hoursWorkedMinutes: 120 });
     const tx = makeTx(rec);
 
-    await expect(undoCheckOutForEmployee('emp-001', NOW, tx as never)).rejects.toMatchObject({
+    await expect(undoCheckOutForEmployee(1001, NOW, tx as never)).rejects.toMatchObject({
       httpStatus: 409,
       code: 'UNDO_WINDOW_EXPIRED',
     });

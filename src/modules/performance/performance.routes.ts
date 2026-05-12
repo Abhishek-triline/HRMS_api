@@ -16,7 +16,6 @@
  *   POST   /reviews/:id/manager-rating           M-10   Manager or Admin
  *
  * Business rules enforced:
- *   BL-037  Mid-cycle joiner exclusion
  *   BL-038  Goal proposal window (SelfReview phase or within deadline)
  *   BL-039  Self-rating deadline
  *   BL-040  Manager-rating deadline + managerOverrodeSelf
@@ -47,7 +46,6 @@ import type {
   ReviewListQuery,
   DistributionBucket,
   MissingReviewItem,
-  PerformanceCycleSummary,
 } from '@nexora/contracts/performance';
 import { errorEnvelope, ErrorCode } from '@nexora/contracts/errors';
 import { requireSession } from '../../middleware/requireSession.js';
@@ -58,6 +56,11 @@ import { idempotencyKey } from '../../middleware/idempotencyKey.js';
 import { prisma } from '../../lib/prisma.js';
 import { logger } from '../../lib/logger.js';
 import { getSubordinateIds } from '../employees/hierarchy.js';
+import {
+  RoleId,
+  CycleStatus,
+  type AuditActorRoleValue,
+} from '../../lib/statusInt.js';
 import {
   createCycle,
   closeCycle,
@@ -70,7 +73,7 @@ import {
   shapeReviewDetail,
   cycleInclude,
   reviewInclude,
-  mapCycleStatusToDB,
+  mapCycleStatus,
   isServiceError,
 } from './performance.service.js';
 
@@ -87,7 +90,7 @@ function clientIp(req: Request): string {
 router.post(
   '/cycles',
   requireSession(),
-  requireRole('Admin'),
+  requireRole(RoleId.Admin),
   idempotencyKey(),
   validateBody(CreateCycleRequestSchema),
   async (req: Request, res: Response): Promise<void> => {
@@ -97,7 +100,7 @@ router.post(
 
     try {
       const result = await prisma.$transaction(async (tx) => {
-        return createCycle(body, actor.id, actor.role, ip, tx);
+        return createCycle(body, actor.id, actor.roleId as AuditActorRoleValue, ip, tx);
       });
 
       if (isServiceError(result)) {
@@ -130,7 +133,8 @@ router.get(
       const where: Record<string, any> = {};
 
       if (query.status) {
-        where['status'] = mapCycleStatusToDB(query.status);
+        // query.status is already an INT from the contract (z.coerce.number)
+        where['status'] = query.status;
       }
 
       if (query.fyStartFrom || query.fyStartTo) {
@@ -141,12 +145,15 @@ router.get(
       }
 
       if (query.cursor) {
-        const cursor = await prisma.performanceCycle.findUnique({
-          where: { id: query.cursor },
-          select: { createdAt: true },
-        });
-        if (cursor) {
-          where['createdAt'] = { lt: cursor.createdAt };
+        const cursorId = Number(query.cursor);
+        if (!isNaN(cursorId)) {
+          const cursorRow = await prisma.performanceCycle.findUnique({
+            where: { id: cursorId },
+            select: { createdAt: true },
+          });
+          if (cursorRow) {
+            where['createdAt'] = { lt: cursorRow.createdAt };
+          }
         }
       }
 
@@ -158,21 +165,16 @@ router.get(
 
       const hasNext = cycles.length > limit;
       const items = hasNext ? cycles.slice(0, limit) : cycles;
-      const nextCursor = hasNext ? items[items.length - 1]!.id : null;
+      const nextCursor = hasNext ? String(items[items.length - 1]!.id) : null;
 
-      const data: PerformanceCycleSummary[] = items.map((c) => ({
+      const data = items.map((c) => ({
         id: c.id,
         code: c.code,
         fyStart: c.fyStart.toISOString().split('T')[0]!,
         fyEnd: c.fyEnd.toISOString().split('T')[0]!,
-        status: c.status === 'SelfReview'
-          ? 'Self-Review'
-          : c.status === 'ManagerReview'
-          ? 'Manager-Review'
-          : (c.status as 'Open' | 'Closed'),
+        status: mapCycleStatus(c.status),
         selfReviewDeadline: c.selfReviewDeadline.toISOString().split('T')[0]!,
         managerReviewDeadline: c.managerReviewDeadline.toISOString().split('T')[0]!,
-        participants: c.participants,
         closedAt: c.closedAt ? c.closedAt.toISOString() : null,
       }));
 
@@ -191,12 +193,16 @@ router.get(
   '/cycles/:id',
   requireSession(),
   async (req: Request, res: Response): Promise<void> => {
-    const { id } = req.params as { id: string };
+    const cycleId = Number(req.params['id']);
+    if (isNaN(cycleId)) {
+      res.status(404).json(errorEnvelope(ErrorCode.NOT_FOUND, 'Cycle not found.'));
+      return;
+    }
     const actor = req.user!;
 
     try {
       const cycle = await prisma.performanceCycle.findUnique({
-        where: { id },
+        where: { id: cycleId },
         include: cycleInclude,
       });
 
@@ -207,21 +213,21 @@ router.get(
 
       // Build review filter based on role
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      let reviewWhere: Record<string, any> = { cycleId: id };
+      let reviewWhere: Record<string, any> = { cycleId };
 
-      if (actor.role === 'Manager') {
+      if (actor.roleId === RoleId.Manager) {
         // Manager sees reviews where they are the assigned manager OR their subordinates
         const subIds = await getSubordinateIds(actor.id);
         reviewWhere = {
-          cycleId: id,
+          cycleId,
           OR: [
             { managerId: actor.id },
             { employeeId: { in: subIds } },
           ],
         };
-      } else if (actor.role === 'Employee' || actor.role === 'PayrollOfficer') {
+      } else if (actor.roleId === RoleId.Employee || actor.roleId === RoleId.PayrollOfficer) {
         // Employee sees only own review
-        reviewWhere = { cycleId: id, employeeId: actor.id };
+        reviewWhere = { cycleId, employeeId: actor.id };
       }
       // Admin: no additional filter
 
@@ -250,18 +256,22 @@ router.get(
 router.post(
   '/cycles/:id/close',
   requireSession(),
-  requireRole('Admin'),
+  requireRole(RoleId.Admin),
   idempotencyKey(),
   validateBody(CloseCycleRequestSchema),
   async (req: Request, res: Response): Promise<void> => {
-    const { id } = req.params as { id: string };
+    const cycleId = Number(req.params['id']);
+    if (isNaN(cycleId)) {
+      res.status(404).json(errorEnvelope(ErrorCode.NOT_FOUND, 'Cycle not found.'));
+      return;
+    }
     const body = req.body as CloseCycleRequest;
     const actor = req.user!;
     const ip = clientIp(req);
 
     try {
       const result = await prisma.$transaction(async (tx) => {
-        return closeCycle(id, body.version, actor.id, actor.role, ip, tx);
+        return closeCycle(cycleId, body.version, actor.id, actor.roleId as AuditActorRoleValue, ip, tx);
       });
 
       if (isServiceError(result)) {
@@ -283,13 +293,17 @@ router.post(
 router.get(
   '/cycles/:id/reports/distribution',
   requireSession(),
-  requireRole('Admin'),
+  requireRole(RoleId.Admin),
   async (req: Request, res: Response): Promise<void> => {
-    const { id } = req.params as { id: string };
+    const cycleId = Number(req.params['id']);
+    if (isNaN(cycleId)) {
+      res.status(404).json(errorEnvelope(ErrorCode.NOT_FOUND, 'Cycle not found.'));
+      return;
+    }
 
     try {
       const cycle = await prisma.performanceCycle.findUnique({
-        where: { id },
+        where: { id: cycleId },
         select: { id: true, code: true },
       });
 
@@ -300,9 +314,13 @@ router.get(
 
       // Fetch all reviews with employee department + finalRating
       const reviews = await prisma.performanceReview.findMany({
-        where: { cycleId: id, isMidCycleJoiner: false },
+        where: { cycleId },
         include: {
-          employee: { select: { department: true } },
+          employee: {
+            select: {
+              department: { select: { name: true } },
+            },
+          },
         },
       });
 
@@ -310,7 +328,7 @@ router.get(
       const deptMap = new Map<string, { r1: number; r2: number; r3: number; r4: number; r5: number; notRated: number }>();
 
       for (const r of reviews) {
-        const dept = r.employee.department ?? 'Unassigned';
+        const dept = r.employee.department?.name ?? 'Unassigned';
         if (!deptMap.has(dept)) {
           deptMap.set(dept, { r1: 0, r2: 0, r3: 0, r4: 0, r5: 0, notRated: 0 });
         }
@@ -354,13 +372,17 @@ router.get(
 router.get(
   '/cycles/:id/reports/missing',
   requireSession(),
-  requireRole('Admin'),
+  requireRole(RoleId.Admin),
   async (req: Request, res: Response): Promise<void> => {
-    const { id } = req.params as { id: string };
+    const cycleId = Number(req.params['id']);
+    if (isNaN(cycleId)) {
+      res.status(404).json(errorEnvelope(ErrorCode.NOT_FOUND, 'Cycle not found.'));
+      return;
+    }
 
     try {
       const cycle = await prisma.performanceCycle.findUnique({
-        where: { id },
+        where: { id: cycleId },
         select: { id: true, code: true },
       });
 
@@ -369,14 +391,18 @@ router.get(
         return;
       }
 
-      // Reviews with missing manager rating (managerSubmittedAt IS NULL).
-      // BUG-PERF-001 fix — mid-cycle joiners (BL-037) are excluded from
-      // the cycle's rating workflow and must NOT appear in this report.
-      // Mirrors the distribution-report filter.
+      // Reviews where managerRating is null (no manager rating submitted yet)
       const reviews = await prisma.performanceReview.findMany({
-        where: { cycleId: id, managerSubmittedAt: null, isMidCycleJoiner: false },
+        where: { cycleId, managerRating: null },
         include: {
-          employee: { select: { name: true, code: true, department: true, designation: true } },
+          employee: {
+            select: {
+              name: true,
+              code: true,
+              department: { select: { name: true } },
+              designation: { select: { name: true } },
+            },
+          },
           manager: { select: { name: true } },
         },
         orderBy: { createdAt: 'asc' },
@@ -387,11 +413,11 @@ router.get(
         employeeId: r.employeeId,
         employeeName: r.employee.name,
         employeeCode: r.employee.code,
-        department: r.employee.department ?? null,
-        designation: r.employee.designation ?? null,
+        department: r.employee.department?.name ?? null,
+        designation: r.employee.designation?.name ?? null,
         managerId: r.managerId ?? null,
         managerName: r.manager?.name ?? null,
-        selfSubmitted: r.selfSubmittedAt !== null,
+        selfSubmitted: r.selfRating !== null,
         managerSubmitted: false,
       }));
 
@@ -422,20 +448,21 @@ router.get(
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const where: Record<string, any> = {};
 
-      if (query.cycleId) where['cycleId'] = query.cycleId;
+      if (query.cycleId) where['cycleId'] = Number(query.cycleId);
 
-      if (actor.role === 'Admin') {
+      if (actor.roleId === RoleId.Admin) {
         // Admin sees all — apply optional filters
-        if (query.employeeId) where['employeeId'] = query.employeeId;
-        if (query.managerId) where['managerId'] = query.managerId;
-      } else if (actor.role === 'Manager') {
+        if (query.employeeId) where['employeeId'] = Number(query.employeeId);
+        if (query.managerId) where['managerId'] = Number(query.managerId);
+      } else if (actor.roleId === RoleId.Manager) {
         // Manager sees reviews where managerId=self OR employee in subordinates
         const subIds = await getSubordinateIds(actor.id);
 
         if (query.employeeId) {
+          const empId = Number(query.employeeId);
           // Must still be scoped to actor's visibility
-          if (query.employeeId === actor.id || subIds.includes(query.employeeId)) {
-            where['employeeId'] = query.employeeId;
+          if (empId === actor.id || subIds.includes(empId)) {
+            where['employeeId'] = empId;
           } else {
             // Not in scope — return empty
             res.status(200).json({ data: [], nextCursor: null });
@@ -449,8 +476,9 @@ router.get(
         }
 
         if (query.managerId) {
+          const mgId = Number(query.managerId);
           // Only allow filtering by own managerId
-          if (query.managerId !== actor.id) {
+          if (mgId !== actor.id) {
             res.status(200).json({ data: [], nextCursor: null });
             return;
           }
@@ -463,12 +491,15 @@ router.get(
       }
 
       if (query.cursor) {
-        const cursor = await prisma.performanceReview.findFirst({
-          where: { id: query.cursor },
-          select: { createdAt: true },
-        });
-        if (cursor) {
-          where['createdAt'] = { lt: cursor.createdAt };
+        const cursorId = Number(query.cursor);
+        if (!isNaN(cursorId)) {
+          const cursorRow = await prisma.performanceReview.findFirst({
+            where: { id: cursorId },
+            select: { createdAt: true },
+          });
+          if (cursorRow) {
+            where['createdAt'] = { lt: cursorRow.createdAt };
+          }
         }
       }
 
@@ -481,7 +512,7 @@ router.get(
 
       const hasNext = reviews.length > limit;
       const items = hasNext ? reviews.slice(0, limit) : reviews;
-      const nextCursor = hasNext ? items[items.length - 1]!.id : null;
+      const nextCursor = hasNext ? String(items[items.length - 1]!.id) : null;
 
       res.status(200).json({
         data: items.map((r) => shapeReviewSummary(r)),
@@ -501,12 +532,16 @@ router.get(
   '/reviews/:id',
   requireSession(),
   async (req: Request, res: Response): Promise<void> => {
-    const { id } = req.params as { id: string };
+    const reviewId = Number(req.params['id']);
+    if (isNaN(reviewId)) {
+      res.status(404).json(errorEnvelope(ErrorCode.NOT_FOUND, 'Review not found.'));
+      return;
+    }
     const actor = req.user!;
 
     try {
       const review = await prisma.performanceReview.findUnique({
-        where: { id },
+        where: { id: reviewId },
         include: reviewInclude,
       });
 
@@ -518,11 +553,11 @@ router.get(
       // Visibility check
       let canView = false;
 
-      if (actor.role === 'Admin') {
+      if (actor.roleId === RoleId.Admin) {
         canView = true;
       } else if (actor.id === review.employeeId) {
         canView = true;
-      } else if (actor.role === 'Manager') {
+      } else if (actor.roleId === RoleId.Manager) {
         if (review.managerId === actor.id) {
           canView = true;
         } else {
@@ -551,18 +586,22 @@ router.get(
 router.post(
   '/reviews/:id/goals',
   requireSession(),
-  requireRole('Admin', 'Manager'),
+  requireRole(RoleId.Admin, RoleId.Manager),
   idempotencyKey(),
   validateBody(CreateGoalRequestSchema),
   async (req: Request, res: Response): Promise<void> => {
-    const { id } = req.params as { id: string };
+    const reviewId = Number(req.params['id']);
+    if (isNaN(reviewId)) {
+      res.status(404).json(errorEnvelope(ErrorCode.NOT_FOUND, 'Review not found.'));
+      return;
+    }
     const body = req.body as CreateGoalRequest;
     const actor = req.user!;
     const ip = clientIp(req);
 
     try {
       const result = await prisma.$transaction(async (tx) => {
-        return createGoal(id, body.text, actor.id, actor.role, ip, tx);
+        return createGoal(reviewId, body.text, actor.id, actor.roleId as AuditActorRoleValue, ip, tx);
       });
 
       if (isServiceError(result)) {
@@ -587,14 +626,18 @@ router.post(
   idempotencyKey(),
   validateBody(ProposeGoalRequestSchema),
   async (req: Request, res: Response): Promise<void> => {
-    const { id } = req.params as { id: string };
+    const reviewId = Number(req.params['id']);
+    if (isNaN(reviewId)) {
+      res.status(404).json(errorEnvelope(ErrorCode.NOT_FOUND, 'Review not found.'));
+      return;
+    }
     const body = req.body as ProposeGoalRequest;
     const actor = req.user!;
     const ip = clientIp(req);
 
     try {
       const result = await prisma.$transaction(async (tx) => {
-        return proposeGoal(id, body.text, actor.id, actor.role, ip, tx);
+        return proposeGoal(reviewId, body.text, actor.id, actor.roleId as AuditActorRoleValue, ip, tx);
       });
 
       if (isServiceError(result)) {
@@ -619,7 +662,11 @@ router.patch(
   idempotencyKey(),
   validateBody(SelfRatingRequestSchema),
   async (req: Request, res: Response): Promise<void> => {
-    const { id } = req.params as { id: string };
+    const reviewId = Number(req.params['id']);
+    if (isNaN(reviewId)) {
+      res.status(404).json(errorEnvelope(ErrorCode.NOT_FOUND, 'Review not found.'));
+      return;
+    }
     const body = req.body as SelfRatingRequest;
     const actor = req.user!;
     const ip = clientIp(req);
@@ -627,12 +674,12 @@ router.patch(
     try {
       const result = await prisma.$transaction(async (tx) => {
         return submitSelfRating(
-          id,
+          reviewId,
           body.selfRating,
           body.selfNote,
           body.version,
           actor.id,
-          actor.role,
+          actor.roleId as AuditActorRoleValue,
           ip,
           tx,
         );
@@ -657,11 +704,15 @@ router.patch(
 router.post(
   '/reviews/:id/manager-rating',
   requireSession(),
-  requireRole('Admin', 'Manager'),
+  requireRole(RoleId.Admin, RoleId.Manager),
   idempotencyKey(),
   validateBody(ManagerRatingRequestSchema),
   async (req: Request, res: Response): Promise<void> => {
-    const { id } = req.params as { id: string };
+    const reviewId = Number(req.params['id']);
+    if (isNaN(reviewId)) {
+      res.status(404).json(errorEnvelope(ErrorCode.NOT_FOUND, 'Review not found.'));
+      return;
+    }
     const body = req.body as ManagerRatingRequest;
     const actor = req.user!;
     const ip = clientIp(req);
@@ -669,13 +720,13 @@ router.post(
     try {
       const result = await prisma.$transaction(async (tx) => {
         return submitManagerRating(
-          id,
+          reviewId,
           body.managerRating,
           body.managerNote,
           body.goals,
           body.version,
           actor.id,
-          actor.role,
+          actor.roleId as AuditActorRoleValue,
           ip,
           tx,
         );

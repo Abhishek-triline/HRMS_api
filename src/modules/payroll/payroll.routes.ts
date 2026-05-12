@@ -1,17 +1,14 @@
 /**
- * Payroll routes — Phase 4.
+ * Payroll routes — v2 schema (INT IDs, INT status codes).
  *
  * Mounted at /api/v1/ (three sub-routers merged here for clean grouping):
  *   payrollRouter   → /api/v1/payroll/*
  *   payslipsRouter  → /api/v1/payslips/*
  *   taxConfigRouter → /api/v1/config/tax
  *
- * Run state model (simplified from SRS — see implementation choice note):
- *   STATUS GATE: Run is created with status='Review' (skipping Draft).
- *   Rationale: The SRS uses Draft and Review loosely; what matters for BL-036a
- *   is that PO can edit tax until Finalise. We create runs as 'Review' so the
- *   PO can immediately edit payslip taxes. 'Draft' is reserved if a future
- *   phase needs a pre-compute staging state.
+ * Run state model (simplified from SRS):
+ *   STATUS GATE: Run is created with status=Review (INT 2).
+ *   Rationale: PO can edit tax until Finalise. 'Draft' is reserved for future phases.
  *
  * BL-034 concurrency guard: finalise and reverse both use SELECT … FOR UPDATE
  * inside a Prisma interactive transaction to prevent two simultaneous callers
@@ -20,7 +17,15 @@
  * BL-031 / BL-032: finalised payslips' financial fields are NEVER updated;
  * reversals create new rows. The back-link field `reversedByPayslipId` IS
  * set on the original payslip by the reversal handler — that's a schema-
- * intended pointer, not a financial mutation (SEC-004-P4 doc clarification).
+ * intended pointer, not a financial mutation.
+ *
+ * v2 schema notes:
+ *   - All IDs are INT (number).
+ *   - PayrollRun.status and Payslip.status are INT (PayrollRunStatus constants).
+ *   - PayrollRun has no createdAt — use initiatedAt.
+ *   - PayrollRun has no reversalOf relation — only reversalOfRunId INT.
+ *   - Payslip.employee has relation objects for department/designation.
+ *   - employee.role → employee.roleId (INT).
  */
 
 import { Router } from 'express';
@@ -56,6 +61,12 @@ import {
 import { acquireRunLock } from './concurrencyGuard.js';
 import { streamPayslipPDF } from './payslip.pdf.js';
 import { notify } from '../../lib/notifications.js';
+import {
+  RoleId,
+  EmployeeStatus,
+  PayrollRunStatus,
+  type AuditActorRoleValue,
+} from '../../lib/statusInt.js';
 
 // ── Routers ───────────────────────────────────────────────────────────────────
 
@@ -65,29 +76,40 @@ export const taxConfigRouter = Router();
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+/** Map INT PayrollRunStatus to its display string (for PDF labels, etc.). */
+function mapRunStatusToString(status: number): string {
+  switch (status) {
+    case PayrollRunStatus.Draft: return 'Draft';
+    case PayrollRunStatus.Review: return 'Review';
+    case PayrollRunStatus.Finalised: return 'Finalised';
+    case PayrollRunStatus.Reversed: return 'Reversed';
+    default: return 'Unknown';
+  }
+}
+
 /** Format a PayrollRun row for the API response. */
 function formatRun(
   run: {
-    id: string;
+    id: number;
     code: string;
     month: number;
     year: number;
-    status: string;
+    status: number;
     workingDays: number;
     periodStart: Date;
     periodEnd: Date;
-    initiatedBy: string;
+    initiatedBy: number;
+    initiatedAt: Date;
     initiator: { name: string };
-    finalisedBy: string | null;
+    finalisedBy: number | null;
     finaliser?: { name: string } | null;
     finalisedAt: Date | null;
-    reversedBy: string | null;
+    reversedBy: number | null;
     reverser?: { name: string } | null;
     reversedAt: Date | null;
     reversalReason: string | null;
-    reversalOfRunId: string | null;
-    createdAt: Date;
-    updatedAt: Date;
+    reversalOfRunId: number | null;
+    updatedAt?: Date;
     version: number;
     payslips?: Array<{
       grossPaise: number;
@@ -119,7 +141,7 @@ function formatRun(
     periodEnd: run.periodEnd.toISOString().split('T')[0]!,
     initiatedBy: run.initiatedBy,
     initiatedByName: run.initiator.name,
-    initiatedAt: run.createdAt.toISOString(),
+    initiatedAt: run.initiatedAt.toISOString(),
     finalisedBy: run.finalisedBy,
     finalisedByName: run.finaliser?.name ?? null,
     finalisedAt: run.finalisedAt?.toISOString() ?? null,
@@ -130,8 +152,7 @@ function formatRun(
     reversalOfRunId: run.reversalOfRunId,
     employeeCount: slips.length,
     ...totals,
-    createdAt: run.createdAt.toISOString(),
-    updatedAt: run.updatedAt.toISOString(),
+    updatedAt: run.updatedAt?.toISOString() ?? run.initiatedAt.toISOString(),
     version: run.version,
   };
 }
@@ -139,15 +160,20 @@ function formatRun(
 /** Format a Payslip row for the API response. */
 function formatPayslip(
   slip: {
-    id: string;
+    id: number;
     code: string;
-    runId: string;
+    runId: number;
     run: { code: string };
-    employeeId: string;
-    employee: { name: string; code: string; designation: string | null; department: string | null };
+    employeeId: number;
+    employee: {
+      name: string;
+      code: string;
+      designation: { name: string } | null;
+      department: { name: string } | null;
+    };
     month: number;
     year: number;
-    status: string;
+    status: number;
     periodStart: Date;
     periodEnd: Date;
     workingDays: number;
@@ -163,10 +189,10 @@ function formatPayslip(
     netPayPaise: number;
     encashmentDays?: number;
     encashmentPaise?: number;
-    encashmentId?: string | null;
+    encashmentId?: number | null;
     finalisedAt: Date | null;
-    reversalOfPayslipId: string | null;
-    reversedByPayslipId: string | null;
+    reversalOfPayslipId: number | null;
+    reversedByPayslipId: number | null;
     createdAt: Date;
     updatedAt: Date;
     version: number;
@@ -180,8 +206,8 @@ function formatPayslip(
     employeeId: slip.employeeId,
     employeeName: slip.employee.name,
     employeeCode: slip.employee.code,
-    designation: slip.employee.designation,
-    department: slip.employee.department,
+    designation: slip.employee.designation?.name ?? null,
+    department: slip.employee.department?.name ?? null,
     month: slip.month,
     year: slip.year,
     status: slip.status,
@@ -210,6 +236,8 @@ function formatPayslip(
   };
 }
 
+import type { Prisma } from '@prisma/client';
+
 const runInclude = {
   initiator: { select: { name: true } },
   finaliser: { select: { name: true } },
@@ -222,19 +250,26 @@ const runInclude = {
       netPayPaise: true,
     },
   },
-} as const;
+} as const satisfies Prisma.PayrollRunInclude;
 
 const slipInclude = {
   run: { select: { code: true } },
-  employee: { select: { name: true, code: true, designation: true, department: true } },
-} as const;
+  employee: {
+    select: {
+      name: true,
+      code: true,
+      designation: { select: { name: true } },
+      department: { select: { name: true } },
+    },
+  },
+} as const satisfies Prisma.PayslipInclude;
 
 // ── POST /payroll/runs ────────────────────────────────────────────────────────
 
 payrollRouter.post(
   '/runs',
   requireSession(),
-  requireRole('Admin', 'PayrollOfficer'),
+  requireRole(RoleId.Admin, RoleId.PayrollOfficer),
   idempotencyKey(),
   validateBody(CreatePayrollRunRequestSchema),
   async (req: Request, res: Response): Promise<void> => {
@@ -252,17 +287,12 @@ payrollRouter.post(
     try {
       result = await prisma.$transaction(async (tx) => {
         // Check for an existing non-Reversed run for this month+year.
-        // SEC-P8-007: The application-layer check here is the first line of defense.
-        // The DB unique constraint @@unique([month, year, reversalOfRunId]) on payroll_runs
-        // is the defense-in-depth — if two concurrent requests both pass this check before
-        // either inserts, exactly one wins and the other gets a Prisma P2002 unique-constraint
-        // violation which is caught below and returned as RUN_ALREADY_EXISTS.
         const existing = await tx.payrollRun.findFirst({
           where: {
             month,
             year,
             reversalOfRunId: null,
-            status: { not: 'Reversed' },
+            status: { not: PayrollRunStatus.Reversed },
           },
         });
 
@@ -295,7 +325,7 @@ payrollRouter.post(
             code: runCode,
             month,
             year,
-            status: 'Review',
+            status: PayrollRunStatus.Review,
             workingDays,
             periodStart,
             periodEnd,
@@ -306,7 +336,11 @@ payrollRouter.post(
 
         // Fetch all Active or On-Notice employees
         const employees = await tx.employee.findMany({
-          where: { status: { in: ['Active', 'OnNotice'] } },
+          where: {
+            status: {
+              in: [EmployeeStatus.Active, EmployeeStatus.OnNotice],
+            },
+          },
         });
 
         let payslipCount = 0;
@@ -323,7 +357,7 @@ payrollRouter.post(
                 employeeId: emp.id,
                 month: values.month,
                 year: values.year,
-                status: 'Review',
+                status: PayrollRunStatus.Review,
                 periodStart: values.periodStart,
                 periodEnd: values.periodEnd,
                 workingDays: values.workingDays,
@@ -364,7 +398,7 @@ payrollRouter.post(
         await audit({
           tx,
           actorId: user.id,
-          actorRole: user.role,
+          actorRole: user.roleId as AuditActorRoleValue,
           actorIp: req.ip ?? null,
           action: 'payroll.run.create',
           targetType: 'PayrollRun',
@@ -376,7 +410,7 @@ payrollRouter.post(
             month,
             year,
             workingDays,
-            status: 'Review',
+            status: PayrollRunStatus.Review,
             payslipCount,
             skipped,
           },
@@ -392,9 +426,6 @@ payrollRouter.post(
           .json(errorEnvelope(txErr.code, txErr.message, { ruleId: txErr.ruleId, details: txErr.details }));
         return;
       }
-      // SEC-P8-007: DB unique constraint fallback — two concurrent creates raced past the
-      // application-layer check. The DB unique index on (month, year, reversalOfRunId) caught
-      // the duplicate. Return a named RUN_ALREADY_EXISTS rather than a 500.
       const prismaErr = err as { code?: string };
       if (prismaErr.code === 'P2002') {
         res.status(409).json(
@@ -421,7 +452,7 @@ payrollRouter.post(
 
     // Notify all PayrollOfficer employees about the new run (batched, outside tx)
     const payrollOfficers = await prisma.employee.findMany({
-      where: { role: 'PayrollOfficer', status: 'Active' },
+      where: { roleId: RoleId.PayrollOfficer, status: EmployeeStatus.Active },
       select: { id: true },
     });
     if (payrollOfficers.length > 0) {
@@ -437,7 +468,7 @@ payrollRouter.post(
 
     // Notify all Active employees that payroll is being processed
     const activeEmployees = await prisma.employee.findMany({
-      where: { status: { in: ['Active', 'OnNotice'] } },
+      where: { status: { in: [EmployeeStatus.Active, EmployeeStatus.OnNotice] } },
       select: { id: true },
     });
     if (activeEmployees.length > 0) {
@@ -464,25 +495,25 @@ payrollRouter.post(
 payrollRouter.get(
   '/runs',
   requireSession(),
-  requireRole('Admin', 'PayrollOfficer'),
+  requireRole(RoleId.Admin, RoleId.PayrollOfficer),
   validateQuery(PayrollRunListQuerySchema),
   async (req: Request, res: Response): Promise<void> => {
     const { year, status, cursor, limit } = req.query as {
-      year?: number;
+      year?: string;
       status?: string;
       cursor?: string;
-      limit?: number;
+      limit?: string;
     };
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const where: Record<string, any> = {};
     if (year) where['year'] = Number(year);
-    if (status) where['status'] = status;
-    if (cursor) where['id'] = { gt: cursor };
+    if (status) where['status'] = Number(status);
+    if (cursor) where['id'] = { gt: Number(cursor) };
 
     const runs = await prisma.payrollRun.findMany({
       where,
-      orderBy: [{ year: 'desc' }, { month: 'desc' }, { createdAt: 'desc' }],
+      orderBy: [{ year: 'desc' }, { month: 'desc' }, { initiatedAt: 'desc' }],
       take: (Number(limit) || 20) + 1,
       include: {
         initiator: { select: { name: true } },
@@ -499,7 +530,7 @@ payrollRouter.get(
 
     const hasMore = runs.length > (Number(limit) || 20);
     const page = hasMore ? runs.slice(0, Number(limit) || 20) : runs;
-    const nextCursor = hasMore ? (page[page.length - 1]?.id ?? null) : null;
+    const nextCursor = hasMore ? String(page[page.length - 1]?.id ?? '') : null;
 
     const formatted = page.map((r) => ({
       id: r.id,
@@ -513,7 +544,7 @@ payrollRouter.get(
       totalGrossPaise: r.payslips.reduce((s, p) => s + p.grossPaise, 0),
       totalNetPaise: r.payslips.reduce((s, p) => s + p.netPayPaise, 0),
       reversalOfRunId: r.reversalOfRunId,
-      createdAt: r.createdAt.toISOString(),
+      initiatedAt: r.initiatedAt.toISOString(),
     }));
 
     res.status(200).json({ data: formatted, nextCursor });
@@ -525,12 +556,16 @@ payrollRouter.get(
 payrollRouter.get(
   '/runs/:id',
   requireSession(),
-  requireRole('Admin', 'PayrollOfficer'),
+  requireRole(RoleId.Admin, RoleId.PayrollOfficer),
   async (req: Request, res: Response): Promise<void> => {
-    const id = req.params['id'] as string;
+    const runId = Number(req.params['id']);
+    if (isNaN(runId)) {
+      res.status(404).json(errorEnvelope(ErrorCode.NOT_FOUND, 'Payroll run not found.'));
+      return;
+    }
 
     const run = await prisma.payrollRun.findUnique({
-      where: { id },
+      where: { id: runId },
       include: {
         ...runInclude,
         payslips: {
@@ -584,12 +619,16 @@ payrollRouter.get(
 payrollRouter.post(
   '/runs/:id/finalise',
   requireSession(),
-  requireRole('Admin', 'PayrollOfficer'),
+  requireRole(RoleId.Admin, RoleId.PayrollOfficer),
   idempotencyKey(),
   validateBody(FinaliseRunRequestSchema),
   async (req: Request, res: Response): Promise<void> => {
     const user = req.user!;
-    const id = req.params['id'] as string;
+    const runId = Number(req.params['id']);
+    if (isNaN(runId)) {
+      res.status(404).json(errorEnvelope(ErrorCode.NOT_FOUND, 'Payroll run not found.'));
+      return;
+    }
     const { version } = req.body as { confirm: 'FINALISE'; version: number };
 
     let finalisedRun;
@@ -597,7 +636,7 @@ payrollRouter.post(
     try {
       finalisedRun = await prisma.$transaction(async (tx) => {
         // BL-034: acquire row-level lock
-        const locked = await acquireRunLock(id, tx);
+        const locked = await acquireRunLock(runId, tx);
 
         if (!locked) {
           const e = new Error('Payroll run not found.') as Error & { statusCode: number; code: string };
@@ -607,7 +646,7 @@ payrollRouter.post(
         }
 
         // Re-check status post-lock
-        if (locked.status === 'Finalised') {
+        if (locked.status === PayrollRunStatus.Finalised) {
           // Another caller already finalised this run
           const winner = await tx.employee.findUnique({
             where: { id: locked.finalisedBy! },
@@ -631,8 +670,11 @@ payrollRouter.post(
           throw e;
         }
 
-        if (locked.status !== 'Review' && locked.status !== 'Draft') {
-          const e = new Error(`Run cannot be finalised from status '${locked.status}'.`) as Error & {
+        if (
+          locked.status !== PayrollRunStatus.Review &&
+          locked.status !== PayrollRunStatus.Draft
+        ) {
+          const e = new Error(`Run cannot be finalised from this status.`) as Error & {
             statusCode: number;
             code: string;
           };
@@ -656,9 +698,9 @@ payrollRouter.post(
 
         // Update run status
         const updated = await tx.payrollRun.update({
-          where: { id },
+          where: { id: runId },
           data: {
-            status: 'Finalised',
+            status: PayrollRunStatus.Finalised,
             finalisedBy: user.id,
             finalisedAt: now,
             version: { increment: 1 },
@@ -668,9 +710,9 @@ payrollRouter.post(
 
         // Update all payslips (BL-031: they become immutable after this)
         await tx.payslip.updateMany({
-          where: { runId: id },
+          where: { runId },
           data: {
-            status: 'Finalised',
+            status: PayrollRunStatus.Finalised,
             finalisedAt: now,
           },
         });
@@ -678,14 +720,14 @@ payrollRouter.post(
         await audit({
           tx,
           actorId: user.id,
-          actorRole: user.role,
+          actorRole: user.roleId as AuditActorRoleValue,
           actorIp: req.ip ?? null,
           action: 'payroll.run.finalise',
           targetType: 'PayrollRun',
-          targetId: id,
+          targetId: runId,
           module: 'payroll',
           before: { status: locked.status, version: locked.version },
-          after: { status: 'Finalised', finalisedAt: now.toISOString(), finalisedBy: user.id },
+          after: { status: PayrollRunStatus.Finalised, finalisedAt: now.toISOString(), finalisedBy: user.id },
         });
 
         return updated;
@@ -713,18 +755,17 @@ payrollRouter.post(
 
     // Re-fetch with aggregates
     const fullRun = await prisma.payrollRun.findUnique({
-      where: { id },
+      where: { id: runId },
       include: runInclude,
     });
 
     // Notify all employees whose payslip was in this run that it's ready
     const finalizedPayslips = await prisma.payslip.findMany({
-      where: { runId: id, status: 'Finalised', reversalOfPayslipId: null },
+      where: { runId, status: PayrollRunStatus.Finalised, reversalOfPayslipId: null },
       select: { id: true, employeeId: true, month: true, year: true },
     });
 
     if (finalizedPayslips.length > 0) {
-      // Fan-out: one notification per employee payslip
       const monthLabel = new Date(finalizedPayslips[0]!.year, finalizedPayslips[0]!.month - 1, 1)
         .toLocaleString('en-IN', { month: 'long', year: 'numeric' });
 
@@ -750,12 +791,16 @@ payrollRouter.post(
 payrollRouter.post(
   '/runs/:id/reverse',
   requireSession(),
-  requireRole('Admin'),  // BL-033: only Admin can reverse
+  requireRole(RoleId.Admin),  // BL-033: only Admin can reverse
   idempotencyKey(),
   validateBody(ReverseRunRequestSchema),
   async (req: Request, res: Response): Promise<void> => {
     const user = req.user!;
-    const sourceId = req.params['id'] as string;
+    const sourceId = Number(req.params['id']);
+    if (isNaN(sourceId)) {
+      res.status(404).json(errorEnvelope(ErrorCode.NOT_FOUND, 'Payroll run not found.'));
+      return;
+    }
     const { reason } = req.body as { confirm: 'REVERSE'; reason: string };
 
     let result;
@@ -772,9 +817,9 @@ payrollRouter.post(
           throw e;
         }
 
-        if (locked.status !== 'Finalised') {
+        if (locked.status !== PayrollRunStatus.Finalised) {
           const e = new Error(
-            `Only Finalised runs can be reversed. Current status: '${locked.status}'.`,
+            `Only Finalised runs can be reversed.`,
           ) as Error & { statusCode: number; code: string };
           e.statusCode = 409;
           e.code = ErrorCode.VALIDATION_FAILED;
@@ -808,7 +853,7 @@ payrollRouter.post(
             code: reversalCode,
             month: sourceRun.month,
             year: sourceRun.year,
-            status: 'Reversed',
+            status: PayrollRunStatus.Reversed,
             workingDays: sourceRun.workingDays,
             periodStart: sourceRun.periodStart,
             periodEnd: sourceRun.periodEnd,
@@ -837,8 +882,6 @@ payrollRouter.post(
           );
 
           // Create reversal payslip (identical money values — UI/PO reads signs)
-          // BL-LE-11: for payslips with encashment, emit negative encashmentPaise
-          // on the reversal payslip. Balance is NOT restored.
           const revSlip = await tx.payslip.create({
             data: {
               code: revSlipCode,
@@ -846,7 +889,7 @@ payrollRouter.post(
               employeeId: slip.employeeId,
               month: slip.month,
               year: slip.year,
-              status: 'Reversed',
+              status: PayrollRunStatus.Reversed,
               periodStart: slip.periodStart,
               periodEnd: slip.periodEnd,
               workingDays: slip.workingDays,
@@ -863,8 +906,6 @@ payrollRouter.post(
               finalisedAt: slip.finalisedAt,
               reversalOfPayslipId: slip.id,
               // BL-LE-11: negative encashment line on reversal payslip
-              // (The encashmentId FK is NOT carried to reversal — the FK stays on the
-              // original payslip. The reversal payslip just carries the negative amounts.)
               encashmentDays: slip.encashmentDays,
               encashmentPaise: -(slip.encashmentPaise),  // negative = money returned
               version: 0,
@@ -888,7 +929,7 @@ payrollRouter.post(
         await audit({
           tx,
           actorId: user.id,
-          actorRole: user.role,
+          actorRole: user.roleId as AuditActorRoleValue,
           actorIp: req.ip ?? null,
           action: 'payroll.run.reverse',
           targetType: 'PayrollRun',
@@ -927,7 +968,10 @@ payrollRouter.post(
 
     // Notify Admins + affected employees about the reversal
     const [admins, reversalPayslips] = await Promise.all([
-      prisma.employee.findMany({ where: { role: 'Admin', status: 'Active' }, select: { id: true } }),
+      prisma.employee.findMany({
+        where: { roleId: RoleId.Admin, status: EmployeeStatus.Active },
+        select: { id: true },
+      }),
       prisma.payslip.findMany({
         where: { runId: result.reversalRun.id },
         select: { employeeId: true },
@@ -964,15 +1008,15 @@ payrollRouter.post(
 payrollRouter.get(
   '/reversals',
   requireSession(),
-  requireRole('Admin', 'PayrollOfficer'),
+  requireRole(RoleId.Admin, RoleId.PayrollOfficer),
   validateQuery(PaginationQuerySchema),
   async (req: Request, res: Response): Promise<void> => {
-    const { cursor, limit } = req.query as { cursor?: string; limit?: number };
+    const { cursor, limit } = req.query as { cursor?: string; limit?: string };
     const take = (Number(limit) || 20) + 1;
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const where: Record<string, any> = { reversalOfRunId: { not: null } };
-    if (cursor) where['id'] = { gt: cursor };
+    if (cursor) where['id'] = { gt: Number(cursor) };
 
     const reversals = await prisma.payrollRun.findMany({
       where,
@@ -980,28 +1024,39 @@ payrollRouter.get(
       take,
       include: {
         reverser: { select: { name: true } },
-        reversalOf: { select: { code: true } },
         payslips: { select: { netPayPaise: true } },
       },
     });
 
     const hasMore = reversals.length > (Number(limit) || 20);
     const page = hasMore ? reversals.slice(0, Number(limit) || 20) : reversals;
-    const nextCursor = hasMore ? (page[page.length - 1]?.id ?? null) : null;
+    const nextCursor = hasMore ? String(page[page.length - 1]?.id ?? '') : null;
+
+    // We need originalRunCode — fetch source run codes
+    const sourceRunIds = page
+      .map((r) => r.reversalOfRunId)
+      .filter((id): id is number => id !== null);
+
+    const sourceRuns = sourceRunIds.length > 0
+      ? await prisma.payrollRun.findMany({
+          where: { id: { in: sourceRunIds } },
+          select: { id: true, code: true },
+        })
+      : [];
+    const sourceRunMap = new Map(sourceRuns.map((r) => [r.id, r.code]));
 
     const formatted = page.map((r) => ({
       reversalRunId: r.id,
       reversalRunCode: r.code,
       originalRunId: r.reversalOfRunId!,
-      originalRunCode: r.reversalOf?.code ?? '',
+      originalRunCode: r.reversalOfRunId !== null ? (sourceRunMap.get(r.reversalOfRunId) ?? '') : '',
       month: r.month,
       year: r.year,
-      reversedBy: r.reversedBy ?? '',
+      reversedBy: r.reversedBy ?? null,
       reversedByName: r.reverser?.name ?? '',
-      reversedAt: r.reversedAt?.toISOString() ?? r.createdAt.toISOString(),
+      reversedAt: r.reversedAt?.toISOString() ?? r.initiatedAt.toISOString(),
       reason: r.reversalReason ?? '',
       affectedEmployees: r.payslips.length,
-      // Net adjustment is negative for reversals (represents money returned)
       netAdjustmentPaise: -r.payslips.reduce((s, p) => s + p.netPayPaise, 0),
     }));
 
@@ -1019,48 +1074,48 @@ payslipsRouter.get(
     const user = req.user!;
     const { year, month, employeeId, status, runId, isReversal, cursor, limit } =
       req.query as {
-        year?: number;
-        month?: number;
+        year?: string;
+        month?: string;
         employeeId?: string;
         status?: string;
         runId?: string;
-        isReversal?: boolean;
+        isReversal?: string;
         cursor?: string;
-        limit?: number;
+        limit?: string;
       };
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const where: Record<string, any> = {};
 
     // Scope by role
-    if (user.role === 'Employee') {
+    if (user.roleId === RoleId.Employee) {
       where['employeeId'] = user.id;
-    } else if (user.role === 'Manager') {
+    } else if (user.roleId === RoleId.Manager) {
       const subs = await getSubordinateIds(user.id);
-      const allowed = [user.id, ...subs];
+      const allowed: number[] = [user.id, ...subs];
       if (employeeId) {
-        if (!allowed.includes(employeeId)) {
+        const empId = Number(employeeId);
+        if (!allowed.includes(empId)) {
           res.status(200).json({ data: [], nextCursor: null });
           return;
         }
-        where['employeeId'] = employeeId;
+        where['employeeId'] = empId;
       } else {
         where['employeeId'] = { in: allowed };
       }
     } else {
       // Admin / PayrollOfficer — see all
-      if (employeeId) where['employeeId'] = employeeId;
+      if (employeeId) where['employeeId'] = Number(employeeId);
     }
 
     if (year) where['year'] = Number(year);
     if (month) where['month'] = Number(month);
-    if (status) where['status'] = status;
-    // BUG-PAY-004 fix — `runId` is a documented filter; was previously dropped.
-    if (runId) where['runId'] = runId;
+    if (status) where['status'] = Number(status);
+    if (runId) where['runId'] = Number(runId);
     if (isReversal !== undefined) {
-      where['reversalOfPayslipId'] = isReversal ? { not: null } : null;
+      where['reversalOfPayslipId'] = isReversal === 'true' ? { not: null } : null;
     }
-    if (cursor) where['id'] = { gt: cursor };
+    if (cursor) where['id'] = { gt: Number(cursor) };
 
     const slips = await prisma.payslip.findMany({
       where,
@@ -1071,7 +1126,7 @@ payslipsRouter.get(
 
     const hasMore = slips.length > (Number(limit) || 20);
     const page = hasMore ? slips.slice(0, Number(limit) || 20) : slips;
-    const nextCursor = hasMore ? (page[page.length - 1]?.id ?? null) : null;
+    const nextCursor = hasMore ? String(page[page.length - 1]?.id ?? '') : null;
 
     const summaries = page.map((s) => ({
       id: s.id,
@@ -1103,10 +1158,14 @@ payslipsRouter.get(
   requireSession(),
   async (req: Request, res: Response): Promise<void> => {
     const user = req.user!;
-    const id = req.params['id'] as string;
+    const slipId = Number(req.params['id']);
+    if (isNaN(slipId)) {
+      res.status(404).json(errorEnvelope(ErrorCode.NOT_FOUND, 'Payslip not found.'));
+      return;
+    }
 
     const slip = await prisma.payslip.findUnique({
-      where: { id },
+      where: { id: slipId },
       include: slipInclude,
     });
 
@@ -1116,7 +1175,7 @@ payslipsRouter.get(
     }
 
     // Visibility check
-    const canSee = await canViewPayslip(user.id, user.role, slip.employeeId);
+    const canSee = await canViewPayslip(user.id, user.roleId, slip.employeeId);
     if (!canSee) {
       res.status(404).json(errorEnvelope(ErrorCode.NOT_FOUND, 'Payslip not found.'));
       return;
@@ -1131,19 +1190,23 @@ payslipsRouter.get(
 payslipsRouter.patch(
   '/:id/tax',
   requireSession(),
-  requireRole('Admin', 'PayrollOfficer'),
+  requireRole(RoleId.Admin, RoleId.PayrollOfficer),
   idempotencyKey(),
   validateBody(UpdatePayslipTaxRequestSchema),
   async (req: Request, res: Response): Promise<void> => {
     const user = req.user!;
-    const id = req.params['id'] as string;
+    const slipId = Number(req.params['id']);
+    if (isNaN(slipId)) {
+      res.status(404).json(errorEnvelope(ErrorCode.NOT_FOUND, 'Payslip not found.'));
+      return;
+    }
     const { finalTaxPaise: newTax, version } = req.body as {
       finalTaxPaise: number;
       version: number;
     };
 
     const slip = await prisma.payslip.findUnique({
-      where: { id },
+      where: { id: slipId },
       include: { run: { select: { status: true } } },
     });
 
@@ -1153,7 +1216,10 @@ payslipsRouter.patch(
     }
 
     // BL-031: reject if payslip is Finalised or Reversed
-    if (slip.status === 'Finalised' || slip.status === 'Reversed') {
+    if (
+      slip.status === PayrollRunStatus.Finalised ||
+      slip.status === PayrollRunStatus.Reversed
+    ) {
       res.status(409).json(
         errorEnvelope(ErrorCode.PAYSLIP_IMMUTABLE, 'This payslip is finalised and cannot be modified.', {
           ruleId: 'BL-031',
@@ -1163,7 +1229,10 @@ payslipsRouter.patch(
     }
 
     // Run must be in a mutable state (Draft or Review)
-    if (slip.run.status === 'Finalised' || slip.run.status === 'Reversed') {
+    if (
+      slip.run.status === PayrollRunStatus.Finalised ||
+      slip.run.status === PayrollRunStatus.Reversed
+    ) {
       res.status(409).json(
         errorEnvelope(ErrorCode.PAYSLIP_IMMUTABLE, 'The parent run is finalised. Payslip cannot be modified.', {
           ruleId: 'BL-031',
@@ -1191,7 +1260,7 @@ payslipsRouter.patch(
 
     const updated = await prisma.$transaction(async (tx) => {
       const u = await tx.payslip.update({
-        where: { id },
+        where: { id: slipId },
         data: {
           finalTaxPaise: newTax,
           netPayPaise: newNet,
@@ -1203,11 +1272,11 @@ payslipsRouter.patch(
       await audit({
         tx,
         actorId: user.id,
-        actorRole: user.role,
+        actorRole: user.roleId as AuditActorRoleValue,
         actorIp: req.ip ?? null,
         action: 'payslip.tax.update',
         targetType: 'Payslip',
-        targetId: id,
+        targetId: slipId,
         module: 'payroll',
         before,
         after: { finalTaxPaise: newTax, netPayPaise: newNet },
@@ -1227,10 +1296,14 @@ payslipsRouter.get(
   requireSession(),
   async (req: Request, res: Response): Promise<void> => {
     const user = req.user!;
-    const id = req.params['id'] as string;
+    const slipId = Number(req.params['id']);
+    if (isNaN(slipId)) {
+      res.status(404).json(errorEnvelope(ErrorCode.NOT_FOUND, 'Payslip not found.'));
+      return;
+    }
 
     const slip = await prisma.payslip.findUnique({
-      where: { id },
+      where: { id: slipId },
       include: slipInclude,
     });
 
@@ -1239,7 +1312,7 @@ payslipsRouter.get(
       return;
     }
 
-    const canSee = await canViewPayslip(user.id, user.role, slip.employeeId);
+    const canSee = await canViewPayslip(user.id, user.roleId, slip.employeeId);
     if (!canSee) {
       res.status(404).json(errorEnvelope(ErrorCode.NOT_FOUND, 'Payslip not found.'));
       return;
@@ -1250,7 +1323,7 @@ payslipsRouter.get(
         code: slip.code,
         month: slip.month,
         year: slip.year,
-        status: slip.status,
+        status: mapRunStatusToString(slip.status),
         periodStart: slip.periodStart.toISOString().split('T')[0]!,
         periodEnd: slip.periodEnd.toISOString().split('T')[0]!,
         workingDays: slip.workingDays,
@@ -1265,11 +1338,11 @@ payslipsRouter.get(
         otherDeductionsPaise: slip.otherDeductionsPaise,
         netPayPaise: slip.netPayPaise,
         finalisedAt: slip.finalisedAt?.toISOString() ?? null,
-        reversalOfPayslipId: slip.reversalOfPayslipId,
+        reversalOfPayslipId: slip.reversalOfPayslipId !== null ? String(slip.reversalOfPayslipId) : null,
         employeeName: slip.employee.name,
         employeeCode: slip.employee.code,
-        designation: slip.employee.designation,
-        department: slip.employee.department,
+        designation: slip.employee.designation?.name ?? null,
+        department: slip.employee.department?.name ?? null,
         runCode: slip.run.code,
       },
       res,
@@ -1279,7 +1352,6 @@ payslipsRouter.get(
 
 // ── Tax config ────────────────────────────────────────────────────────────────
 
-// Default basis used when the Configuration row is absent (pre-seed installs).
 const DEFAULT_GROSS_TAXABLE_BASIS = 'GrossMinusStandardDeduction' as const;
 type GrossTaxableBasisValue =
   | 'GrossMinusStandardDeduction'
@@ -1296,7 +1368,7 @@ function coerceBasis(raw: unknown): GrossTaxableBasisValue {
 taxConfigRouter.get(
   '/',
   requireSession(),
-  requireRole('Admin'),
+  requireRole(RoleId.Admin),
   async (_req: Request, res: Response): Promise<void> => {
     const [rateRow, basisRow] = await Promise.all([
       prisma.configuration.findUnique({
@@ -1307,7 +1379,6 @@ taxConfigRouter.get(
       }),
     ]);
 
-    // The most recently touched of the two rows wins for updatedBy/updatedAt.
     const newest =
       rateRow && basisRow
         ? rateRow.updatedAt >= basisRow.updatedAt
@@ -1326,11 +1397,11 @@ taxConfigRouter.get(
   },
 );
 
-// PATCH /config/tax — partial body; rate and basis can be saved independently.
+// PATCH /config/tax
 taxConfigRouter.patch(
   '/',
   requireSession(),
-  requireRole('Admin'),
+  requireRole(RoleId.Admin),
   idempotencyKey(),
   validateBody(UpdateTaxSettingsRequestSchema),
   async (req: Request, res: Response): Promise<void> => {
@@ -1359,25 +1430,25 @@ taxConfigRouter.patch(
           create: {
             key: 'STANDARD_TAX_REFERENCE_RATE',
             value: referenceRate,
-            updatedBy: user.id,
+            updatedBy: String(user.id),
           },
           update: {
             value: referenceRate,
-            updatedBy: user.id,
+            updatedBy: String(user.id),
           },
         });
 
         await audit({
           tx,
           actorId: user.id,
-          actorRole: user.role,
+          actorRole: user.roleId as AuditActorRoleValue,
           actorIp: req.ip ?? null,
           action: 'config.tax.update',
           targetType: 'Configuration',
-          targetId: 'STANDARD_TAX_REFERENCE_RATE',
+          targetId: null,
           module: 'payroll',
-          before: { referenceRate: (beforeRate?.value as number) ?? null },
-          after: { referenceRate },
+          before: { key: 'STANDARD_TAX_REFERENCE_RATE', referenceRate: (beforeRate?.value as number) ?? null },
+          after: { key: 'STANDARD_TAX_REFERENCE_RATE', referenceRate },
         });
       }
 
@@ -1387,37 +1458,34 @@ taxConfigRouter.patch(
           create: {
             key: 'TAX_GROSS_TAXABLE_BASIS',
             value: grossTaxableBasis,
-            updatedBy: user.id,
+            updatedBy: String(user.id),
           },
           update: {
             value: grossTaxableBasis,
-            updatedBy: user.id,
+            updatedBy: String(user.id),
           },
         });
 
         await audit({
           tx,
           actorId: user.id,
-          actorRole: user.role,
+          actorRole: user.roleId as AuditActorRoleValue,
           actorIp: req.ip ?? null,
           action: 'config.tax.update',
           targetType: 'Configuration',
-          targetId: 'TAX_GROSS_TAXABLE_BASIS',
+          targetId: null,
           module: 'payroll',
-          before: { grossTaxableBasis: coerceBasis(beforeBasis?.value) },
-          after: { grossTaxableBasis },
+          before: { key: 'TAX_GROSS_TAXABLE_BASIS', grossTaxableBasis: coerceBasis(beforeBasis?.value) },
+          after: { key: 'TAX_GROSS_TAXABLE_BASIS', grossTaxableBasis },
         });
       }
 
       return { rateRow: nextRateRow, basisRow: nextBasisRow };
     });
 
-    // Notify all PayrollOfficers if the reference rate changed. Basis-only
-    // changes do not affect the live reference figure today (v1 engine
-    // ignores the basis) — skip the notify to avoid noise.
     if (referenceRate !== undefined) {
       const payrollOfficers = await prisma.employee.findMany({
-        where: { role: 'PayrollOfficer', status: 'Active' },
+        where: { roleId: RoleId.PayrollOfficer, status: EmployeeStatus.Active },
         select: { id: true },
       });
       if (payrollOfficers.length > 0) {
@@ -1455,21 +1523,16 @@ taxConfigRouter.patch(
 /**
  * Returns true if the calling user is allowed to see a payslip for the
  * given employeeId.
- *
- * Rules:
- *   - Employee: own payslip only
- *   - Manager: own + subordinate tree
- *   - PayrollOfficer / Admin: all
  */
 async function canViewPayslip(
-  userId: string,
-  userRole: string,
-  ownerId: string,
+  userId: number,
+  userRoleId: number,
+  ownerId: number,
 ): Promise<boolean> {
-  if (userRole === 'Admin' || userRole === 'PayrollOfficer') return true;
+  if (userRoleId === RoleId.Admin || userRoleId === RoleId.PayrollOfficer) return true;
   if (userId === ownerId) return true;
 
-  if (userRole === 'Manager') {
+  if (userRoleId === RoleId.Manager) {
     const subs = await getSubordinateIds(userId);
     return subs.includes(ownerId);
   }

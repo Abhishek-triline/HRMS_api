@@ -10,10 +10,10 @@
 import type { Prisma } from '@prisma/client';
 
 export interface LockedRunRow {
-  id: string;
-  status: string;
+  id: number;
+  status: number;
   version: number;
-  finalisedBy: string | null;
+  finalisedBy: number | null;
   finalisedAt: Date | null;
 }
 
@@ -24,23 +24,41 @@ export interface LockedRunRow {
  * $transaction). Returns the row data post-lock so the caller can
  * inspect the current status before proceeding.
  *
- * SQL used: SELECT id, status, version, finalisedBy, finalisedAt
+ * SQL used: SELECT id, status, version, finalised_by, finalised_at
  *           FROM payroll_runs WHERE id = ? FOR UPDATE
  *
  * MySQL compatibility: FOR UPDATE is supported in InnoDB (the default MySQL
  * storage engine). The lock is released when the surrounding transaction
  * commits or rolls back.
+ *
+ * Note: $queryRaw returns raw MySQL column names (snake_case). The result is
+ * cast to LockedRunRow; numeric columns come back as number from mysql2 driver.
  */
 export async function acquireRunLock(
-  runId: string,
+  runId: number,
   tx: Prisma.TransactionClient,
 ): Promise<LockedRunRow | null> {
-  const rows = await tx.$queryRaw<LockedRunRow[]>`
-    SELECT id, status, version, finalisedBy, finalisedAt
+  const rows = await tx.$queryRaw<Array<{
+    id: number;
+    status: number;
+    version: number;
+    finalised_by: number | null;
+    finalised_at: Date | null;
+  }>>`
+    SELECT id, status, version, finalised_by, finalised_at
     FROM payroll_runs
     WHERE id = ${runId}
     FOR UPDATE
   `;
 
-  return rows[0] ?? null;
+  const row = rows[0];
+  if (!row) return null;
+
+  return {
+    id: row.id,
+    status: row.status,
+    version: row.version,
+    finalisedBy: row.finalised_by,
+    finalisedAt: row.finalised_at,
+  };
 }

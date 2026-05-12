@@ -23,6 +23,7 @@ import { validateQuery } from '../../middleware/validateQuery.js';
 import { audit } from '../../lib/audit.js';
 import { errorEnvelope, ErrorCode } from '@nexora/contracts/errors';
 import { ReplaceHolidaysRequestSchema } from '@nexora/contracts/attendance';
+import { RoleId, type AuditActorRoleValue } from '../../lib/statusInt.js';
 import { logger } from '../../lib/logger.js';
 
 export const holidaysRouter = Router();
@@ -69,7 +70,7 @@ holidaysRouter.get(
 holidaysRouter.put(
   '/',
   requireSession(),
-  requireRole('Admin'),
+  requireRole(RoleId.Admin),
   validateBody(ReplaceHolidaysRequestSchema),
   async (req: Request, res: Response): Promise<void> => {
     const user = req.user!;
@@ -109,11 +110,11 @@ holidaysRouter.put(
         await audit({
           tx,
           actorId: user.id,
-          actorRole: user.role,
+          actorRole: user.roleId as AuditActorRoleValue,
           actorIp: null,
           action: 'config.holidays.replace',
           targetType: 'Holiday',
-          targetId: String(body.year),
+          targetId: null,
           module: 'attendance',
           before: {
             year: body.year,

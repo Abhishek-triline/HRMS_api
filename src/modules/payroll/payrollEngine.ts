@@ -45,7 +45,7 @@ export interface PayslipValues {
   // BL-LE-09: encashment fields (0 / null when no encashment in this run)
   encashmentDays: number;
   encashmentPaise: number;
-  encashmentId: string | null;
+  encashmentId: number | null;
 }
 
 // ── Engine ────────────────────────────────────────────────────────────────────
@@ -152,7 +152,7 @@ export async function computePayslip(
 
   let encashmentDays = 0;
   let encashmentPaiseFinal = 0;
-  let encashmentId: string | null = null;
+  let encashmentId: number | null = null;
 
   if (pendingEncashment && pendingEncashment.daysApproved !== null) {
     // BL-LE-07: rate uses THIS RUN's workingDays (paying-month), not the locked snapshot.
@@ -234,7 +234,7 @@ export async function computePayslip(
  */
 export async function finaliseEncashmentPayment(
   values: PayslipValues,
-  payslipId: string,
+  payslipId: number,
   tx: Prisma.TransactionClient,
 ): Promise<void> {
   if (!values.encashmentId) return;

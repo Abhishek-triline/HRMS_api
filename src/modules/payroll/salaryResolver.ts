@@ -19,7 +19,7 @@ import type { Prisma, SalaryStructure } from '@prisma/client';
  * Must be called inside a transaction so the read is consistent with other ops.
  */
 export async function resolveSalaryFor(
-  employeeId: string,
+  employeeId: number,
   periodStart: Date,
   tx: Prisma.TransactionClient,
 ): Promise<SalaryStructure | null> {

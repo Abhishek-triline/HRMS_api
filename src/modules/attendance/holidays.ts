@@ -18,7 +18,7 @@ import { getAttendanceConfig, weekdayTokenFromIndex } from '../../lib/config.js'
 export async function isHoliday(
   date: Date,
   tx: Prisma.TransactionClient,
-): Promise<{ id: string; name: string } | null> {
+): Promise<{ id: number; name: string } | null> {
   // Normalise to midnight UTC for DB comparison with @db.Date columns.
   const dayStart = new Date(date);
   dayStart.setUTCHours(0, 0, 0, 0);

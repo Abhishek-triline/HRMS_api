@@ -1,5 +1,5 @@
 /**
- * Notifications routes — Phase 6.
+ * Notifications routes — v2 schema (INT IDs, INT categoryId).
  *
  * Mounted at /api/v1/notifications
  *
@@ -18,6 +18,11 @@
  *
  * Audit: mark-read is a read-state toggle, NOT a business state change.
  * No audit entries are written for these routes (per spec).
+ *
+ * v2 schema notes:
+ *   - Notification.id is INT (not cuid)
+ *   - Notification.categoryId is INT FK
+ *   - cursor is String(id) / Number(cursor)
  */
 
 import { Router } from 'express';
@@ -34,7 +39,6 @@ import {
 import type {
   NotificationListQuery,
   MarkReadRequest,
-  NotificationCategory,
 } from '@nexora/contracts/notifications';
 import { logger } from '../../lib/logger.js';
 
@@ -42,27 +46,22 @@ export const notificationsRouter = Router();
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/** Map DB category enum (no hyphens) → contract category. They match here. */
-function mapCategoryFromDB(cat: string): NotificationCategory {
-  return cat as NotificationCategory;
-}
-
 /** Format a Notification row to the contract shape. */
 function formatNotification(n: {
-  id: string;
-  recipientId: string;
-  category: string;
+  id: number;
+  recipientId: number;
+  categoryId: number;
   title: string;
   body: string;
   link: string | null;
   unread: boolean;
-  auditLogId: string | null;
+  auditLogId: number | null;
   createdAt: Date;
 }) {
   return {
     id: n.id,
     recipientId: n.recipientId,
-    category: mapCategoryFromDB(n.category),
+    categoryId: n.categoryId,
     title: n.title,
     body: n.body,
     link: n.link,
@@ -92,10 +91,10 @@ notificationsRouter.get(
         recipientId: user.id, // INVARIANT — never remove this
       };
 
-      // Optional: filter by category (single or multi-value)
-      if (query.category !== undefined) {
-        const cats = Array.isArray(query.category) ? query.category : [query.category];
-        where['category'] = { in: cats };
+      // Optional: filter by categoryId (single or multi-value INT)
+      if (query.categoryId !== undefined) {
+        const cats = Array.isArray(query.categoryId) ? query.categoryId : [query.categoryId];
+        where['categoryId'] = { in: cats };
       }
 
       // Optional: show only unread
@@ -108,25 +107,23 @@ notificationsRouter.get(
         where['createdAt'] = { gte: new Date(query.since) };
       }
 
-      // Cursor-based pagination (cursor is the notification id of the last seen row).
+      // Cursor-based pagination (cursor is String(id) of the last seen row).
       // BUG-NOT-005: use keyset (createdAt, id) so same-millisecond fan-out rows
       // (e.g. payroll finalise) are never dropped at page boundaries.
       if (query.cursor) {
-        const cursorRow = await prisma.notification.findFirst({
-          where: { id: query.cursor, recipientId: user.id }, // BL-044 scoped
-          select: { createdAt: true, id: true },
-        });
-        if (cursorRow) {
-          // Items strictly older than the cursor row, OR same createdAt but smaller id.
-          // This composite keyset ensures no rows with identical createdAt are skipped.
-          // The existing index on (recipientId, createdAt DESC) still covers the
-          // leading column so the query plan is unchanged.
-          where['OR'] = [
-            { createdAt: { lt: cursorRow.createdAt } },
-            { createdAt: cursorRow.createdAt, id: { lt: cursorRow.id } },
-          ];
-          // Remove any `since` filter that was merged into createdAt — it is now
-          // handled via a separate top-level `createdAt` key alongside `OR`.
+        const cursorId = Number(query.cursor);
+        if (!isNaN(cursorId)) {
+          const cursorRow = await prisma.notification.findFirst({
+            where: { id: cursorId, recipientId: user.id }, // BL-044 scoped
+            select: { createdAt: true, id: true },
+          });
+          if (cursorRow) {
+            // Items strictly older than the cursor row, OR same createdAt but smaller id.
+            where['OR'] = [
+              { createdAt: { lt: cursorRow.createdAt } },
+              { createdAt: cursorRow.createdAt, id: { lt: cursorRow.id } },
+            ];
+          }
         }
       }
 
@@ -138,7 +135,8 @@ notificationsRouter.get(
 
       const hasMore = rows.length > limit;
       const items = hasMore ? rows.slice(0, limit) : rows;
-      const nextCursor = hasMore ? (items[items.length - 1]?.id ?? null) : null;
+      const lastId = items[items.length - 1]?.id ?? null;
+      const nextCursor = hasMore && lastId !== null ? String(lastId) : null;
 
       res.status(200).json({
         data: items.map(formatNotification),
@@ -178,11 +176,14 @@ notificationsRouter.post(
         });
         updated = result.count;
       } else if ('ids' in body && Array.isArray(body.ids)) {
+        // ids from contract are numbers in v2
+        const numericIds = body.ids.map(Number).filter((n) => !isNaN(n));
+
         // Mark specific IDs as read — intersect with recipientId so a caller
         // can NEVER affect another user's notifications (BL-044).
         const result = await prisma.notification.updateMany({
           where: {
-            id: { in: body.ids },
+            id: { in: numericIds },
             recipientId: user.id, // BL-044: INVARIANT — cross-user ids silently ignored
             unread: true,
           },
@@ -191,16 +192,13 @@ notificationsRouter.post(
         updated = result.count;
 
         // SEC-002-P6: Detect and log possible IDOR attempts.
-        // If fewer rows were updated than requested, some IDs either don't
-        // belong to this user, don't exist, or were already read. The count
-        // discrepancy alone is suspicious — log it for forensics.
-        if (result.count < body.ids.length) {
+        if (result.count < numericIds.length) {
           logger.warn(
             {
               userId: user.id,
-              requestedIds: body.ids.length,
+              requestedIds: numericIds.length,
               updatedCount: result.count,
-              missingCount: body.ids.length - result.count,
+              missingCount: numericIds.length - result.count,
             },
             'notifications.mark-read: some IDs did not match caller — possible IDOR attempt',
           );

@@ -332,8 +332,7 @@ export function startScheduler(): void {
             const reviews = await prisma.performanceReview.findMany({
               where: {
                 cycleId: cycle.id,
-                isMidCycleJoiner: false,
-                selfSubmittedAt: null,
+                selfRating: null,
               },
               select: { id: true, employeeId: true },
             });

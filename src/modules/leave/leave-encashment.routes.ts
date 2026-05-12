@@ -1,5 +1,5 @@
 /**
- * Leave Encashment routes (additive — BL-LE-01..14).
+ * Leave Encashment routes (v2 schema: INT IDs, INT status/role codes).
  *
  * Mounted at /api/v1/leave-encashments
  *
@@ -40,6 +40,12 @@ import {
   formatEncashment,
 } from './leave-encashment.service.js';
 import { getSubordinateIds } from '../employees/hierarchy.js';
+import {
+  RoleId,
+  EmployeeStatus,
+  LeaveEncashmentStatus,
+  type AuditActorRoleValue,
+} from '../../lib/statusInt.js';
 
 // ── Router ────────────────────────────────────────────────────────────────────
 
@@ -75,6 +81,24 @@ function handleTxError(err: unknown, res: Response): boolean {
   return false;
 }
 
+// ── Visibility helper ─────────────────────────────────────────────────────────
+
+async function canViewEncashment(
+  userId: number,
+  userRoleId: number,
+  ownerId: number,
+): Promise<boolean> {
+  if (userRoleId === RoleId.Admin) return true;
+  if (userId === ownerId) return true;
+
+  if (userRoleId === RoleId.Manager) {
+    const subs = await getSubordinateIds(userId);
+    return subs.includes(ownerId);
+  }
+
+  return false;
+}
+
 // ── POST /leave-encashments ───────────────────────────────────────────────────
 
 leaveEncashmentRouter.post(
@@ -107,39 +131,40 @@ leaveEncashmentRouter.get(
   async (req: Request, res: Response): Promise<void> => {
     const user = req.user!;
     const { year, status, employeeId, cursor, limit } = req.query as {
-      year?: number;
+      year?: string;
       status?: string;
       employeeId?: string;
       cursor?: string;
-      limit?: number;
+      limit?: string;
     };
 
     const take = (Number(limit) || 20) + 1;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const where: Record<string, any> = {};
 
-    if (user.role === 'Employee') {
+    if (user.roleId === RoleId.Employee) {
       where['employeeId'] = user.id;
-    } else if (user.role === 'Manager') {
+    } else if (user.roleId === RoleId.Manager) {
       const subs = await getSubordinateIds(user.id);
       const allowed = [user.id, ...subs];
       if (employeeId) {
-        if (!allowed.includes(employeeId)) {
+        const empIdNum = Number(employeeId);
+        if (!allowed.includes(empIdNum)) {
           res.status(200).json({ data: [], nextCursor: null });
           return;
         }
-        where['employeeId'] = employeeId;
+        where['employeeId'] = empIdNum;
       } else {
         where['employeeId'] = { in: allowed };
       }
     } else {
       // Admin / PayrollOfficer — see all
-      if (employeeId) where['employeeId'] = employeeId;
+      if (employeeId) where['employeeId'] = Number(employeeId);
     }
 
     if (year) where['year'] = Number(year);
-    if (status) where['status'] = status;
-    if (cursor) where['id'] = { gt: cursor };
+    if (status) where['status'] = Number(status);
+    if (cursor) where['id'] = { gt: Number(cursor) };
 
     const items = await prisma.leaveEncashment.findMany({
       where,
@@ -150,7 +175,8 @@ leaveEncashmentRouter.get(
 
     const hasMore = items.length > (Number(limit) || 20);
     const page = hasMore ? items.slice(0, Number(limit) || 20) : items;
-    const nextCursor = hasMore ? (page[page.length - 1]?.id ?? null) : null;
+    const lastId = page[page.length - 1]?.id ?? null;
+    const nextCursor = hasMore && lastId !== null ? String(lastId) : null;
 
     res.status(200).json({ data: page.map(formatEncashment), nextCursor });
   },
@@ -162,23 +188,23 @@ leaveEncashmentRouter.get(
 leaveEncashmentRouter.get(
   '/queue',
   requireSession(),
-  requireRole('Manager', 'Admin'),
+  requireRole(RoleId.Manager, RoleId.Admin),
   async (req: Request, res: Response): Promise<void> => {
     const user = req.user!;
-    const { cursor, limit } = req.query as { cursor?: string; limit?: number };
+    const { cursor, limit } = req.query as { cursor?: string; limit?: string };
     const take = (Number(limit) || 20) + 1;
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const where: Record<string, any> = {
-      status: { in: ['Pending', 'ManagerApproved'] },
+      status: { in: [LeaveEncashmentStatus.Pending, LeaveEncashmentStatus.ManagerApproved] },
     };
 
-    if (user.role === 'Manager') {
+    if (user.roleId === RoleId.Manager) {
       where['approverId'] = user.id;
     }
     // Admin sees all pending/manager-approved
 
-    if (cursor) where['id'] = { gt: cursor };
+    if (cursor) where['id'] = { gt: Number(cursor) };
 
     const items = await prisma.leaveEncashment.findMany({
       where,
@@ -189,7 +215,8 @@ leaveEncashmentRouter.get(
 
     const hasMore = items.length > (Number(limit) || 20);
     const page = hasMore ? items.slice(0, Number(limit) || 20) : items;
-    const nextCursor = hasMore ? (page[page.length - 1]?.id ?? null) : null;
+    const lastId = page[page.length - 1]?.id ?? null;
+    const nextCursor = hasMore && lastId !== null ? String(lastId) : null;
 
     res.status(200).json({ data: page.map(formatEncashment), nextCursor });
   },
@@ -202,7 +229,11 @@ leaveEncashmentRouter.get(
   requireSession(),
   async (req: Request, res: Response): Promise<void> => {
     const user = req.user!;
-    const id = req.params['id'] as string;
+    const id = Number(req.params['id']);
+    if (isNaN(id)) {
+      res.status(404).json(errorEnvelope(ErrorCode.NOT_FOUND, 'Encashment request not found.'));
+      return;
+    }
 
     const enc = await prisma.leaveEncashment.findUnique({
       where: { id },
@@ -215,7 +246,7 @@ leaveEncashmentRouter.get(
     }
 
     // Visibility check
-    const canSee = await canViewEncashment(user.id, user.role, enc.employeeId);
+    const canSee = await canViewEncashment(user.id, user.roleId, enc.employeeId);
     if (!canSee) {
       res.status(404).json(errorEnvelope(ErrorCode.NOT_FOUND, 'Encashment request not found.'));
       return;
@@ -234,7 +265,11 @@ leaveEncashmentRouter.post(
   validateBody(CancelEncashmentBodySchema),
   async (req: Request, res: Response): Promise<void> => {
     const user = req.user!;
-    const id = req.params['id'] as string;
+    const id = Number(req.params['id']);
+    if (isNaN(id)) {
+      res.status(404).json(errorEnvelope(ErrorCode.NOT_FOUND, 'Encashment request not found.'));
+      return;
+    }
     const { note, version } = req.body as { note?: string; version: number };
 
     // Load for version check
@@ -253,7 +288,7 @@ leaveEncashmentRouter.post(
 
     try {
       const result = await prisma.$transaction(async (tx) => {
-        return cancelEncashment(id, user.id, user.role, tx, req.ip ?? null, note);
+        return cancelEncashment(id, user.id, user.roleId as AuditActorRoleValue, tx, req.ip ?? null, note);
       });
       res.status(200).json({ data: result });
     } catch (err: unknown) {
@@ -268,12 +303,16 @@ leaveEncashmentRouter.post(
 leaveEncashmentRouter.post(
   '/:id/manager-approve',
   requireSession(),
-  requireRole('Manager'),
+  requireRole(RoleId.Manager),
   idempotencyKey(),
   validateBody(ManagerApproveEncashmentBodySchema),
   async (req: Request, res: Response): Promise<void> => {
     const user = req.user!;
-    const id = req.params['id'] as string;
+    const id = Number(req.params['id']);
+    if (isNaN(id)) {
+      res.status(404).json(errorEnvelope(ErrorCode.NOT_FOUND, 'Encashment request not found.'));
+      return;
+    }
     const { note, version } = req.body as { note?: string; version: number };
 
     const enc = await prisma.leaveEncashment.findUnique({ where: { id } });
@@ -291,7 +330,7 @@ leaveEncashmentRouter.post(
 
     try {
       const result = await prisma.$transaction(async (tx) => {
-        return managerApproveEncashment(id, user.id, note, tx, user.role, req.ip ?? null);
+        return managerApproveEncashment(id, user.id, note, tx, user.roleId as AuditActorRoleValue, req.ip ?? null);
       });
       res.status(200).json({ data: result });
     } catch (err: unknown) {
@@ -306,12 +345,16 @@ leaveEncashmentRouter.post(
 leaveEncashmentRouter.post(
   '/:id/admin-finalise',
   requireSession(),
-  requireRole('Admin'),
+  requireRole(RoleId.Admin),
   idempotencyKey(),
   validateBody(AdminFinaliseEncashmentBodySchema),
   async (req: Request, res: Response): Promise<void> => {
     const user = req.user!;
-    const id = req.params['id'] as string;
+    const id = Number(req.params['id']);
+    if (isNaN(id)) {
+      res.status(404).json(errorEnvelope(ErrorCode.NOT_FOUND, 'Encashment request not found.'));
+      return;
+    }
     const { daysApproved, note, version } = req.body as {
       daysApproved?: number;
       note?: string;
@@ -333,7 +376,7 @@ leaveEncashmentRouter.post(
 
     try {
       const result = await prisma.$transaction(async (tx) => {
-        return adminFinaliseEncashment(id, user.id, daysApproved, note, tx, user.role, req.ip ?? null);
+        return adminFinaliseEncashment(id, user.id, daysApproved, note, tx, user.roleId as AuditActorRoleValue, req.ip ?? null);
       });
       res.status(200).json({ data: result });
     } catch (err: unknown) {
@@ -348,12 +391,16 @@ leaveEncashmentRouter.post(
 leaveEncashmentRouter.post(
   '/:id/reject',
   requireSession(),
-  requireRole('Manager', 'Admin'),
+  requireRole(RoleId.Manager, RoleId.Admin),
   idempotencyKey(),
   validateBody(RejectEncashmentBodySchema),
   async (req: Request, res: Response): Promise<void> => {
     const user = req.user!;
-    const id = req.params['id'] as string;
+    const id = Number(req.params['id']);
+    if (isNaN(id)) {
+      res.status(404).json(errorEnvelope(ErrorCode.NOT_FOUND, 'Encashment request not found.'));
+      return;
+    }
     const { note, version } = req.body as { note: string; version: number };
 
     const enc = await prisma.leaveEncashment.findUnique({ where: { id } });
@@ -371,7 +418,7 @@ leaveEncashmentRouter.post(
 
     try {
       const result = await prisma.$transaction(async (tx) => {
-        return rejectEncashment(id, user.id, note, tx, user.role, req.ip ?? null);
+        return rejectEncashment(id, user.id, note, tx, user.roleId as AuditActorRoleValue, req.ip ?? null);
       });
       res.status(200).json({ data: result });
     } catch (err: unknown) {
@@ -381,20 +428,5 @@ leaveEncashmentRouter.post(
   },
 );
 
-// ── Visibility helper ─────────────────────────────────────────────────────────
-
-async function canViewEncashment(
-  userId: string,
-  userRole: string,
-  ownerId: string,
-): Promise<boolean> {
-  if (userRole === 'Admin') return true;
-  if (userId === ownerId) return true;
-
-  if (userRole === 'Manager') {
-    const subs = await getSubordinateIds(userId);
-    return subs.includes(ownerId);
-  }
-
-  return false;
-}
+// Suppress unused import warning — EmployeeStatus imported for future queue filter extensions
+void EmployeeStatus;

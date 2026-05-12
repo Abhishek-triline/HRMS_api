@@ -1,5 +1,5 @@
 /**
- * Configuration routes — Phase 7.
+ * Configuration routes — Phase 7 (v2 schema: INT IDs, INT status/role codes).
  *
  * Mounted at /api/v1/config (alongside existing /config/tax and /config/holidays).
  *
@@ -8,6 +8,8 @@
  *   PUT  /api/v1/config/attendance   Admin only
  *   GET  /api/v1/config/leave        Admin only
  *   PUT  /api/v1/config/leave        Admin only
+ *   GET  /api/v1/config/encashment   Admin only
+ *   PUT  /api/v1/config/encashment   Admin only
  *
  * All writes:
  *   - Run atomically in a Prisma transaction.
@@ -41,6 +43,11 @@ import {
   UpdateLeaveConfigSchema,
 } from '@nexora/contracts/configuration';
 import type { AttendanceConfig, LeaveConfig, EncashmentConfig } from '@nexora/contracts/configuration';
+import {
+  RoleId,
+  EmployeeStatus,
+  type AuditActorRoleValue,
+} from '../../lib/statusInt.js';
 
 export const configurationRouter = Router();
 
@@ -52,9 +59,8 @@ export const configurationRouter = Router();
  * SEC-P8-005: do NOT read req.headers['x-forwarded-for'] directly — that header
  * is trivially spoofable by an attacker and would let them forge the IP stored in
  * audit rows. Express's req.ip already honours XFF correctly when
- * app.set('trust proxy', N) is configured (see PRE_PRODUCTION_CHECKLIST.md
- * SEC-P8-006). In the default no-proxy case, req.ip falls back to the socket
- * peer, which cannot be spoofed from outside the network.
+ * app.set('trust proxy', N) is configured. In the default no-proxy case,
+ * req.ip falls back to the socket peer, which cannot be spoofed from outside the network.
  */
 function resolveIp(req: Request): string | null {
   return req.ip ?? req.socket.remoteAddress ?? null;
@@ -63,20 +69,22 @@ function resolveIp(req: Request): string | null {
 /**
  * Upsert a single configuration key in the given transaction.
  * Returns { before, after } for the audit row.
+ *
+ * Configuration.updatedBy is String? in the schema — pass String(actorId).
  */
 async function upsertConfigKey(
   tx: Parameters<Parameters<typeof prisma.$transaction>[0]>[0],
   key: string,
   newValue: unknown,
-  updatedBy: string,
+  updatedByStr: string,
 ): Promise<{ before: unknown | null; after: unknown }> {
   const existing = await tx.configuration.findUnique({ where: { key } });
   const before = existing ? existing.value : null;
 
   await tx.configuration.upsert({
     where: { key },
-    create: { key, value: newValue as import('@prisma/client').Prisma.InputJsonValue, updatedBy },
-    update: { value: newValue as import('@prisma/client').Prisma.InputJsonValue, updatedBy },
+    create: { key, value: newValue as import('@prisma/client').Prisma.InputJsonValue, updatedBy: updatedByStr },
+    update: { value: newValue as import('@prisma/client').Prisma.InputJsonValue, updatedBy: updatedByStr },
   });
 
   return { before, after: newValue };
@@ -87,8 +95,8 @@ async function upsertConfigKey(
 configurationRouter.get(
   '/attendance',
   requireSession(),
-  requireRole('Admin'),
-  async (req: Request, res: Response): Promise<void> => {
+  requireRole(RoleId.Admin),
+  async (_req: Request, res: Response): Promise<void> => {
     try {
       const config = await getAttendanceConfig();
       res.status(200).json({ data: config });
@@ -106,12 +114,13 @@ configurationRouter.get(
 configurationRouter.put(
   '/attendance',
   requireSession(),
-  requireRole('Admin'),
+  requireRole(RoleId.Admin),
   validateBody(UpdateAttendanceConfigSchema),
   async (req: Request, res: Response): Promise<void> => {
     try {
       const actorId = req.user!.id;
-      const actorRole = req.user!.role;
+      const actorRole = req.user!.roleId as AuditActorRoleValue;
+      const actorIdStr = String(actorId);
       const actorIp = resolveIp(req);
       const body = req.body as Partial<AttendanceConfig>;
 
@@ -127,7 +136,7 @@ configurationRouter.put(
             tx,
             'ATTENDANCE_LATE_THRESHOLD_TIME',
             body.lateThresholdTime,
-            actorId,
+            actorIdStr,
           );
           changedKeys.push({ key: 'ATTENDANCE_LATE_THRESHOLD_TIME', before, after });
 
@@ -139,10 +148,10 @@ configurationRouter.put(
             action: 'config.attendance.update',
             module: 'configuration',
             targetType: 'Configuration',
-            targetId: 'ATTENDANCE_LATE_THRESHOLD_TIME',
+            targetId: null,
             // BUG-CFG-003: use resolved before value so first-write audit is not null
-            before: { value: beforeResolved.lateThresholdTime },
-            after: { value: after },
+            before: { key: 'ATTENDANCE_LATE_THRESHOLD_TIME', value: beforeResolved.lateThresholdTime },
+            after: { key: 'ATTENDANCE_LATE_THRESHOLD_TIME', value: after },
           });
         }
 
@@ -151,7 +160,7 @@ configurationRouter.put(
             tx,
             'ATTENDANCE_STANDARD_DAILY_HOURS',
             body.standardDailyHours,
-            actorId,
+            actorIdStr,
           );
           changedKeys.push({ key: 'ATTENDANCE_STANDARD_DAILY_HOURS', before, after });
 
@@ -163,10 +172,10 @@ configurationRouter.put(
             action: 'config.attendance.update',
             module: 'configuration',
             targetType: 'Configuration',
-            targetId: 'ATTENDANCE_STANDARD_DAILY_HOURS',
+            targetId: null,
             // BUG-CFG-003: use resolved before value so first-write audit is not null
-            before: { value: beforeResolved.standardDailyHours },
-            after: { value: after },
+            before: { key: 'ATTENDANCE_STANDARD_DAILY_HOURS', value: beforeResolved.standardDailyHours },
+            after: { key: 'ATTENDANCE_STANDARD_DAILY_HOURS', value: after },
           });
         }
 
@@ -180,7 +189,7 @@ configurationRouter.put(
             tx,
             'ATTENDANCE_WEEKLY_OFF_DAYS',
             canonical,
-            actorId,
+            actorIdStr,
           );
           changedKeys.push({ key: 'ATTENDANCE_WEEKLY_OFF_DAYS', before, after });
 
@@ -192,16 +201,16 @@ configurationRouter.put(
             action: 'config.attendance.update',
             module: 'configuration',
             targetType: 'Configuration',
-            targetId: 'ATTENDANCE_WEEKLY_OFF_DAYS',
-            before: { value: beforeResolved.weeklyOffDays },
-            after: { value: after },
+            targetId: null,
+            before: { key: 'ATTENDANCE_WEEKLY_OFF_DAYS', value: beforeResolved.weeklyOffDays },
+            after: { key: 'ATTENDANCE_WEEKLY_OFF_DAYS', value: after },
           });
         }
 
         // Notify all active Admins (BL-044 — Configuration category)
         if (changedKeys.length > 0) {
           const admins = await tx.employee.findMany({
-            where: { role: 'Admin', status: 'Active' },
+            where: { roleId: RoleId.Admin, status: EmployeeStatus.Active },
             select: { id: true },
           });
 
@@ -242,8 +251,8 @@ configurationRouter.put(
 configurationRouter.get(
   '/leave',
   requireSession(),
-  requireRole('Admin'),
-  async (req: Request, res: Response): Promise<void> => {
+  requireRole(RoleId.Admin),
+  async (_req: Request, res: Response): Promise<void> => {
     try {
       const config = await getLeaveConfig();
       res.status(200).json({ data: config });
@@ -261,12 +270,13 @@ configurationRouter.get(
 configurationRouter.put(
   '/leave',
   requireSession(),
-  requireRole('Admin'),
+  requireRole(RoleId.Admin),
   validateBody(UpdateLeaveConfigSchema),
   async (req: Request, res: Response): Promise<void> => {
     try {
       const actorId = req.user!.id;
-      const actorRole = req.user!.role;
+      const actorRole = req.user!.roleId as AuditActorRoleValue;
+      const actorIdStr = String(actorId);
       const actorIp = resolveIp(req);
       const body = req.body as Partial<LeaveConfig>;
 
@@ -309,14 +319,12 @@ configurationRouter.put(
             tx,
             'LEAVE_CARRY_FORWARD_CAPS',
             merged,
-            actorId,
+            actorIdStr,
           );
           changedKeys.push({ key: 'LEAVE_CARRY_FORWARD_CAPS', before, after });
 
           // BUG-CFG-001 / SEC-003-P7: also sync leave_types.carryForwardCap so that
           // runCarryForward() (which reads lt.carryForwardCap) uses the updated value.
-          // Unknown type names are silently skipped — they are already blocked at the
-          // contract layer but we guard defensively here too.
           for (const [typeName, capValue] of Object.entries(merged)) {
             if (typeof capValue !== 'number') continue;
             try {
@@ -325,8 +333,7 @@ configurationRouter.put(
                 data: { carryForwardCap: capValue },
               });
             } catch {
-              // Unknown leave-type name — skip silently (safe: contract layer already
-              // validates incoming keys). Do NOT abort the whole transaction.
+              // Unknown leave-type name — skip silently (safe: contract layer already validates)
             }
           }
 
@@ -338,10 +345,10 @@ configurationRouter.put(
             action: 'config.leave.update',
             module: 'configuration',
             targetType: 'Configuration',
-            targetId: 'LEAVE_CARRY_FORWARD_CAPS',
+            targetId: null,
             // BUG-CFG-003: use resolved before value — includes code-defaults on first write
-            before: { value: beforeResolved.carryForwardCaps },
-            after: { value: after },
+            before: { key: 'LEAVE_CARRY_FORWARD_CAPS', value: beforeResolved.carryForwardCaps },
+            after: { key: 'LEAVE_CARRY_FORWARD_CAPS', value: after },
           });
         }
 
@@ -350,7 +357,7 @@ configurationRouter.put(
             tx,
             'LEAVE_ESCALATION_PERIOD_DAYS',
             body.escalationPeriodDays,
-            actorId,
+            actorIdStr,
           );
           changedKeys.push({ key: 'LEAVE_ESCALATION_PERIOD_DAYS', before, after });
 
@@ -362,10 +369,10 @@ configurationRouter.put(
             action: 'config.leave.update',
             module: 'configuration',
             targetType: 'Configuration',
-            targetId: 'LEAVE_ESCALATION_PERIOD_DAYS',
+            targetId: null,
             // BUG-CFG-003: use resolved before value
-            before: { value: beforeResolved.escalationPeriodDays },
-            after: { value: after },
+            before: { key: 'LEAVE_ESCALATION_PERIOD_DAYS', value: beforeResolved.escalationPeriodDays },
+            after: { key: 'LEAVE_ESCALATION_PERIOD_DAYS', value: after },
           });
         }
 
@@ -374,20 +381,18 @@ configurationRouter.put(
             tx,
             'LEAVE_MATERNITY_DAYS',
             body.maternityDays,
-            actorId,
+            actorIdStr,
           );
           changedKeys.push({ key: 'LEAVE_MATERNITY_DAYS', before, after });
 
-          // BUG-CFG-002: sync leave_types.maxDaysPerEvent for Maternity so that when
-          // Phase 2 eligibility enforcement lands (TODO: BUG-CFG-002) it reads the
-          // correct value, not the seed-time constant.
+          // BUG-CFG-002: sync leave_types.maxDaysPerEvent for Maternity
           try {
             await tx.leaveType.update({
               where: { name: 'Maternity' },
               data: { maxDaysPerEvent: body.maternityDays },
             });
           } catch {
-            // Maternity leave type not found — skip silently (seed gap, not fatal here)
+            // Maternity leave type not found — skip silently (seed gap, not fatal)
           }
 
           await audit({
@@ -398,10 +403,10 @@ configurationRouter.put(
             action: 'config.leave.update',
             module: 'configuration',
             targetType: 'Configuration',
-            targetId: 'LEAVE_MATERNITY_DAYS',
+            targetId: null,
             // BUG-CFG-003: use resolved before value
-            before: { value: beforeResolved.maternityDays },
-            after: { value: after },
+            before: { key: 'LEAVE_MATERNITY_DAYS', value: beforeResolved.maternityDays },
+            after: { key: 'LEAVE_MATERNITY_DAYS', value: after },
           });
         }
 
@@ -410,20 +415,18 @@ configurationRouter.put(
             tx,
             'LEAVE_PATERNITY_DAYS',
             body.paternityDays,
-            actorId,
+            actorIdStr,
           );
           changedKeys.push({ key: 'LEAVE_PATERNITY_DAYS', before, after });
 
-          // BUG-CFG-002: sync leave_types.maxDaysPerEvent for Paternity so that when
-          // Phase 2 eligibility enforcement lands (TODO: BUG-CFG-002) it reads the
-          // correct value, not the seed-time constant.
+          // BUG-CFG-002: sync leave_types.maxDaysPerEvent for Paternity
           try {
             await tx.leaveType.update({
               where: { name: 'Paternity' },
               data: { maxDaysPerEvent: body.paternityDays },
             });
           } catch {
-            // Paternity leave type not found — skip silently (seed gap, not fatal here)
+            // Paternity leave type not found — skip silently (seed gap, not fatal)
           }
 
           await audit({
@@ -434,17 +437,17 @@ configurationRouter.put(
             action: 'config.leave.update',
             module: 'configuration',
             targetType: 'Configuration',
-            targetId: 'LEAVE_PATERNITY_DAYS',
+            targetId: null,
             // BUG-CFG-003: use resolved before value
-            before: { value: beforeResolved.paternityDays },
-            after: { value: after },
+            before: { key: 'LEAVE_PATERNITY_DAYS', value: beforeResolved.paternityDays },
+            after: { key: 'LEAVE_PATERNITY_DAYS', value: after },
           });
         }
 
         // Notify all active Admins (BL-044 — Configuration category)
         if (changedKeys.length > 0) {
           const admins = await tx.employee.findMany({
-            where: { role: 'Admin', status: 'Active' },
+            where: { roleId: RoleId.Admin, status: EmployeeStatus.Active },
             select: { id: true },
           });
 
@@ -464,7 +467,6 @@ configurationRouter.put(
       });
 
       // Bust cache BEFORE reread so the after-snapshot reflects persisted values
-      // (BUG-CFG-003: stale cache would return the pre-upsert value as 'after').
       bustConfigCache();
 
       const updated = await getLeaveConfig();
@@ -486,8 +488,8 @@ configurationRouter.put(
 configurationRouter.get(
   '/encashment',
   requireSession(),
-  requireRole('Admin'),
-  async (req: Request, res: Response): Promise<void> => {
+  requireRole(RoleId.Admin),
+  async (_req: Request, res: Response): Promise<void> => {
     try {
       const config = await getEncashmentConfig();
       res.status(200).json({ data: config });
@@ -505,11 +507,12 @@ configurationRouter.get(
 configurationRouter.put(
   '/encashment',
   requireSession(),
-  requireRole('Admin'),
+  requireRole(RoleId.Admin),
   async (req: Request, res: Response): Promise<void> => {
     try {
       const actorId = req.user!.id;
-      const actorRole = req.user!.role;
+      const actorRole = req.user!.roleId as AuditActorRoleValue;
+      const actorIdStr = String(actorId);
       const actorIp = resolveIp(req);
       const body = req.body as Partial<EncashmentConfig>;
 
@@ -519,56 +522,60 @@ configurationRouter.put(
       await prisma.$transaction(async (tx) => {
         if (body.windowStartMonth !== undefined) {
           const { before, after } = await upsertConfigKey(
-            tx, 'ENCASHMENT_WINDOW_START_MONTH', body.windowStartMonth, actorId,
+            tx, 'ENCASHMENT_WINDOW_START_MONTH', body.windowStartMonth, actorIdStr,
           );
           changedKeys.push({ key: 'ENCASHMENT_WINDOW_START_MONTH', before, after });
           await audit({
             tx, actorId, actorRole, actorIp,
             action: 'config.encashment.update', module: 'configuration',
-            targetType: 'Configuration', targetId: 'ENCASHMENT_WINDOW_START_MONTH',
-            before: { value: beforeResolved.windowStartMonth }, after: { value: after },
+            targetType: 'Configuration', targetId: null,
+            before: { key: 'ENCASHMENT_WINDOW_START_MONTH', value: beforeResolved.windowStartMonth },
+            after: { key: 'ENCASHMENT_WINDOW_START_MONTH', value: after },
           });
         }
         if (body.windowEndMonth !== undefined) {
           const { before, after } = await upsertConfigKey(
-            tx, 'ENCASHMENT_WINDOW_END_MONTH', body.windowEndMonth, actorId,
+            tx, 'ENCASHMENT_WINDOW_END_MONTH', body.windowEndMonth, actorIdStr,
           );
           changedKeys.push({ key: 'ENCASHMENT_WINDOW_END_MONTH', before, after });
           await audit({
             tx, actorId, actorRole, actorIp,
             action: 'config.encashment.update', module: 'configuration',
-            targetType: 'Configuration', targetId: 'ENCASHMENT_WINDOW_END_MONTH',
-            before: { value: beforeResolved.windowEndMonth }, after: { value: after },
+            targetType: 'Configuration', targetId: null,
+            before: { key: 'ENCASHMENT_WINDOW_END_MONTH', value: beforeResolved.windowEndMonth },
+            after: { key: 'ENCASHMENT_WINDOW_END_MONTH', value: after },
           });
         }
         if (body.windowEndDay !== undefined) {
           const { before, after } = await upsertConfigKey(
-            tx, 'ENCASHMENT_WINDOW_END_DAY', body.windowEndDay, actorId,
+            tx, 'ENCASHMENT_WINDOW_END_DAY', body.windowEndDay, actorIdStr,
           );
           changedKeys.push({ key: 'ENCASHMENT_WINDOW_END_DAY', before, after });
           await audit({
             tx, actorId, actorRole, actorIp,
             action: 'config.encashment.update', module: 'configuration',
-            targetType: 'Configuration', targetId: 'ENCASHMENT_WINDOW_END_DAY',
-            before: { value: beforeResolved.windowEndDay }, after: { value: after },
+            targetType: 'Configuration', targetId: null,
+            before: { key: 'ENCASHMENT_WINDOW_END_DAY', value: beforeResolved.windowEndDay },
+            after: { key: 'ENCASHMENT_WINDOW_END_DAY', value: after },
           });
         }
         if (body.maxPercent !== undefined) {
           const { before, after } = await upsertConfigKey(
-            tx, 'ENCASHMENT_MAX_PERCENT', body.maxPercent, actorId,
+            tx, 'ENCASHMENT_MAX_PERCENT', body.maxPercent, actorIdStr,
           );
           changedKeys.push({ key: 'ENCASHMENT_MAX_PERCENT', before, after });
           await audit({
             tx, actorId, actorRole, actorIp,
             action: 'config.encashment.update', module: 'configuration',
-            targetType: 'Configuration', targetId: 'ENCASHMENT_MAX_PERCENT',
-            before: { value: beforeResolved.maxPercent }, after: { value: after },
+            targetType: 'Configuration', targetId: null,
+            before: { key: 'ENCASHMENT_MAX_PERCENT', value: beforeResolved.maxPercent },
+            after: { key: 'ENCASHMENT_MAX_PERCENT', value: after },
           });
         }
 
         if (changedKeys.length > 0) {
           const admins = await tx.employee.findMany({
-            where: { role: 'Admin', status: 'Active' },
+            where: { roleId: RoleId.Admin, status: EmployeeStatus.Active },
             select: { id: true },
           });
           const changeSummary = changedKeys

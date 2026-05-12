@@ -12,19 +12,20 @@
  */
 
 import type { Prisma } from '@prisma/client';
+import { LeaveStatus } from '../../lib/statusInt.js';
 
 /**
  * Compute the number of approved Unpaid leave days for an employee
  * that fall within [periodStart, periodEnd].
  *
- * @param employeeId  — employee to compute LOP for
+ * @param employeeId  — employee to compute LOP for (INT)
  * @param periodStart — first day of the pay period (inclusive)
  * @param periodEnd   — last day of the pay period (inclusive)
  * @param workingDays — cap: LOP days cannot exceed working days in the period
  * @param tx          — transaction client
  */
 export async function lopDaysFor(
-  employeeId: string,
+  employeeId: number,
   periodStart: Date,
   periodEnd: Date,
   workingDays: number,
@@ -43,7 +44,7 @@ export async function lopDaysFor(
     where: {
       employeeId,
       leaveTypeId: unpaidType.id,
-      status: 'Approved',
+      status: LeaveStatus.Approved,
       // Overlap condition: fromDate <= periodEnd AND toDate >= periodStart
       fromDate: { lte: periodEnd },
       toDate: { gte: periodStart },
