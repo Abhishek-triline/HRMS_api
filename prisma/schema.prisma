@@ -1,171 +1,248 @@
-// Nexora HRMS — Prisma schema (Phase 0)
-// BL-047 enforcement: REVOKE UPDATE, DELETE on audit_log runs as raw SQL
-// after migration (see migration script comment).
+// Nexora HRMS — Prisma schema (v2 — clean refactor)
+//
+// Per docs/HRMS_Schema_v2_Plan.md:
+//   • Every primary key is INT AUTO_INCREMENT (no cuids).
+//   • Every status/type/category column is plain INT — no Prisma enums.
+//   • Lookup data (roles, employment_types, departments, designations,
+//     genders, audit_modules, leave_types) lives in master tables.
+//   • All DB column names are snake_case via @map; Prisma field names stay
+//     camelCase so application code reads naturally.
+//   • No FOREIGN KEY constraints — `relationMode = "prisma"` enforces
+//     integrity at the application layer; @relation directives drive
+//     Prisma's client-side joins only.
+//
+// INT-code mappings are frozen — see docs/HRMS_Schema_v2_Plan.md §3 and
+// apps/api/src/lib/statusInt.ts. Never re-number; only append.
 
 generator client {
   provider = "prisma-client-js"
 }
 
 datasource db {
-  provider = "mysql"
-  url      = env("DATABASE_URL")
+  provider     = "mysql"
+  url          = env("DATABASE_URL")
+  relationMode = "prisma"
 }
 
-// ── Enums ────────────────────────────────────────────────────────────────────
+// ════════════════════════════════════════════════════════════════════════════
+// MASTER / LOOKUP TABLES
+// ════════════════════════════════════════════════════════════════════════════
 
-enum Role {
-  Employee
-  Manager
-  PayrollOfficer
-  Admin
+/// Master list of roles.
+/// Seed (frozen IDs): 1=Employee, 2=Manager, 3=PayrollOfficer, 4=Admin.
+/// status_id: 1=Active, 2=Deprecated.
+model Role {
+  id        Int      @id @default(autoincrement())
+  name      String   @unique
+  statusId  Int      @default(1) @map("status_id")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+  employees Employee[]
+  @@map("roles")
 }
 
-/// BL-022: employment type drives leave quotas and proration rules.
-enum EmploymentType {
-  Permanent
-  Contract
-  Intern
-  Probation
+/// Master list of employment types.
+/// Seed (frozen IDs): 1=Permanent, 2=Contract, 3=Probation, 4=Intern.
+model EmploymentType {
+  id        Int      @id @default(autoincrement())
+  name      String   @unique
+  statusId  Int      @default(1) @map("status_id")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+  employees Employee[]
+  @@map("employment_types")
 }
 
-/// Reason stored on ReportingManagerHistory rows when a row is closed.
-enum HistoryReason {
-  Initial
-  Reassigned
-  Exited
+/// Master list of departments. Admin can add new ones via the Admin UI.
+model Department {
+  id        Int      @id @default(autoincrement())
+  name      String   @unique
+  statusId  Int      @default(1) @map("status_id")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+  employees Employee[]
+  @@map("departments")
 }
 
-/// BL-006: Active / OnNotice / Exited are Admin-controlled.
-/// OnLeave is system-set on leave approval start, reverted on end.
-/// Inactive is the pre-first-login state.
-enum EmployeeStatus {
-  Active
-  OnNotice
-  Exited
-  OnLeave
-  Inactive
+/// Master list of designations / job titles. Admin can add new ones.
+model Designation {
+  id        Int      @id @default(autoincrement())
+  name      String   @unique
+  statusId  Int      @default(1) @map("status_id")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+  employees Employee[]
+  @@map("designations")
 }
 
-enum TokenPurpose {
-  FirstLogin
-  ResetPassword
+/// Master list of genders.
+/// Seed (frozen IDs): 1=Male, 2=Female, 3=Other, 4=PreferNotToSay.
+model Gender {
+  id        Int      @id @default(autoincrement())
+  name      String   @unique
+  statusId  Int      @default(1) @map("status_id")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+  employees Employee[]
+  @@map("genders")
 }
 
-// ── Tables ───────────────────────────────────────────────────────────────────
+/// Master list of audit-log modules.
+/// Seed (frozen IDs): 1=auth, 2=employees, 3=leave, 4=payroll, 5=attendance,
+/// 6=performance, 7=notifications, 8=audit, 9=configuration.
+model AuditModule {
+  id        Int      @id @default(autoincrement())
+  name      String   @unique
+  statusId  Int      @default(1) @map("status_id")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+  auditLogs AuditLog[]
+  @@map("audit_modules")
+}
+
+/// Master list of leave types.
+/// Seed (frozen IDs): 1=Annual, 2=Sick, 3=Casual, 4=Unpaid, 5=Maternity, 6=Paternity.
+model LeaveType {
+  id                    Int      @id @default(autoincrement())
+  name                  String   @unique
+  isEventBased          Boolean  @map("is_event_based")
+  requiresAdminApproval Boolean  @map("requires_admin_approval")
+  carryForwardCap       Int?     @map("carry_forward_cap")
+  maxDaysPerEvent       Int?     @map("max_days_per_event")
+  statusId              Int      @default(1) @map("status_id")
+  createdAt             DateTime @default(now()) @map("created_at")
+  updatedAt             DateTime @updatedAt @map("updated_at")
+
+  quotas        LeaveQuota[]
+  balances      LeaveBalance[]
+  requests      LeaveRequest[]
+  ledgerEntries LeaveBalanceLedger[]
+  @@map("leave_types")
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// CORE — EMPLOYEES + HIERARCHY
+// ════════════════════════════════════════════════════════════════════════════
 
 /// Core employee record. BL-008: code is EMP-YYYY-NNNN and never reused.
+/// status_id (§3.1): 1=Active, 2=OnNotice, 3=OnLeave, 4=Inactive, 5=Exited.
 model Employee {
-  id                String         @id @default(cuid())
+  id           Int      @id @default(autoincrement())
   /// BL-008 — unique, never reused, generated transactionally per year
-  code              String         @unique
-  email             String         @unique
-  /// stored as first+last or full name
-  name              String
-  passwordHash      String
-  role              Role
-  status            EmployeeStatus @default(Inactive)
-  /// Employment type drives leave quotas and proration (BL-022a)
-  employmentType    EmploymentType @default(Permanent)
-  department        String?
-  designation       String?
-  /// Optional personal information — nullable so existing rows are unaffected
-  phone             String?
-  /// Stored as a date column (time component ignored). YYYY-MM-DD.
-  dateOfBirth       DateTime?      @db.Date
-  /// One of: Male | Female | Other | PreferNotToSay — validated by Zod at the API layer.
-  gender            String?
-  reportingManagerId String?
-  reportingManager  Employee?      @relation("EmployeeManager", fields: [reportingManagerId], references: [id])
-  reports           Employee[]     @relation("EmployeeManager")
-  /// The most recent prior manager id — fast lookup for past-team queries (BL-022a)
-  previousReportingManagerId String?
-  joinDate          DateTime       @db.Date
-  exitDate          DateTime?      @db.Date
-  /// UC-FL-01: forces password reset on first login
-  mustResetPassword Boolean        @default(false)
-  /// Optimistic concurrency token (BL-034 applies to all mutable resources)
-  version           Int            @default(0)
-  createdAt         DateTime       @default(now())
-  updatedAt         DateTime       @updatedAt
+  code         String   @unique
+  email        String   @unique
+  name         String
+  passwordHash String   @map("password_hash")
 
-  sessions              Session[]
-  passwordResetTokens   PasswordResetToken[]
-  loginAttempts         LoginAttempt[]
-  auditActorEntries     AuditLog[]           @relation("AuditActor")
-  salaryStructures      SalaryStructure[]
-  reportingManagerHistory ReportingManagerHistory[] @relation("EmployeeHistory")
-  managedHistories        ReportingManagerHistory[] @relation("ManagerHistory")
-  // Phase 2 — Leave
-  leaveRequests           LeaveRequest[]     @relation("EmployeeLeaveRequests")
-  leaveRequestsApproving  LeaveRequest[]     @relation("LeaveApprover")
-  leaveBalances           LeaveBalance[]
-  leaveBalanceLedger      LeaveBalanceLedger[] @relation("EmployeeLedger")
-  // Phase 3 — Attendance & Regularisation
-  attendanceRecords       AttendanceRecord[]  @relation("EmployeeAttendance")
-  regularisations         RegularisationRequest[] @relation("EmployeeRegularisations")
-  regularisationsApproving RegularisationRequest[] @relation("RegularisationApprover")
-  lateLedger              AttendanceLateLedger[] @relation("EmployeeLateLedger")
-  // Phase 4 — Payroll
-  payrollRunsInitiated    PayrollRun[]           @relation("PayrollInitiator")
-  payrollRunsFinalised    PayrollRun[]           @relation("PayrollFinaliser")
-  payrollRunsReversed     PayrollRun[]           @relation("PayrollReverser")
-  payslips                Payslip[]              @relation("EmployeePayslips")
-  idempotencyKeys         IdempotencyKey[]       @relation("EmployeeIdempotencyKeys")
-  // Phase 5 — Performance Reviews
-  performanceCyclesCreated  PerformanceCycle[]   @relation("CycleCreatedBy")
-  performanceCyclesClosed   PerformanceCycle[]   @relation("CycleClosedBy")
-  reviewsAsEmployee         PerformanceReview[]  @relation("ReviewEmployee")
-  reviewsAsManager          PerformanceReview[]  @relation("ReviewManager")
-  reviewsAsPreviousManager  PerformanceReview[]  @relation("ReviewPreviousManager")
-  // Phase 6 — Notifications
-  notifications             Notification[]       @relation("EmployeeNotifications")
-  // Leave Encashment (additive)
-  leaveEncashments          LeaveEncashment[]    @relation("EmployeeEncashments")
-  encashmentsApproving      LeaveEncashment[]    @relation("EncashmentApprover")
+  // Master FKs — INT columns; no DB-level FK constraints (relationMode=prisma)
+  roleId             Int      @map("role_id")
+  role               Role     @relation(fields: [roleId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  employmentTypeId   Int      @default(1) @map("employment_type_id")
+  employmentType     EmploymentType @relation(fields: [employmentTypeId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  departmentId       Int?     @map("department_id")
+  department         Department? @relation(fields: [departmentId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  designationId      Int?     @map("designation_id")
+  designation        Designation? @relation(fields: [designationId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  genderId           Int?     @map("gender_id")
+  gender             Gender?  @relation(fields: [genderId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+
+  /// §3.1 status code. Default 4=Inactive (pre-first-login).
+  statusId           Int      @default(4) @map("status_id")
+
+  // Optional personal info
+  phone        String?
+  dateOfBirth  DateTime? @db.Date @map("date_of_birth")
+
+  // Self-relation: reporting manager
+  reportingManagerId         Int?      @map("reporting_manager_id")
+  reportingManager           Employee? @relation("EmployeeManager", fields: [reportingManagerId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  reports                    Employee[] @relation("EmployeeManager")
+  previousReportingManagerId Int?      @map("previous_reporting_manager_id")
+
+  joinDate          DateTime  @db.Date @map("join_date")
+  exitDate          DateTime? @db.Date @map("exit_date")
+  mustResetPassword Boolean   @default(false) @map("must_reset_password")
+
+  version           Int       @default(0)
+  createdAt         DateTime  @default(now()) @map("created_at")
+  updatedAt         DateTime  @updatedAt @map("updated_at")
+
+  // Back-references
+  sessions                  Session[]
+  passwordResetTokens       PasswordResetToken[]
+  loginAttempts             LoginAttempt[]
+  auditActorEntries         AuditLog[] @relation("AuditActor")
+  salaryStructures          SalaryStructure[]
+  reportingManagerHistory   ReportingManagerHistory[] @relation("EmployeeHistory")
+  managedHistories          ReportingManagerHistory[] @relation("ManagerHistory")
+  leaveRequests             LeaveRequest[] @relation("EmployeeLeaveRequests")
+  leaveRequestsApproving    LeaveRequest[] @relation("LeaveApprover")
+  leaveBalances             LeaveBalance[]
+  leaveBalanceLedger        LeaveBalanceLedger[] @relation("EmployeeLedger")
+  attendanceRecords         AttendanceRecord[] @relation("EmployeeAttendance")
+  regularisations           RegularisationRequest[] @relation("EmployeeRegularisations")
+  regularisationsApproving  RegularisationRequest[] @relation("RegularisationApprover")
+  lateLedger                AttendanceLateLedger[] @relation("EmployeeLateLedger")
+  payrollRunsInitiated      PayrollRun[] @relation("PayrollInitiator")
+  payrollRunsFinalised      PayrollRun[] @relation("PayrollFinaliser")
+  payrollRunsReversed       PayrollRun[] @relation("PayrollReverser")
+  payslips                  Payslip[] @relation("EmployeePayslips")
+  idempotencyKeys           IdempotencyKey[] @relation("EmployeeIdempotencyKeys")
+  performanceCyclesCreated  PerformanceCycle[] @relation("CycleCreatedBy")
+  performanceCyclesClosed   PerformanceCycle[] @relation("CycleClosedBy")
+  reviewsAsEmployee         PerformanceReview[] @relation("ReviewEmployee")
+  reviewsAsManager          PerformanceReview[] @relation("ReviewManager")
+  reviewsAsPreviousManager  PerformanceReview[] @relation("ReviewPreviousManager")
+  notifications             Notification[] @relation("EmployeeNotifications")
+  leaveEncashments          LeaveEncashment[] @relation("EmployeeEncashments")
+  encashmentsApproving      LeaveEncashment[] @relation("EncashmentApprover")
 
   @@index([email])
   @@index([reportingManagerId])
   @@index([previousReportingManagerId])
+  @@index([roleId])
+  @@index([employmentTypeId])
+  @@index([departmentId])
+  @@index([designationId])
+  @@index([genderId])
+  @@index([statusId])
   @@map("employees")
 }
 
 /// Salary structure history. One row per change; active = latest effectiveFrom <= today.
-/// BL-030: salary edits apply from the next payroll run only; old payslips are immutable.
+/// BL-030: salary edits apply from the next payroll run; old payslips immutable.
 model SalaryStructure {
-  id              String   @id @default(cuid())
-  employeeId      String
-  employee        Employee @relation(fields: [employeeId], references: [id], onDelete: Cascade)
-  basicPaise      Int      /// stored as integer paise to avoid float drift
-  allowancesPaise Int      /// sum of HRA + special + transport, etc.
-  effectiveFrom   DateTime @db.Date
-  createdAt       DateTime @default(now())
-  /// Optimistic concurrency token
+  id              Int      @id @default(autoincrement())
+  employeeId      Int      @map("employee_id")
+  employee        Employee @relation(fields: [employeeId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  basicPaise      Int      @map("basic_paise")
+  allowancesPaise Int      @map("allowances_paise")
+  effectiveFrom   DateTime @db.Date @map("effective_from")
+  createdAt       DateTime @default(now()) @map("created_at")
   version         Int      @default(0)
-  /// Optional allowance component breakdown (nullable — existing rows unaffected).
-  /// When present: hraPaise + transportPaise + otherPaise == allowancesPaise (enforced at app layer).
-  hraPaise        Int?     /// HRA component in paise
-  transportPaise  Int?     /// Transport allowance in paise
-  otherPaise      Int?     /// Other allowances in paise
-  /// Dearness Allowance. Nullable; legacy rows default to null → treated as 0 (BL-LE-07).
-  daPaise         Int?
+
+  // Optional component breakdown
+  hraPaise        Int?     @map("hra_paise")
+  transportPaise  Int?     @map("transport_paise")
+  otherPaise      Int?     @map("other_paise")
+  daPaise         Int?     @map("da_paise")
 
   @@index([employeeId, effectiveFrom(sort: Desc)])
   @@map("salary_structures")
 }
 
 /// Audit trail for reporting-manager assignments. BL-007: never deleted.
-/// Insert Initial on employee creation; close row and insert new row on reassign.
+/// reason_id (§3.8 history): 1=Initial, 2=Reassigned, 3=Exited.
 model ReportingManagerHistory {
-  id         String        @id @default(cuid())
-  employeeId String
-  employee   Employee      @relation("EmployeeHistory", fields: [employeeId], references: [id], onDelete: Cascade)
-  managerId  String?
-  manager    Employee?     @relation("ManagerHistory", fields: [managerId], references: [id], onDelete: SetNull)
-  fromDate   DateTime      @db.Date
-  /// null means currently open (this is the active assignment)
-  toDate     DateTime?     @db.Date
-  reason     HistoryReason
-  createdAt  DateTime      @default(now())
+  id         Int       @id @default(autoincrement())
+  employeeId Int       @map("employee_id")
+  employee   Employee  @relation("EmployeeHistory", fields: [employeeId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  managerId  Int?      @map("manager_id")
+  manager    Employee? @relation("ManagerHistory", fields: [managerId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  fromDate   DateTime  @db.Date @map("from_date")
+  toDate     DateTime? @db.Date @map("to_date")
+  reasonId   Int       @map("reason_id")
+  createdAt  DateTime  @default(now()) @map("created_at")
 
   @@index([employeeId, fromDate(sort: Desc)])
   @@index([managerId, toDate])
@@ -173,139 +250,82 @@ model ReportingManagerHistory {
 }
 
 /// Session row. iron-session data maps to this.
-/// Sliding expiry: 12 h default, 30 days if rememberMe.
 model Session {
-  id          String    @id @default(cuid())
-  employeeId  String
-  employee    Employee  @relation(fields: [employeeId], references: [id], onDelete: Cascade)
-  ip          String?
-  userAgent   String?   @db.Text
-  expiresAt   DateTime
-  createdAt   DateTime  @default(now())
+  id         Int       @id @default(autoincrement())
+  /// Public session token returned in the cookie (random hex).
+  token      String    @unique
+  employeeId Int       @map("employee_id")
+  employee   Employee  @relation(fields: [employeeId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  ip         String?
+  userAgent  String?   @db.Text @map("user_agent")
+  expiresAt  DateTime  @map("expires_at")
+  createdAt  DateTime  @default(now()) @map("created_at")
 
-  @@index([employeeId, expiresAt])
+  @@index([employeeId])
+  @@index([expiresAt])
   @@map("sessions")
 }
 
-/// Single-use password reset / first-login token.
-/// Raw token is sent over email; only the hash is stored (BL-047).
-model PasswordResetToken {
-  id          String       @id @default(cuid())
-  employeeId  String
-  employee    Employee     @relation(fields: [employeeId], references: [id], onDelete: Cascade)
-  tokenHash   String       @unique
-  purpose     TokenPurpose
-  expiresAt   DateTime
-  usedAt      DateTime?
-  createdAt   DateTime     @default(now())
-
-  @@index([tokenHash])
-  @@map("password_reset_tokens")
-}
-
-/// Login attempt log — used for 5-strikes-in-15-min lockout.
+/// Login attempt log — feeds the lockout check.
 model LoginAttempt {
-  id         String    @id @default(cuid())
+  id         Int       @id @default(autoincrement())
   email      String
-  employeeId String?
-  employee   Employee? @relation(fields: [employeeId], references: [id], onDelete: SetNull)
   ip         String
   success    Boolean
-  createdAt  DateTime  @default(now())
+  employeeId Int?      @map("employee_id")
+  employee   Employee? @relation(fields: [employeeId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  createdAt  DateTime  @default(now()) @map("created_at")
 
-  @@index([email])
-  @@index([email, ip, createdAt])
+  @@index([email, createdAt])
+  @@index([ip, createdAt])
   @@map("login_attempts")
 }
 
-/// Append-only audit log. BL-047 / BL-048.
-/// DB enforces append-only via REVOKE UPDATE, DELETE (see migration).
-/// id is a ULID (generated application-side for monotonic ordering).
-model AuditLog {
-  id          String   @id // ULID generated by application
-  actorId     String?
-  actor       Employee? @relation("AuditActor", fields: [actorId], references: [id], onDelete: SetNull)
-  actorRole   String
-  actorIp     String?
-  action      String   // e.g. "auth.login.success"
-  targetType  String?
-  targetId    String?
-  module      String
-  before      Json?
-  after       Json?
-  createdAt   DateTime @default(now())
+/// One-shot token used for first-login and password-reset flows.
+/// purpose_id (§3.8): 1=FirstLogin, 2=ResetPassword.
+model PasswordResetToken {
+  id         Int       @id @default(autoincrement())
+  tokenHash  String    @unique @map("token_hash")
+  employeeId Int       @map("employee_id")
+  employee   Employee  @relation(fields: [employeeId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  purposeId  Int       @map("purpose_id")
+  expiresAt  DateTime  @map("expires_at")
+  usedAt     DateTime? @map("used_at")
+  createdAt  DateTime  @default(now()) @map("created_at")
 
-  @@index([actorId])
-  @@index([action])
-  @@index([createdAt])
-  @@index([targetType, targetId])
-  @@map("audit_log")
+  @@index([employeeId])
+  @@index([expiresAt])
+  @@map("password_reset_tokens")
 }
 
-/// System configuration (A-19 and related). Key-value store.
-/// Seeded with all configurable defaults on first run.
-model Configuration {
-  key       String   @id
-  value     Json
-  updatedBy String?
-  updatedAt DateTime @updatedAt
+// ════════════════════════════════════════════════════════════════════════════
+// LEAVE
+// ════════════════════════════════════════════════════════════════════════════
 
-  @@map("configuration")
-}
-
-// ── Phase 2 — Leave Management ───────────────────────────────────────────────
-
-/// BL-011 / BL-015 / BL-016: Leave type definitions.
-/// name is validated as one of the 6 canonical types at the application layer (zod).
-/// isEventBased=true for Maternity/Paternity (no annual accrual).
-model LeaveType {
-  id                    String   @id @default(cuid())
-  name                  String   @unique   // 'Annual'|'Sick'|'Casual'|'Unpaid'|'Maternity'|'Paternity'
-  isEventBased          Boolean
-  requiresAdminApproval Boolean
-  /// Annual + Casual carry forward; Sick/Unpaid/event-based = 0 or null
-  carryForwardCap       Int?
-  /// Maternity = 182 days (26w), Paternity = 10 days; null for accrual types
-  maxDaysPerEvent       Int?
-  createdAt             DateTime @default(now())
-  updatedAt             DateTime @updatedAt
-
-  quotas     LeaveQuota[]
-  balances   LeaveBalance[]
-  requests   LeaveRequest[]
-  ledger     LeaveBalanceLedger[]
-
-  @@map("leave_types")
-}
-
-/// Per-employment-type entitlement for each accrual leave type.
-/// Maternity/Paternity have no quota rows (event-based, no annual limit).
+/// Leave quotas — days per year per leave type per employment type.
 model LeaveQuota {
-  id              String         @id @default(cuid())
-  leaveTypeId     String
-  leaveType       LeaveType      @relation(fields: [leaveTypeId], references: [id], onDelete: Cascade)
-  employmentType  EmploymentType
-  daysPerYear     Int
+  id               Int        @id @default(autoincrement())
+  leaveTypeId      Int        @map("leave_type_id")
+  leaveType        LeaveType  @relation(fields: [leaveTypeId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  employmentTypeId Int        @map("employment_type_id")
+  daysPerYear      Int        @map("days_per_year")
 
-  @@unique([leaveTypeId, employmentType])
-  @@index([leaveTypeId])
+  @@unique([leaveTypeId, employmentTypeId])
   @@map("leave_quotas")
 }
 
-/// Per-employee per-year balance snapshot (BL-021).
-/// version for optimistic concurrency on balance mutations.
-/// daysUsed tracks lifetime usage for event-based types in a given year.
+/// Running balance per employee / leave type / year. Refreshed by carry-forward cron.
 model LeaveBalance {
-  id            String    @id @default(cuid())
-  employeeId    String
-  employee      Employee  @relation(fields: [employeeId], references: [id], onDelete: Cascade)
-  leaveTypeId   String
-  leaveType     LeaveType @relation(fields: [leaveTypeId], references: [id], onDelete: Cascade)
-  year          Int       // calendar year
-  daysRemaining Int       @default(0)
-  daysUsed      Int       @default(0)  // running tally; for event-based: lifetime used this year
-  /// Days encashed in this year (BL-LE-06). Separate from daysUsed.
-  daysEncashed  Int       @default(0)
+  id            Int       @id @default(autoincrement())
+  employeeId    Int       @map("employee_id")
+  employee      Employee  @relation(fields: [employeeId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  leaveTypeId   Int       @map("leave_type_id")
+  leaveType     LeaveType @relation(fields: [leaveTypeId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  year          Int
+  daysRemaining Int       @default(0) @map("days_remaining")
+  daysUsed      Int       @default(0) @map("days_used")
+  /// Days encashed this year (BL-LE-06). Separate from daysUsed.
+  daysEncashed  Int       @default(0) @map("days_encashed")
   version       Int       @default(0)
 
   @@unique([employeeId, leaveTypeId, year])
@@ -313,613 +333,446 @@ model LeaveBalance {
   @@map("leave_balances")
 }
 
-/// Tracks pending + resolved leave requests. BL-009 / BL-019 / BL-020 / BL-021.
-model LeaveRequest {
-  id                 String              @id @default(cuid())
-  /// Format: L-YYYY-NNNN (same pattern as EMP code)
-  code               String              @unique
-  employeeId         String
-  employee           Employee            @relation("EmployeeLeaveRequests", fields: [employeeId], references: [id], onDelete: Cascade)
-  leaveTypeId        String
-  leaveType          LeaveType           @relation(fields: [leaveTypeId], references: [id], onDelete: Restrict)
-  fromDate           DateTime            @db.Date
-  toDate             DateTime            @db.Date
-  days               Int                 // server-computed inclusive count (BL-011)
-  reason             String              @db.Text
-  status             LeaveRequestStatus  @default(Pending)
-  routedTo           RoutedTo
-  /// The current approver (Manager or Admin). Null after final decision.
-  approverId         String?
-  approver           Employee?           @relation("LeaveApprover", fields: [approverId], references: [id], onDelete: SetNull)
-  decidedAt          DateTime?
-  decidedBy          String?             // employee id of the decision-maker
-  decisionNote       String?             @db.Text
-  escalatedAt        DateTime?           // set by the hourly cron (BL-018)
-  cancelledAt        DateTime?
-  cancelledBy        String?
-  /// BL-020: true when cancellation happens on/after fromDate
-  cancelledAfterStart Boolean            @default(false)
-  /// Balance deduction recorded on approval (BL-021); 0 until approved
-  deductedDays       Int                 @default(0)
-  /// Days restored on cancellation (BL-020)
-  restoredDays       Int                 @default(0)
-  createdAt          DateTime            @default(now())
-  updatedAt          DateTime            @updatedAt
-  version            Int                 @default(0)
-
-  ledgerEntries      LeaveBalanceLedger[]
-
-  @@index([employeeId, fromDate])
-  @@index([approverId, status])
-  @@index([status, escalatedAt])
-  @@map("leave_requests")
-}
-
-/// Append-only ledger — every balance change is a row (BL-021 traceability).
-/// Reconstruct the balance at any point by summing delta for (employeeId, leaveTypeId, year).
+/// Append-only ledger of every balance mutation. BL-047 immutable.
+/// reason_id (§3.2): 1=Initial, 2=Approval, 3=Cancellation, 4=CarryForward, 5=Adjustment, 6=LateMarkPenalty.
 model LeaveBalanceLedger {
-  id               String        @id @default(cuid())
-  employeeId       String
-  employee         Employee      @relation("EmployeeLedger", fields: [employeeId], references: [id], onDelete: Cascade)
-  leaveTypeId      String
-  leaveType        LeaveType     @relation(fields: [leaveTypeId], references: [id], onDelete: Cascade)
+  id               Int       @id @default(autoincrement())
+  employeeId       Int       @map("employee_id")
+  employee         Employee  @relation("EmployeeLedger", fields: [employeeId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  leaveTypeId      Int       @map("leave_type_id")
+  leaveType        LeaveType @relation(fields: [leaveTypeId], references: [id], onDelete: NoAction, onUpdate: NoAction)
   year             Int
-  /// Positive = grant; negative = deduction (full days only, BL-011)
   delta            Int
-  reason           LedgerReason
-  /// The leave request that triggered this entry (null for adjustments/carry-forward)
-  relatedRequestId String?
-  relatedRequest   LeaveRequest? @relation(fields: [relatedRequestId], references: [id], onDelete: SetNull)
-  createdBy        String?       // actorId; null for system/cron
-  createdAt        DateTime      @default(now())
+  reasonId         Int       @map("reason_id")
+  relatedRequestId Int?      @map("related_request_id")
+  createdBy        Int?      @map("created_by")
+  createdAt        DateTime  @default(now()) @map("created_at")
 
-  @@index([employeeId, leaveTypeId, year])
-  @@index([relatedRequestId])
+  @@index([employeeId, year, createdAt])
   @@map("leave_balance_ledger")
 }
 
-/// Counter table for generating L-YYYY-NNNN codes — same pattern as EMP code.
+/// Per-year counter for L-YYYY-NNNN codes.
 model LeaveCodeCounter {
-  year    Int @id
-  lastSeq Int @default(0)
-
+  year   Int @id
+  number Int @default(0)
   @@map("leave_code_counters")
 }
 
-// ── Leave enums ──────────────────────────────────────────────────────────────
-
-enum LeaveRequestStatus {
-  Pending
-  Approved
-  Rejected
-  Cancelled
-  Escalated
+/// Per-year counter for LE-YYYY-NNNN encashment codes.
+model EncashmentCodeCounter {
+  year   Int @id
+  number Int @default(0)
+  @@map("encashment_code_counters")
 }
 
-enum RoutedTo {
-  Manager
-  Admin
+/// Leave request.
+/// status_id (§3.2): 1=Pending, 2=Approved, 3=Rejected, 4=Cancelled, 5=Escalated.
+/// routed_to_id (§3.2): 1=Manager, 2=Admin.
+model LeaveRequest {
+  id                  Int       @id @default(autoincrement())
+  code                String    @unique
+  employeeId          Int       @map("employee_id")
+  employee            Employee  @relation("EmployeeLeaveRequests", fields: [employeeId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  leaveTypeId         Int       @map("leave_type_id")
+  leaveType           LeaveType @relation(fields: [leaveTypeId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  fromDate            DateTime  @db.Date @map("from_date")
+  toDate              DateTime  @db.Date @map("to_date")
+  days                Int
+  reason              String    @db.Text
+  statusId            Int       @default(1) @map("status_id")
+  routedToId          Int       @map("routed_to_id")
+  approverId          Int?      @map("approver_id")
+  approver            Employee? @relation("LeaveApprover", fields: [approverId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  decidedAt           DateTime? @map("decided_at")
+  decidedBy           Int?      @map("decided_by")
+  decisionNote        String?   @db.Text @map("decision_note")
+  escalatedAt         DateTime? @map("escalated_at")
+  cancelledAt         DateTime? @map("cancelled_at")
+  cancelledBy         Int?      @map("cancelled_by")
+  cancelledAfterStart Boolean   @default(false) @map("cancelled_after_start")
+  deductedDays        Int       @default(0) @map("deducted_days")
+  restoredDays        Int       @default(0) @map("restored_days")
+  version             Int       @default(0)
+  createdAt           DateTime  @default(now()) @map("created_at")
+  updatedAt           DateTime  @updatedAt @map("updated_at")
+
+  @@index([employeeId, statusId])
+  @@index([approverId, statusId])
+  @@index([statusId, escalatedAt])
+  @@map("leave_requests")
 }
 
-enum LedgerReason {
-  Approval
-  Cancellation
-  CarryForward
-  Adjustment
-  Initial
-  LateMarkPenalty
-}
+// ════════════════════════════════════════════════════════════════════════════
+// ATTENDANCE + REGULARISATION
+// ════════════════════════════════════════════════════════════════════════════
 
-// ── Phase 3 — Attendance & Regularisation ────────────────────────────────────
-
-/// BL-026: Status derivation priority: OnLeave > WeeklyOff/Holiday > Present > Absent.
-/// Stored without hyphens; mapped to contract enum (On-Leave, Weekly-Off) at boundary.
-enum AttendanceStatus {
-  Present
-  Absent
-  OnLeave
-  WeeklyOff
-  Holiday
-}
-
-/// BL-007: system = original midnight row; regularisation = corrected overlay row.
-/// BL-007 mandates: NEVER delete rows. Corrections append a new row.
-enum AttendanceSource {
-  system
-  regularisation
-}
-
-/// Regularisation request status — matches contract RegStatusSchema.
-enum RegStatusDb {
-  Pending
-  Approved
-  Rejected
-}
-
-/// Regularisation routing — matches contract RegRoutedToSchema.
-enum RegRoutedToDb {
-  Manager
-  Admin
-}
-
-/// Attendance record. BL-023: one row per active employee per day (default Absent).
-/// BL-007: rows are NEVER deleted. Regularisation corrections add a new row.
-/// UNIQUE (employeeId, date, source) so the system row and regularisation overlay coexist.
-model AttendanceRecord {
-  id                 String            @id @default(cuid())
-  employeeId         String
-  employee           Employee          @relation("EmployeeAttendance", fields: [employeeId], references: [id], onDelete: Cascade)
-  date               DateTime          @db.Date
-  status             AttendanceStatus
-  checkInTime        DateTime?
-  checkOutTime       DateTime?
-  /// Server-computed: (checkOutTime − checkInTime) in minutes. BL-025.
-  hoursWorkedMinutes Int?
-  /// BL-027: true when checkInTime > configured LATE_THRESHOLD.
-  late               Boolean           @default(false)
-  /// Running count of late marks in the calendar month at the time this row was last written.
-  lateMonthCount     Int               @default(0)
-  /// True when this Absent day incurs LOP at payroll time.
-  lopApplied         Boolean           @default(false)
-  /// BL-007: system = midnight-generated; regularisation = approved correction overlay.
-  source             AttendanceSource
-  /// Set when source = regularisation — links to the approving RegularisationRequest.
-  regularisationId   String?
-  regularisation     RegularisationRequest? @relation("AttendanceCorrection", fields: [regularisationId], references: [id], onDelete: SetNull)
-  createdAt          DateTime          @default(now())
-  /// Optimistic concurrency token (BL-034).
-  version            Int               @default(0)
-
-  @@unique([employeeId, date, source])
-  @@index([employeeId, date])
-  @@index([date, status])
-  @@map("attendance_records")
-}
-
-/// Regularisation request. BL-029: ≤7 days → Manager; >7 days → Admin.
-/// BL-010: cannot overlap an approved leave on the same date.
-model RegularisationRequest {
-  id                 String          @id @default(cuid())
-  /// Format: R-YYYY-NNNN
-  code               String          @unique
-  employeeId         String
-  employee           Employee        @relation("EmployeeRegularisations", fields: [employeeId], references: [id], onDelete: Cascade)
-  /// The date being corrected (always in the past).
-  date               DateTime        @db.Date
-  proposedCheckIn    DateTime?
-  proposedCheckOut   DateTime?
-  reason             String          @db.Text
-  status             RegStatusDb     @default(Pending)
-  /// BL-029: age-based routing (≤7d → Manager, >7d → Admin).
-  routedTo           RegRoutedToDb
-  /// Captured at submit time — snapshot for the audit trail.
-  ageDaysAtSubmit    Int
-  /// Current owner of the approval queue.
-  approverId         String?
-  approver           Employee?       @relation("RegularisationApprover", fields: [approverId], references: [id], onDelete: SetNull)
-  decidedAt          DateTime?
-  decidedBy          String?
-  decisionNote       String?         @db.Text
-  /// Link to the corrected AttendanceRecord row created on approval (BL-026).
-  correctedRecordId  String?
-  createdAt          DateTime        @default(now())
-  updatedAt          DateTime        @updatedAt
-  /// Optimistic concurrency token (BL-034).
-  version            Int             @default(0)
-
-  correctedRecord    AttendanceRecord[] @relation("AttendanceCorrection")
-
-  @@index([employeeId, date])
-  @@index([approverId, status])
-  @@index([status, routedTo])
-  @@map("regularisation_requests")
-}
-
-/// Counter table for generating R-YYYY-NNNN codes — mirrors LeaveCodeCounter.
-model RegCodeCounter {
-  year    Int @id
-  lastSeq Int @default(0)
-
-  @@map("reg_code_counters")
-}
-
-/// Tracks monthly late counts for BL-028 deduction logic.
-/// UNIQUE (employeeId, year, month) ensures idempotent upserts.
+/// Per-month late-mark count per employee. BL-028 penalty driver.
 model AttendanceLateLedger {
-  id         String   @id @default(cuid())
-  employeeId String
-  employee   Employee @relation("EmployeeLateLedger", fields: [employeeId], references: [id], onDelete: Cascade)
+  id         Int      @id @default(autoincrement())
+  employeeId Int      @map("employee_id")
+  employee   Employee @relation("EmployeeLateLedger", fields: [employeeId], references: [id], onDelete: NoAction, onUpdate: NoAction)
   year       Int
-  /// 1-12 calendar month.
   month      Int
-  /// Running count of late marks this employee has in this year/month.
   count      Int      @default(0)
+  updatedAt  DateTime @updatedAt @map("updated_at")
 
   @@unique([employeeId, year, month])
   @@map("attendance_late_ledger")
 }
 
-/// Holiday calendar. BL-026: holidays are identified via this table.
-/// Admin replaces the calendar per year via PUT /config/holidays.
-model Holiday {
-  id    String   @id @default(cuid())
-  year  Int
-  date  DateTime @db.Date
-  name  String   @db.VarChar(120)
+/// Attendance record. BL-023: one row per active employee per day.
+/// status_id (§3.4): 1=Present, 2=Absent, 3=OnLeave, 4=WeeklyOff, 5=Holiday.
+/// source_id (§3.4): 1=system, 2=regularisation.
+model AttendanceRecord {
+  id                 Int       @id @default(autoincrement())
+  employeeId         Int       @map("employee_id")
+  employee           Employee  @relation("EmployeeAttendance", fields: [employeeId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  date               DateTime  @db.Date
+  statusId           Int       @map("status_id")
+  checkInTime        DateTime? @map("check_in_time")
+  checkOutTime       DateTime? @map("check_out_time")
+  hoursWorkedMinutes Int?      @map("hours_worked_minutes")
+  late               Boolean   @default(false)
+  lateMonthCount     Int       @default(0) @map("late_month_count")
+  lopApplied         Boolean   @default(false) @map("lop_applied")
+  sourceId           Int       @map("source_id")
+  regularisationId   Int?      @map("regularisation_id")
+  regularisation     RegularisationRequest? @relation(fields: [regularisationId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  version            Int       @default(0)
+  createdAt          DateTime  @default(now()) @map("created_at")
 
-  @@unique([year, date])
-  @@index([date])
+  @@unique([employeeId, date, sourceId])
+  @@index([employeeId, date])
+  @@index([date, statusId])
+  @@map("attendance_records")
+}
+
+/// Year-keyed counter for R-YYYY-NNNN regularisation codes.
+model RegCodeCounter {
+  year   Int @id
+  number Int @default(0)
+  @@map("reg_code_counters")
+}
+
+/// Regularisation request.
+/// status_id (§3.4): 1=Pending, 2=Approved, 3=Rejected.
+/// routed_to_id (§3.4): 1=Manager, 2=Admin.
+model RegularisationRequest {
+  id                Int       @id @default(autoincrement())
+  code              String    @unique
+  employeeId        Int       @map("employee_id")
+  employee          Employee  @relation("EmployeeRegularisations", fields: [employeeId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  date              DateTime  @db.Date
+  proposedCheckIn   DateTime? @map("proposed_check_in")
+  proposedCheckOut  DateTime? @map("proposed_check_out")
+  reason            String    @db.Text
+  statusId          Int       @default(1) @map("status_id")
+  routedToId        Int       @map("routed_to_id")
+  ageDaysAtSubmit   Int       @map("age_days_at_submit")
+  approverId        Int?      @map("approver_id")
+  approver          Employee? @relation("RegularisationApprover", fields: [approverId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  decidedAt         DateTime? @map("decided_at")
+  decidedBy         Int?      @map("decided_by")
+  decisionNote      String?   @db.Text @map("decision_note")
+  correctedRecordId Int?      @unique @map("corrected_record_id")
+  version           Int       @default(0)
+  createdAt         DateTime  @default(now()) @map("created_at")
+  updatedAt         DateTime  @updatedAt @map("updated_at")
+
+  attendanceRecords AttendanceRecord[]
+
+  @@index([employeeId, statusId])
+  @@index([approverId, statusId])
+  @@map("regularisation_requests")
+}
+
+/// Public holiday. BL-026: workdays exclude these.
+model Holiday {
+  id        Int      @id @default(autoincrement())
+  date      DateTime @db.Date
+  name      String
+  year      Int
+  /// Optional source label (manual / gazette / custom) — free text.
+  source    String?
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@unique([date])
+  @@index([year])
   @@map("holidays")
 }
 
-// ── Phase 4 — Payroll Processing ─────────────────────────────────────────────
+// ════════════════════════════════════════════════════════════════════════════
+// PAYROLL
+// ════════════════════════════════════════════════════════════════════════════
 
-/// BL-034: run lifecycle status.
-/// Draft → Review → Finalised → (Reversed via a new reversal run record)
-enum PayrollRunStatusDb {
-  Draft
-  Review
-  Finalised
-  Reversed
-}
-
-/// Mirrors PayrollRunStatusDb — payslips track the same lifecycle.
-/// Reversal payslip records carry Reversed; originals stay Finalised (BL-031 / BL-032).
-enum PayslipStatusDb {
-  Draft
-  Review
-  Finalised
-  Reversed
-}
-
-/// Payroll run. One per month per origination (original has reversalOfRunId=NULL;
-/// reversal records have reversalOfRunId set to the source).
-/// BL-034: UNIQUE (month, year, reversalOfRunId) allows original + reversal to coexist.
-model PayrollRun {
-  id              String             @id @default(cuid())
-  /// RUN-YYYY-MM for originals; RUN-YYYY-MM-R<n> for reversal records.
-  code            String             @unique
-  month           Int                // 1–12
-  year            Int
-  status          PayrollRunStatusDb @default(Review)
-  workingDays     Int
-  periodStart     DateTime           @db.Date
-  periodEnd       DateTime           @db.Date
-  initiatedBy     String
-  initiator       Employee           @relation("PayrollInitiator", fields: [initiatedBy], references: [id])
-  finalisedBy     String?
-  finaliser       Employee?          @relation("PayrollFinaliser", fields: [finalisedBy], references: [id])
-  finalisedAt     DateTime?
-  reversedBy      String?
-  reverser        Employee?          @relation("PayrollReverser", fields: [reversedBy], references: [id])
-  reversedAt      DateTime?
-  reversalReason  String?            @db.Text
-  /// Points to the original run when this is a reversal record. Null on originals.
-  reversalOfRunId String?
-  reversalOf      PayrollRun?        @relation("PayrollReversal", fields: [reversalOfRunId], references: [id])
-  reversalRuns    PayrollRun[]       @relation("PayrollReversal")
-  createdAt       DateTime           @default(now())
-  updatedAt       DateTime           @updatedAt
-  /// Optimistic concurrency token (BL-034).
-  version         Int                @default(0)
-
-  payslips        Payslip[]
-
-  /// BL-034: original (NULL reversalOfRunId) is unique per month+year;
-  /// multiple reversal records per month+year are allowed (n can increment).
-  @@unique([month, year, reversalOfRunId])
-  @@index([year, status])
-  @@map("payroll_runs")
-}
-
-/// Payslip. One per employee per run. Immutable once Finalised (BL-031).
-/// Reversal creates new rows; originals are never modified (BL-032).
-model Payslip {
-  id                   String          @id @default(cuid())
-  /// P-YYYY-MM-NNNN — globally unique across all payslips.
-  code                 String          @unique
-  runId                String
-  run                  PayrollRun      @relation(fields: [runId], references: [id])
-  employeeId           String
-  employee             Employee        @relation("EmployeePayslips", fields: [employeeId], references: [id])
-  month                Int
-  year                 Int
-  status               PayslipStatusDb @default(Review)
-  periodStart          DateTime        @db.Date
-  periodEnd            DateTime        @db.Date
-  workingDays          Int
-  /// Days actually worked — used for BL-036 proration.
-  daysWorked           Int
-  /// Loss of pay days (BL-035).
-  lopDays              Int             @default(0)
-  /// Snapshot of the active salary structure (BL-030).
-  basicPaise           Int
-  allowancesPaise      Int
-  /// Pro-rated gross for this period (BL-036).
-  grossPaise           Int
-  /// LOP deduction paise (BL-035).
-  lopDeductionPaise    Int             @default(0)
-  /// Reference tax = gross × standardRate (BL-036a).
-  referenceTaxPaise    Int             @default(0)
-  /// Final tax — editable by PO until run is Finalised (BL-036a).
-  finalTaxPaise        Int             @default(0)
-  /// Other deductions (PF, etc.) — zero in v1.
-  otherDeductionsPaise Int             @default(0)
-  /// Net pay = gross − lop − finalTax − other; never negative (BL-035).
-  netPayPaise          Int
-  finalisedAt          DateTime?
-  /// Encashment days paid in this payslip (BL-LE-09). 0 if no encashment.
-  encashmentDays       Int             @default(0)
-  /// Encashment amount in paise (BL-LE-08). Adds to gross.
-  encashmentPaise      Int             @default(0)
-  /// FK to the encashment record paid in this payslip. Null for payslips without encashment.
-  encashmentId         String?         @unique
-  encashment           LeaveEncashment? @relation("PayslipEncashment", fields: [encashmentId], references: [id])
-  /// Set on reversal payslips — points to the original payslip (BL-032).
-  reversalOfPayslipId  String?
-  reversalOfPayslip    Payslip?        @relation("PayslipReversal", fields: [reversalOfPayslipId], references: [id])
-  reversalPayslips     Payslip[]       @relation("PayslipReversal")
-  /// Set on original payslip when a reversal row exists.
-  reversedByPayslipId  String?         @unique
-  reversedByPayslip    Payslip?        @relation("PayslipReversedBy", fields: [reversedByPayslipId], references: [id])
-  reversedByPayslipRef Payslip[]       @relation("PayslipReversedBy")
-  createdAt            DateTime        @default(now())
-  updatedAt            DateTime        @updatedAt
-  /// Optimistic concurrency token.
-  version              Int             @default(0)
-
-  @@index([employeeId, year, month])
-  @@index([runId])
-  @@index([status])
-  @@map("payslips")
-}
-
-/// Counter table for generating RUN and Payslip codes.
-/// kind: 'run' for RUN-YYYY-MM codes, 'payslip' for P-YYYY-MM-NNNN codes.
-/// Indexed on (year, month, kind) — each combination holds its own sequence.
+/// Year-month counter for RUN-YYYY-MM-NN codes.
 model PayrollCodeCounter {
-  id      String @id @default(cuid())
-  year    Int
-  month   Int
-  kind    String // 'run' | 'payslip'
-  lastSeq Int    @default(0)
-
-  @@unique([year, month, kind])
+  year   Int
+  month  Int
+  number Int @default(0)
+  @@id([year, month])
   @@map("payroll_code_counters")
 }
 
-/// Idempotency-Key store (SEC-004-P3 close-out).
-/// One row per (userId, key). TTL: 24 h — cleanup cron deletes stale rows.
-model IdempotencyKey {
-  id           String   @id @default(cuid())
-  userId       String
-  user         Employee @relation("EmployeeIdempotencyKeys", fields: [userId], references: [id], onDelete: Cascade)
-  key          String
-  path         String
-  status       Int
-  responseBody Json
-  createdAt    DateTime @default(now())
+/// Payroll run. status_id (§3.5): 1=Draft, 2=Review, 3=Finalised, 4=Reversed.
+model PayrollRun {
+  id              Int       @id @default(autoincrement())
+  code            String    @unique
+  month           Int
+  year            Int
+  statusId        Int       @default(2) @map("status_id")
+  workingDays     Int       @map("working_days")
+  periodStart     DateTime  @db.Date @map("period_start")
+  periodEnd       DateTime  @db.Date @map("period_end")
+  initiatedBy     Int       @map("initiated_by")
+  initiator       Employee  @relation("PayrollInitiator", fields: [initiatedBy], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  initiatedAt     DateTime  @default(now()) @map("initiated_at")
+  finalisedBy     Int?      @map("finalised_by")
+  finaliser       Employee? @relation("PayrollFinaliser", fields: [finalisedBy], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  finalisedAt     DateTime? @map("finalised_at")
+  reversedBy      Int?      @map("reversed_by")
+  reverser        Employee? @relation("PayrollReverser", fields: [reversedBy], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  reversedAt      DateTime? @map("reversed_at")
+  reversalReason  String?   @db.Text @map("reversal_reason")
+  reversalOfRunId Int?      @map("reversal_of_run_id")
+  version         Int       @default(0)
 
-  @@unique([userId, key])
-  @@index([userId, key])
-  @@map("idempotency_keys")
+  payslips Payslip[]
+
+  @@unique([month, year, reversalOfRunId])
+  @@index([statusId, year, month])
+  @@map("payroll_runs")
 }
 
-// ── Phase 5 — Performance Reviews ────────────────────────────────────────────
+/// Payslip. status_id (§3.5, same as PayrollRun): 1=Draft, 2=Review, 3=Finalised, 4=Reversed.
+model Payslip {
+  id                   Int       @id @default(autoincrement())
+  code                 String    @unique
+  runId                Int       @map("run_id")
+  run                  PayrollRun @relation(fields: [runId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  employeeId           Int       @map("employee_id")
+  employee             Employee  @relation("EmployeePayslips", fields: [employeeId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  month                Int
+  year                 Int
+  statusId             Int       @default(2) @map("status_id")
+  periodStart          DateTime  @db.Date @map("period_start")
+  periodEnd            DateTime  @db.Date @map("period_end")
+  workingDays          Int       @map("working_days")
+  daysWorked           Int       @map("days_worked")
+  lopDays              Int       @default(0) @map("lop_days")
+  basicPaise           Int       @map("basic_paise")
+  allowancesPaise      Int       @map("allowances_paise")
+  grossPaise           Int       @map("gross_paise")
+  lopDeductionPaise    Int       @default(0) @map("lop_deduction_paise")
+  referenceTaxPaise    Int       @default(0) @map("reference_tax_paise")
+  finalTaxPaise        Int       @default(0) @map("final_tax_paise")
+  otherDeductionsPaise Int       @default(0) @map("other_deductions_paise")
+  netPayPaise          Int       @map("net_pay_paise")
+  encashmentDays       Int       @default(0) @map("encashment_days")
+  encashmentPaise      Int       @default(0) @map("encashment_paise")
+  encashmentId         Int?      @unique @map("encashment_id")
+  encashment           LeaveEncashment? @relation("PayslipEncashment", fields: [encashmentId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  finalisedAt          DateTime? @map("finalised_at")
+  reversalOfPayslipId  Int?      @unique @map("reversal_of_payslip_id")
+  reversedByPayslipId  Int?      @unique @map("reversed_by_payslip_id")
+  reversedByPayslip    Payslip?  @relation("PayslipReversedBy", fields: [reversedByPayslipId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  reversedByPayslipRef Payslip[] @relation("PayslipReversedBy")
+  version              Int       @default(0)
+  createdAt            DateTime  @default(now()) @map("created_at")
+  updatedAt            DateTime  @updatedAt @map("updated_at")
 
-/// BL-041: lifecycle of a performance cycle.
-/// Enum values match the DB storage (no hyphens); mapped to contract enum at boundary.
-enum CycleStatusDb {
-  Open
-  SelfReview
-  ManagerReview
-  Closed
+  @@unique([runId, employeeId])
+  @@index([employeeId, year, month])
+  @@map("payslips")
 }
 
-/// Goal outcome — set by Manager (BL-038). Pending until rated.
-enum GoalOutcomeDb {
-  Met
-  Partial
-  Missed
-  Pending
+// ════════════════════════════════════════════════════════════════════════════
+// LEAVE ENCASHMENT
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Leave encashment request.
+/// status_id (§3.3): 1=Pending, 2=ManagerApproved, 3=AdminFinalised, 4=Paid, 5=Rejected, 6=Cancelled.
+/// routed_to_id (§3.3): 1=Manager, 2=Admin.
+model LeaveEncashment {
+  id              Int       @id @default(autoincrement())
+  code            String    @unique
+  employeeId      Int       @map("employee_id")
+  employee        Employee  @relation("EmployeeEncashments", fields: [employeeId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  year            Int
+  daysRequested   Int       @map("days_requested")
+  daysApproved    Int?      @map("days_approved")
+  ratePerDayPaise Int?      @map("rate_per_day_paise")
+  amountPaise     Int?      @map("amount_paise")
+  statusId        Int       @default(1) @map("status_id")
+  routedToId      Int       @map("routed_to_id")
+  approverId      Int?      @map("approver_id")
+  approver        Employee? @relation("EncashmentApprover", fields: [approverId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  decidedAt       DateTime? @map("decided_at")
+  decidedBy       Int?      @map("decided_by")
+  decisionNote    String?   @db.Text @map("decision_note")
+  escalatedAt     DateTime? @map("escalated_at")
+  paidAt          DateTime? @map("paid_at")
+  cancelledAt     DateTime? @map("cancelled_at")
+  cancelledBy     Int?      @map("cancelled_by")
+  version         Int       @default(0)
+  createdAt       DateTime  @default(now()) @map("created_at")
+  updatedAt       DateTime  @updatedAt @map("updated_at")
+
+  paidInPayslip   Payslip[] @relation("PayslipEncashment")
+
+  @@index([employeeId, year, statusId])
+  @@map("leave_encashments")
 }
 
-/// Performance cycle. One per fiscal half (H1 = Apr–Sep, H2 = Oct–Mar).
-/// Code format: C-YYYY-H1 or C-YYYY-H2 (unique, derived from fyStart).
+// ════════════════════════════════════════════════════════════════════════════
+// PERFORMANCE
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Performance cycle.
+/// status_id (§3.6): 1=Open, 2=SelfReview, 3=ManagerReview, 4=Closed.
 model PerformanceCycle {
-  id                   String         @id @default(cuid())
-  /// C-YYYY-H1 or C-YYYY-H2 — unique per fiscal half year
-  code                 String         @unique
-  fyStart              DateTime       @db.Date
-  fyEnd                DateTime       @db.Date
-  status               CycleStatusDb  @default(Open)
-  selfReviewDeadline   DateTime       @db.Date
-  managerReviewDeadline DateTime      @db.Date
-  closedAt             DateTime?
-  closedBy             String?
-  closedByEmployee     Employee?      @relation("CycleClosedBy", fields: [closedBy], references: [id], onDelete: SetNull)
-  createdBy            String
-  createdByEmployee    Employee       @relation("CycleCreatedBy", fields: [createdBy], references: [id])
-  /// Count of participants (excludes mid-cycle joiners — BL-037)
-  participants         Int            @default(0)
-  createdAt            DateTime       @default(now())
-  updatedAt            DateTime       @updatedAt
-  /// Optimistic concurrency token (BL-034)
-  version              Int            @default(0)
+  id                    Int       @id @default(autoincrement())
+  code                  String    @unique
+  fyStart               DateTime  @db.Date @map("fy_start")
+  fyEnd                 DateTime  @db.Date @map("fy_end")
+  statusId              Int       @default(1) @map("status_id")
+  selfReviewDeadline    DateTime  @db.Date @map("self_review_deadline")
+  managerReviewDeadline DateTime  @db.Date @map("manager_review_deadline")
+  closedAt              DateTime? @map("closed_at")
+  closedBy              Int?      @map("closed_by")
+  closer                Employee? @relation("CycleClosedBy", fields: [closedBy], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  createdBy             Int       @map("created_by")
+  creator               Employee  @relation("CycleCreatedBy", fields: [createdBy], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  createdAt             DateTime  @default(now()) @map("created_at")
+  updatedAt             DateTime  @updatedAt @map("updated_at")
+  version               Int       @default(0)
 
-  reviews              PerformanceReview[]
+  reviews PerformanceReview[]
 
-  @@index([status])
-  @@index([fyStart])
   @@map("performance_cycles")
 }
 
-// ── Phase 6 — Notifications ──────────────────────────────────────────────────
-
-/// Category enum — mirrors NotificationCategorySchema in @nexora/contracts/notifications.
-/// Stored without hyphens; mapped at the application boundary.
-enum NotificationCategoryDb {
-  Leave
-  Attendance
-  Payroll
-  Performance
-  Status
-  Configuration
-  Auth
-  System
-}
-
-/// In-app notification feed. BL-043: system-generated only (no public POST).
-/// BL-044: every query MUST filter recipientId = user.id.
-/// BL-045: archived after NOTIFICATION_RETENTION_DAYS (default 90) by a daily cron.
-/// BL-046: in-app only — no email/SMS/push integration.
-model Notification {
-  id           String                  @id @default(cuid())
-  recipientId  String
-  recipient    Employee                @relation("EmployeeNotifications", fields: [recipientId], references: [id], onDelete: Cascade)
-  category     NotificationCategoryDb
-  /// ≤ 120 chars — enforced at the application layer before insert
-  title        String                  @db.VarChar(120)
-  /// ≤ 600 chars — plain text only (BL-046)
-  body         String                  @db.VarChar(600)
-  /// Deep link to the originating record, e.g. /employee/leave/L-2026-0118
-  link         String?
-  unread       Boolean                 @default(true)
-  /// References the audit_log row that produced this notification (BL-047 link)
-  auditLogId   String?
-  createdAt    DateTime                @default(now())
-
-  /// BL-044: unread feed sorted by newest first
-  @@index([recipientId, unread])
-  /// Cursor-pagination / feed queries
-  @@index([recipientId, createdAt(sort: Desc)])
-  /// Retention sweep — daily cron deletes rows older than retentionDays (BL-045)
-  @@index([createdAt])
-  @@map("notifications")
-}
-
-/// Performance review. One per employee per cycle.
-/// BL-042: when a manager is reassigned mid-cycle, previousManagerId captures the
-/// old manager so the audit retains both.
+/// Performance review row per (cycle, employee).
 model PerformanceReview {
-  id                   String         @id @default(cuid())
-  cycleId              String
-  cycle                PerformanceCycle @relation(fields: [cycleId], references: [id], onDelete: Cascade)
-  employeeId           String
-  employee             Employee       @relation("ReviewEmployee", fields: [employeeId], references: [id], onDelete: Cascade)
-  /// BL-042: current manager; may change mid-cycle via reassign-manager endpoint.
-  managerId            String?
-  manager              Employee?      @relation("ReviewManager", fields: [managerId], references: [id], onDelete: SetNull)
-  /// BL-042: previous manager captured on reassignment so both appear in the audit.
-  previousManagerId    String?
-  previousManager      Employee?      @relation("ReviewPreviousManager", fields: [previousManagerId], references: [id], onDelete: SetNull)
-  /// 1–5; editable until selfReviewDeadline (BL-039)
-  selfRating           Int?
-  selfNote             String?        @db.Text
-  selfSubmittedAt      DateTime?
-  /// 1–5; sets managerOverrodeSelf if differs from selfRating (BL-040)
-  managerRating        Int?
-  managerNote          String?        @db.Text
-  managerSubmittedAt   DateTime?
-  /// BL-040: true when managerRating != selfRating
-  managerOverrodeSelf  Boolean        @default(false)
-  /// = managerRating once cycle Closes (BL-041)
-  finalRating          Int?
-  lockedAt             DateTime?
-  /// BL-037: true for employees who joined after fyStart
-  isMidCycleJoiner     Boolean        @default(false)
-  createdAt            DateTime       @default(now())
-  updatedAt            DateTime       @updatedAt
-  /// Optimistic concurrency token
-  version              Int            @default(0)
+  id                  Int       @id @default(autoincrement())
+  cycleId             Int       @map("cycle_id")
+  cycle               PerformanceCycle @relation(fields: [cycleId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  employeeId          Int       @map("employee_id")
+  employee            Employee  @relation("ReviewEmployee", fields: [employeeId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  managerId           Int?      @map("manager_id")
+  manager             Employee? @relation("ReviewManager", fields: [managerId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  previousManagerId   Int?      @map("previous_manager_id")
+  previousManager     Employee? @relation("ReviewPreviousManager", fields: [previousManagerId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  selfRating          Int?      @map("self_rating")
+  selfNote            String?   @db.Text @map("self_note")
+  managerRating       Int?      @map("manager_rating")
+  managerNote         String?   @db.Text @map("manager_note")
+  managerOverrodeSelf Boolean   @default(false) @map("manager_overrode_self")
+  finalRating         Int?      @map("final_rating")
+  lockedAt            DateTime? @map("locked_at")
+  version             Int       @default(0)
+  createdAt           DateTime  @default(now()) @map("created_at")
+  updatedAt           DateTime  @updatedAt @map("updated_at")
 
-  goals                Goal[]
+  goals Goal[]
 
   @@unique([cycleId, employeeId])
-  @@index([cycleId, managerId])
   @@index([employeeId])
   @@map("performance_reviews")
 }
 
-/// Goal within a review. Manager creates; Employee may propose (BL-038).
+/// Goal under a review.
+/// outcome_id (§3.6): 1=Pending, 2=Met, 3=Partial, 4=Missed.
 model Goal {
-  id                   String         @id @default(cuid())
-  reviewId             String
-  review               PerformanceReview @relation(fields: [reviewId], references: [id], onDelete: Cascade)
-  text                 String         @db.Text
-  outcome              GoalOutcomeDb  @default(Pending)
-  /// BL-038: true when proposed by the Employee during self-review window
-  proposedByEmployee   Boolean        @default(false)
-  createdAt            DateTime       @default(now())
-  /// Optimistic concurrency token
-  version              Int            @default(0)
+  id                 Int       @id @default(autoincrement())
+  reviewId           Int       @map("review_id")
+  review             PerformanceReview @relation(fields: [reviewId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  text               String    @db.Text
+  outcomeId          Int       @default(1) @map("outcome_id")
+  proposedByEmployee Boolean   @default(false) @map("proposed_by_employee")
+  version            Int       @default(0)
+  createdAt          DateTime  @default(now()) @map("created_at")
+  updatedAt          DateTime  @updatedAt @map("updated_at")
 
   @@index([reviewId])
   @@map("goals")
 }
 
-// ── Leave Encashment (additive) ───────────────────────────────────────────────
+// ════════════════════════════════════════════════════════════════════════════
+// NOTIFICATIONS + AUDIT + CONFIGURATION
+// ════════════════════════════════════════════════════════════════════════════
 
-/// BL-LE-05: status machine for leave encashment requests.
-enum LeaveEncashmentStatusDb {
-  Pending
-  ManagerApproved
-  AdminFinalised
-  Paid
-  Rejected
-  Cancelled
+/// Notification feed item.
+/// category_id (§3.7): 1=Leave, 2=Attendance, 3=Payroll, 4=Performance, 5=Status,
+/// 6=Configuration, 7=Auth, 8=System.
+model Notification {
+  id          Int       @id @default(autoincrement())
+  recipientId Int       @map("recipient_id")
+  recipient   Employee  @relation("EmployeeNotifications", fields: [recipientId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  categoryId  Int       @map("category_id")
+  title       String
+  body        String    @db.Text
+  link        String?
+  unread      Boolean   @default(true)
+  auditLogId  Int?      @map("audit_log_id")
+  createdAt   DateTime  @default(now()) @map("created_at")
+
+  @@index([recipientId, unread, createdAt(sort: Desc)])
+  @@index([createdAt])
+  @@map("notifications")
 }
 
-/// Leave encashment request. BL-LE-01 to BL-LE-14.
-/// One approved encashment per employee per calendar year (BL-LE-03).
-/// DB-level partial unique index is NOT possible in MySQL; enforced in application
-/// logic via findFirst check at submit + approve time (see leave-encashment.service.ts).
-/// The @@unique([employeeId, year, status]) below is a documentation-only placeholder
-/// that Prisma will NOT create in the DB migration — we rely on app-layer enforcement.
-model LeaveEncashment {
-  id                  String                   @id @default(cuid())
-  /// LE-YYYY-NNNN — globally unique.
-  code                String                   @unique
-  employeeId          String
-  employee            Employee                 @relation("EmployeeEncashments", fields: [employeeId], references: [id])
-  year                Int                      // calendar year the balance was earned in
-  daysRequested       Int                      // employee-stated; server clamps to 50%
-  daysApproved        Int?                     // set at AdminFinalised; null until then
-  /// Locked snapshot at AdminFinalised — basicPaise + daPaise from the active SalaryStructure.
-  ratePerDayPaise     Int?
-  /// daysApproved × ratePerDayPaise; locked at AdminFinalised.
-  amountPaise         Int?
-  status              LeaveEncashmentStatusDb  @default(Pending)
-  /// Same routing model as leave_requests.
-  routedTo            String                   // 'Manager' | 'Admin'
-  approverId          String?                  // current approver
-  approver            Employee?                @relation("EncashmentApprover", fields: [approverId], references: [id])
-  decidedAt           DateTime?
-  decidedBy           String?
-  decisionNote        String?                  @db.Text
-  /// Set when Manager-SLA escalates to Admin.
-  escalatedAt         DateTime?
-  /// Payslip that paid this encashment. Null until payroll run picks it up.
-  paidInPayslipId     String?                  @unique
-  paidInPayslip       Payslip?                 @relation("PayslipEncashment")
-  paidAt              DateTime?
-  /// Cancellation provenance.
-  cancelledAt         DateTime?
-  cancelledBy         String?
-  version             Int                      @default(0)
-  createdAt           DateTime                 @default(now())
-  updatedAt           DateTime                 @updatedAt
+/// Append-only audit log. BL-047 enforced by REVOKE UPDATE/DELETE post-migration.
+/// target_type_id (§3.9): 1=Employee, 2=LeaveRequest, 3=LeaveEncashment, 4=AttendanceRecord,
+/// 5=RegularisationRequest, 6=PayrollRun, 7=Payslip, 8=PerformanceCycle,
+/// 9=PerformanceReview, 10=Goal, 11=Configuration, 12=SalaryStructure, 13=Holiday,
+/// 14=Notification.
+/// actor_role_id (§3.9): 1=Employee, 2=Manager, 3=PayrollOfficer, 4=Admin, 99=unknown, 100=system.
+/// module_id: FK to audit_modules master.
+model AuditLog {
+  id            Int       @id @default(autoincrement())
+  actorId       Int?      @map("actor_id")
+  actor         Employee? @relation("AuditActor", fields: [actorId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  actorRoleId   Int       @map("actor_role_id")
+  actorIp       String?   @map("actor_ip")
+  action        String
+  targetTypeId  Int?      @map("target_type_id")
+  targetId      Int?      @map("target_id")
+  moduleId      Int       @map("module_id")
+  module        AuditModule @relation(fields: [moduleId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  before        Json?
+  after         Json?
+  createdAt     DateTime  @default(now()) @map("created_at")
 
-  @@index([employeeId, year])
-  @@index([status, year])
-  @@index([approverId, status])
-  @@map("leave_encashments")
+  @@index([actorId])
+  @@index([action])
+  @@index([createdAt])
+  @@index([targetTypeId, targetId])
+  @@index([moduleId])
+  @@map("audit_log")
 }
 
-/// Counter table for generating LE-YYYY-NNNN codes.
-model EncashmentCodeCounter {
-  year    Int @id
-  lastSeq Int @default(0)
+/// Key/value configuration store. PK is the key string (semantic lookup).
+model Configuration {
+  key       String   @id
+  value     Json
+  updatedBy String?  @map("updated_by")
+  updatedAt DateTime @updatedAt @map("updated_at")
+  @@map("configurations")
+}
 
-  @@map("encashment_code_counters")
+/// Idempotency key store for guarded mutation endpoints.
+model IdempotencyKey {
+  id               Int       @id @default(autoincrement())
+  key              String    @unique
+  employeeId       Int       @map("employee_id")
+  employee         Employee  @relation("EmployeeIdempotencyKeys", fields: [employeeId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  endpoint         String
+  responseSnapshot Json      @map("response_snapshot")
+  createdAt        DateTime  @default(now()) @map("created_at")
+
+  @@index([createdAt])
+  @@map("idempotency_keys")
 }
