@@ -351,6 +351,498 @@ async function seedDemoAccounts(): Promise<void> {
   }
 }
 
+// ── Dummy data — populates every otherwise-empty table ──────────────────────
+//
+// Idempotent via a marker check on the first row of every section. Re-running
+// the seed will not duplicate dummy data. Staging-only project — these rows
+// give QA realistic shapes across every module.
+
+import crypto from 'node:crypto';
+
+const DUMMY_YEAR = 2026;
+
+/** Generate a 32-hex token (used for session + reset tokens). */
+const randomHex = (bytes = 32): string => crypto.randomBytes(bytes).toString('hex');
+
+/** Fixed pseudo-IP rotator so dummy data looks plausible. */
+const fakeIp = (i: number): string => `10.0.${(i >> 8) & 0xff}.${i & 0xff}`;
+
+async function seedDummyData(): Promise<void> {
+  // Marker check — if L-2026-0001 already exists, the dummy block has already run.
+  const marker = await prisma.leaveRequest.findFirst({ where: { code: 'L-2026-0001' } });
+  if (marker) {
+    console.log('  [dummy] already seeded, skipping');
+    return;
+  }
+
+  // Resolve the 4 demo employees by stable email.
+  const [adminEmp, mgrEmp, empEmp, payEmp] = await Promise.all([
+    prisma.employee.findUniqueOrThrow({ where: { email: ADMIN_EMAIL } }),
+    prisma.employee.findUniqueOrThrow({ where: { email: 'manager@triline.co.in' } }),
+    prisma.employee.findUniqueOrThrow({ where: { email: 'employee@triline.co.in' } }),
+    prisma.employee.findUniqueOrThrow({ where: { email: 'payroll@triline.co.in' } }),
+  ]);
+  const employees = [adminEmp, mgrEmp, empEmp, payEmp]; // ids 1..4
+  const empIds = employees.map((e) => e.id);
+
+  // ── sessions (20) — 5 per employee, all active for 30 days ────────────────
+  const now = new Date();
+  await prisma.session.createMany({
+    data: Array.from({ length: 20 }, (_, i) => ({
+      token: randomHex(),
+      employeeId: empIds[i % 4]!,
+      ip: fakeIp(i),
+      userAgent: 'Mozilla/5.0 (X11; Linux x86_64) NexoraSeed/1.0',
+      expiresAt: new Date(now.getTime() + (30 - i) * 86_400_000),
+    })),
+  });
+
+  // ── login_attempts (+17) — mix of success/failure ─────────────────────────
+  await prisma.loginAttempt.createMany({
+    data: Array.from({ length: 17 }, (_, i) => {
+      const emp = employees[i % 4]!;
+      const success = i % 3 !== 0;
+      return {
+        email: emp.email,
+        ip: fakeIp(i + 100),
+        success,
+        employeeId: success ? emp.id : null,
+        createdAt: new Date(now.getTime() - (17 - i) * 3_600_000),
+      };
+    }),
+  });
+
+  // ── password_reset_tokens (20) ───────────────────────────────────────────
+  await prisma.passwordResetToken.createMany({
+    data: Array.from({ length: 20 }, (_, i) => {
+      const used = i % 3 === 0;
+      const expired = i % 4 === 0;
+      const exp = new Date(now.getTime() + (expired ? -86_400_000 : 86_400_000));
+      return {
+        tokenHash: crypto.createHash('sha256').update(`reset-${i}-${Date.now()}`).digest('hex'),
+        employeeId: empIds[i % 4]!,
+        purposeId: i % 5 === 0 ? 1 : 2, // 1=FirstLogin, 2=ResetPassword
+        expiresAt: exp,
+        usedAt: used ? new Date(now.getTime() - 3_600_000 * i) : null,
+      };
+    }),
+  });
+
+  // ── leave_requests (20) + leave_code_counter ──────────────────────────────
+  const leaveRequestsData = Array.from({ length: 20 }, (_, i) => {
+    const emp = employees[i % 4]!;
+    const leaveTypeId = ((i % 6) + 1) as 1 | 2 | 3 | 4 | 5 | 6;
+    const isEventBased = leaveTypeId === 5 || leaveTypeId === 6;
+    // Manager (id=2) approves emp's requests; admin (id=1) approves mgr/payroll;
+    // event-based always goes to admin.
+    const routedToId = isEventBased
+      ? 2 // Admin
+      : emp.id === empEmp.id
+        ? 1 // Manager
+        : 2; // Admin (for mgr/payroll/admin requesters)
+    const approverId = routedToId === 1 ? mgrEmp.id : adminEmp.id;
+    const statusId = ((i % 5) + 1) as 1 | 2 | 3 | 4 | 5;
+    const decided = statusId === 2 || statusId === 3 || statusId === 4;
+    const from = new Date(Date.UTC(DUMMY_YEAR, 3 + (i % 3), 5 + (i % 20)));
+    const to = new Date(from.getTime() + (i % 3) * 86_400_000);
+    const days = Math.max(1, Math.round((to.getTime() - from.getTime()) / 86_400_000) + 1);
+    return {
+      code: `L-${DUMMY_YEAR}-${String(i + 1).padStart(4, '0')}`,
+      employeeId: emp.id,
+      leaveTypeId,
+      fromDate: from,
+      toDate: to,
+      days,
+      reason: `Sample leave request #${i + 1}`,
+      statusId,
+      routedToId,
+      approverId: decided ? approverId : null,
+      decidedAt: decided ? new Date(now.getTime() - (20 - i) * 3_600_000) : null,
+      decidedBy: decided ? approverId : null,
+      decisionNote: decided && statusId === 3 ? 'Insufficient notice.' : null,
+      escalatedAt: statusId === 5 ? new Date(now.getTime() - i * 86_400_000) : null,
+      cancelledAt: statusId === 4 ? new Date(now.getTime() - i * 3_600_000) : null,
+      cancelledBy: statusId === 4 ? emp.id : null,
+      cancelledAfterStart: statusId === 4 && i % 2 === 0,
+      deductedDays: statusId === 2 ? days : 0,
+      restoredDays: statusId === 4 ? days : 0,
+    };
+  });
+  await prisma.leaveRequest.createMany({ data: leaveRequestsData });
+
+  await prisma.leaveCodeCounter.upsert({
+    where: { year: DUMMY_YEAR },
+    create: { year: DUMMY_YEAR, number: 20 },
+    update: { number: 20 },
+  });
+
+  // ── leave_balance_ledger (20) — initial allocations + approval deductions ─
+  const ledgerSeeds: Array<{
+    employeeId: number;
+    leaveTypeId: number;
+    delta: number;
+    reasonId: number;
+  }> = [];
+  // Initial allocation entries — 4 employees × 4 accrual types = 16
+  for (const emp of employees) {
+    for (const lt of [1, 2, 3, 4]) {
+      ledgerSeeds.push({ employeeId: emp.id, leaveTypeId: lt, delta: 12, reasonId: 1 }); // Initial
+    }
+  }
+  // 4 approval deductions
+  for (let i = 0; i < 4; i++) {
+    ledgerSeeds.push({
+      employeeId: empIds[i]!,
+      leaveTypeId: 1,
+      delta: -2,
+      reasonId: 2, // Approval
+    });
+  }
+  await prisma.leaveBalanceLedger.createMany({
+    data: ledgerSeeds.map((s, i) => ({
+      ...s,
+      year: DUMMY_YEAR,
+      createdAt: new Date(now.getTime() - (ledgerSeeds.length - i) * 60_000),
+    })),
+  });
+
+  // ── attendance_records (20) — 5 days × 4 employees, all source=1 (system) ─
+  await prisma.attendanceRecord.createMany({
+    data: Array.from({ length: 20 }, (_, i) => {
+      const emp = employees[i % 4]!;
+      const dayOffset = Math.floor(i / 4);
+      const date = new Date(Date.UTC(DUMMY_YEAR, 4, 5 + dayOffset));
+      const statusId = dayOffset === 4 ? 4 : 1; // last batch = WeeklyOff; rest = Present
+      const checkIn = statusId === 1 ? new Date(date.getTime() + 9 * 3_600_000 + (i % 3) * 1800_000) : null;
+      const checkOut = checkIn ? new Date(checkIn.getTime() + 9 * 3_600_000) : null;
+      const late = checkIn ? checkIn.getUTCHours() * 60 + checkIn.getUTCMinutes() > 10 * 60 + 30 : false;
+      return {
+        employeeId: emp.id,
+        date,
+        statusId,
+        checkInTime: checkIn,
+        checkOutTime: checkOut,
+        hoursWorkedMinutes: checkIn ? 540 : null,
+        late,
+        lateMonthCount: late ? 1 : 0,
+        lopApplied: false,
+        sourceId: 1, // system
+        regularisationId: null,
+      };
+    }),
+  });
+
+  // ── attendance_late_ledger (20) — 4 emps × 5 months ───────────────────────
+  await prisma.attendanceLateLedger.createMany({
+    data: Array.from({ length: 20 }, (_, i) => ({
+      employeeId: empIds[i % 4]!,
+      year: DUMMY_YEAR,
+      month: Math.floor(i / 4) + 1, // 1..5
+      count: i % 4,
+    })),
+  });
+
+  // ── regularisation_requests (20) + counter ────────────────────────────────
+  await prisma.regularisationRequest.createMany({
+    data: Array.from({ length: 20 }, (_, i) => {
+      const emp = employees[i % 4]!;
+      const statusId = ((i % 3) + 1) as 1 | 2 | 3;
+      const ageDays = (i % 14) + 1;
+      const routedToId = ageDays > 7 ? 2 : 1; // BL-029
+      const approverId = routedToId === 1 ? mgrEmp.id : adminEmp.id;
+      const decided = statusId !== 1;
+      const date = new Date(Date.UTC(DUMMY_YEAR, 3, 1 + (i % 28)));
+      const ci = new Date(date.getTime() + 9 * 3_600_000 + (i % 3) * 1800_000);
+      const co = new Date(date.getTime() + 18 * 3_600_000);
+      return {
+        code: `R-${DUMMY_YEAR}-${String(i + 1).padStart(4, '0')}`,
+        employeeId: emp.id,
+        date,
+        proposedCheckIn: ci,
+        proposedCheckOut: co,
+        reason: `Forgot to check in/out — dummy reason #${i + 1}`,
+        statusId,
+        routedToId,
+        ageDaysAtSubmit: ageDays,
+        approverId: decided ? approverId : null,
+        decidedAt: decided ? new Date(now.getTime() - i * 3_600_000) : null,
+        decidedBy: decided ? approverId : null,
+        decisionNote: decided && statusId === 3 ? 'No corroborating evidence.' : null,
+      };
+    }),
+  });
+
+  await prisma.regCodeCounter.upsert({
+    where: { year: DUMMY_YEAR },
+    create: { year: DUMMY_YEAR, number: 20 },
+    update: { number: 20 },
+  });
+
+  // ── leave_encashments (20) + counter ──────────────────────────────────────
+  await prisma.leaveEncashment.createMany({
+    data: Array.from({ length: 20 }, (_, i) => {
+      const emp = employees[i % 4]!;
+      const statusId = ((i % 6) + 1) as 1 | 2 | 3 | 4 | 5 | 6;
+      const routedToId = statusId === 1 ? 1 : 2;
+      const approverId = routedToId === 1 ? mgrEmp.id : adminEmp.id;
+      const decided = statusId !== 1;
+      const daysReq = (i % 5) + 1;
+      const daysApp = statusId >= 3 ? daysReq : null;
+      const rate = daysApp ? 200000 : null; // ₹2000/day in paise
+      return {
+        code: `LE-${DUMMY_YEAR}-${String(i + 1).padStart(4, '0')}`,
+        employeeId: emp.id,
+        year: DUMMY_YEAR,
+        daysRequested: daysReq,
+        daysApproved: daysApp,
+        ratePerDayPaise: rate,
+        amountPaise: daysApp && rate ? daysApp * rate : null,
+        statusId,
+        routedToId,
+        approverId: decided ? approverId : null,
+        decidedAt: decided ? new Date(now.getTime() - i * 86_400_000) : null,
+        decidedBy: decided ? approverId : null,
+        decisionNote: statusId === 5 ? 'Outside encashment window.' : null,
+        paidAt: statusId === 4 ? new Date(now.getTime() - i * 3_600_000) : null,
+        cancelledAt: statusId === 6 ? new Date(now.getTime() - i * 3_600_000) : null,
+        cancelledBy: statusId === 6 ? emp.id : null,
+      };
+    }),
+  });
+
+  await prisma.encashmentCodeCounter.upsert({
+    where: { year: DUMMY_YEAR },
+    create: { year: DUMMY_YEAR, number: 20 },
+    update: { number: 20 },
+  });
+
+  // ── payroll_runs (5) + counters + payslips (20) ───────────────────────────
+  // 5 runs: Jan–May 2026. Jan–Apr Finalised (status=3), May Review (status=2).
+  const runRows = [];
+  for (let m = 1; m <= 5; m++) {
+    const finalised = m <= 4;
+    const periodStart = new Date(Date.UTC(DUMMY_YEAR, m - 1, 1));
+    const periodEnd = new Date(Date.UTC(DUMMY_YEAR, m, 0));
+    runRows.push({
+      code: `RUN-${DUMMY_YEAR}-${String(m).padStart(2, '0')}`,
+      month: m,
+      year: DUMMY_YEAR,
+      statusId: finalised ? 3 : 2,
+      workingDays: 22,
+      periodStart,
+      periodEnd,
+      initiatedBy: payEmp.id,
+      initiatedAt: new Date(periodEnd.getTime() - 86_400_000),
+      finalisedBy: finalised ? adminEmp.id : null,
+      finalisedAt: finalised ? new Date(periodEnd.getTime() + 86_400_000) : null,
+    });
+  }
+  await prisma.payrollRun.createMany({ data: runRows });
+
+  await prisma.payrollCodeCounter.createMany({
+    data: runRows.map((r) => ({ year: r.year, month: r.month, number: 1 })),
+  });
+
+  const runs = await prisma.payrollRun.findMany({
+    where: { year: DUMMY_YEAR },
+    orderBy: { month: 'asc' },
+  });
+
+  // Payslips: 5 runs × 4 employees = 20
+  const payslips: Array<Parameters<typeof prisma.payslip.createMany>[0]['data']> = [];
+  let psIdx = 0;
+  for (const run of runs) {
+    for (const emp of employees) {
+      psIdx++;
+      const basic = 5_000_000; // ₹50,000 in paise
+      const allow = 2_000_000; // ₹20,000
+      const gross = basic + allow;
+      const tax = Math.round(gross * 0.095);
+      const other = 200_000;
+      const net = gross - tax - other;
+      payslips.push({
+        code: `P-${DUMMY_YEAR}-${String(run.month).padStart(2, '0')}-${String(psIdx).padStart(4, '0')}`,
+        runId: run.id,
+        employeeId: emp.id,
+        month: run.month,
+        year: DUMMY_YEAR,
+        statusId: run.statusId,
+        periodStart: run.periodStart,
+        periodEnd: run.periodEnd,
+        workingDays: 22,
+        daysWorked: 22,
+        lopDays: 0,
+        basicPaise: basic,
+        allowancesPaise: allow,
+        grossPaise: gross,
+        lopDeductionPaise: 0,
+        referenceTaxPaise: tax,
+        finalTaxPaise: tax,
+        otherDeductionsPaise: other,
+        netPayPaise: net,
+        finalisedAt: run.finalisedAt,
+      } as never);
+    }
+  }
+  for (const p of payslips) {
+    await prisma.payslip.create({ data: p as never });
+  }
+
+  // ── performance_cycles (2) + reviews (8) + goals (20) ─────────────────────
+  await prisma.performanceCycle.createMany({
+    data: [
+      {
+        code: `C-${DUMMY_YEAR - 1}-H2`,
+        fyStart: new Date(Date.UTC(DUMMY_YEAR - 1, 9, 1)),
+        fyEnd: new Date(Date.UTC(DUMMY_YEAR, 2, 31)),
+        statusId: 4, // Closed
+        selfReviewDeadline: new Date(Date.UTC(DUMMY_YEAR, 1, 15)),
+        managerReviewDeadline: new Date(Date.UTC(DUMMY_YEAR, 2, 1)),
+        closedAt: new Date(Date.UTC(DUMMY_YEAR, 2, 5)),
+        closedBy: adminEmp.id,
+        createdBy: adminEmp.id,
+      },
+      {
+        code: `C-${DUMMY_YEAR}-H1`,
+        fyStart: new Date(Date.UTC(DUMMY_YEAR, 3, 1)),
+        fyEnd: new Date(Date.UTC(DUMMY_YEAR, 8, 30)),
+        statusId: 1, // Open
+        selfReviewDeadline: new Date(Date.UTC(DUMMY_YEAR, 7, 15)),
+        managerReviewDeadline: new Date(Date.UTC(DUMMY_YEAR, 8, 1)),
+        createdBy: adminEmp.id,
+      },
+    ],
+  });
+
+  const cycles = await prisma.performanceCycle.findMany({ orderBy: { fyStart: 'asc' } });
+
+  // 4 employees × 2 cycles = 8 reviews
+  for (const cycle of cycles) {
+    for (const emp of employees) {
+      const isClosed = cycle.statusId === 4;
+      // Manager: emp's reportingManager OR a peer admin for admin/payroll
+      let managerId: number | null = emp.reportingManagerId;
+      if (!managerId) managerId = adminEmp.id === emp.id ? null : adminEmp.id;
+      const self = isClosed ? 4 : 3;
+      const mgr = isClosed ? 4 : null;
+      await prisma.performanceReview.create({
+        data: {
+          cycleId: cycle.id,
+          employeeId: emp.id,
+          managerId,
+          selfRating: self,
+          selfNote: 'Met all key objectives this cycle.',
+          managerRating: mgr,
+          managerNote: mgr ? 'Solid performance — exceeded expectations on the Q3 launch.' : null,
+          managerOverrodeSelf: mgr !== null && self !== mgr,
+          finalRating: isClosed ? mgr : null,
+          lockedAt: isClosed ? cycle.closedAt : null,
+        },
+      });
+    }
+  }
+
+  // 20 goals = 2 goals × 4 reviews (closed cycle) + 3 goals × 4 reviews (open cycle)
+  const reviews = await prisma.performanceReview.findMany({ orderBy: { id: 'asc' } });
+  let goalCount = 0;
+  for (const r of reviews) {
+    const isClosed = cycles.find((c) => c.id === r.cycleId)!.statusId === 4;
+    const goalsPerReview = isClosed ? 2 : 3;
+    for (let g = 0; g < goalsPerReview; g++) {
+      goalCount++;
+      await prisma.goal.create({
+        data: {
+          reviewId: r.id,
+          text: `Goal #${g + 1}: deliver the Q${g + 1} milestone on time and within budget.`,
+          outcomeId: isClosed ? ((g % 3) + 2) : 1, // closed=Met/Partial/Missed; open=Pending
+          proposedByEmployee: g === 0,
+        },
+      });
+    }
+  }
+
+  // ── notifications (20) ────────────────────────────────────────────────────
+  await prisma.notification.createMany({
+    data: Array.from({ length: 20 }, (_, i) => {
+      const recipient = employees[i % 4]!;
+      const categoryId = ((i % 8) + 1) as 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8;
+      const titles: Record<number, string> = {
+        1: 'Leave request approved',
+        2: 'Late mark recorded for today',
+        3: 'Payslip ready for download',
+        4: 'Self-review window opens tomorrow',
+        5: 'Your reporting manager has changed',
+        6: 'Late threshold updated by Admin',
+        7: 'New session signed in from 10.0.0.42',
+        8: 'System maintenance window: Saturday 2 AM IST',
+      };
+      return {
+        recipientId: recipient.id,
+        categoryId,
+        title: titles[categoryId]!,
+        body: `Dummy notification body #${i + 1} — auto-generated for staging QA.`,
+        link: null,
+        unread: i % 3 !== 0,
+        createdAt: new Date(now.getTime() - (20 - i) * 1_800_000),
+      };
+    }),
+  });
+
+  // ── audit_log (20) ────────────────────────────────────────────────────────
+  const auditActions = [
+    { action: 'auth.login.success',           moduleId: 1, targetTypeId: 1 },
+    { action: 'auth.login.failure',           moduleId: 1, targetTypeId: 1 },
+    { action: 'employee.created',             moduleId: 2, targetTypeId: 1 },
+    { action: 'employee.status.changed',      moduleId: 2, targetTypeId: 1 },
+    { action: 'employee.salary.updated',      moduleId: 2, targetTypeId: 12 },
+    { action: 'leave.request.created',        moduleId: 3, targetTypeId: 2 },
+    { action: 'leave.request.approved',       moduleId: 3, targetTypeId: 2 },
+    { action: 'leave.request.rejected',       moduleId: 3, targetTypeId: 2 },
+    { action: 'leave.encashment.created',     moduleId: 3, targetTypeId: 3 },
+    { action: 'leave.encashment.approved',    moduleId: 3, targetTypeId: 3 },
+    { action: 'attendance.checkin',           moduleId: 5, targetTypeId: 4 },
+    { action: 'attendance.checkout',          moduleId: 5, targetTypeId: 4 },
+    { action: 'regularisation.approved',      moduleId: 5, targetTypeId: 5 },
+    { action: 'payroll.run.initiated',        moduleId: 4, targetTypeId: 6 },
+    { action: 'payroll.run.finalised',        moduleId: 4, targetTypeId: 6 },
+    { action: 'performance.cycle.created',    moduleId: 6, targetTypeId: 8 },
+    { action: 'performance.review.submitted', moduleId: 6, targetTypeId: 9 },
+    { action: 'configuration.updated',        moduleId: 9, targetTypeId: 11 },
+    { action: 'holiday.created',              moduleId: 9, targetTypeId: 13 },
+    { action: 'notification.delivered',       moduleId: 7, targetTypeId: 14 },
+  ];
+  await prisma.auditLog.createMany({
+    data: auditActions.map((a, i) => ({
+      actorId: empIds[i % 4]!,
+      actorRoleId: ((i % 4) + 1), // 1..4
+      actorIp: fakeIp(i + 200),
+      action: a.action,
+      moduleId: a.moduleId,
+      targetTypeId: a.targetTypeId,
+      targetId: (i % 20) + 1,
+      before: null,
+      after: { sample: true, n: i },
+      createdAt: new Date(now.getTime() - (20 - i) * 600_000),
+    })),
+  });
+
+  // ── idempotency_keys (20) ─────────────────────────────────────────────────
+  await prisma.idempotencyKey.createMany({
+    data: Array.from({ length: 20 }, (_, i) => ({
+      key: `idem-${DUMMY_YEAR}-${randomHex(8)}`,
+      employeeId: empIds[i % 4]!,
+      endpoint: ['/leave/requests', '/attendance/check-in', '/payroll/runs', '/leave-encashments'][i % 4]!,
+      responseSnapshot: { ok: true, n: i },
+      createdAt: new Date(now.getTime() - (20 - i) * 300_000),
+    })),
+  });
+
+  console.log('  [dummy] seeded: sessions(20) login_attempts(+17) reset_tokens(20)');
+  console.log('  [dummy]         leave_requests(20) ledger(20) attendance(20) late_ledger(20)');
+  console.log('  [dummy]         regularisations(20) encashments(20) payroll_runs(5) payslips(20)');
+  console.log('  [dummy]         cycles(2) reviews(8) goals(20) notifications(20) audit(20) idem(20)');
+}
+
 // ── Entry point ──────────────────────────────────────────────────────────────
 
 async function main() {
@@ -375,6 +867,9 @@ async function main() {
 
   console.log('• Demo accounts');
   await seedDemoAccounts();
+
+  console.log('• Dummy data');
+  await seedDummyData();
 
   console.log('Seed complete.');
 }
