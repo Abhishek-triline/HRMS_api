@@ -284,7 +284,7 @@ async function seedDemoAccounts(): Promise<void> {
         employmentTypeId: acc.employmentTypeId,
         departmentId: dept?.id ?? null,
         designationId: desig?.id ?? null,
-        statusId: 1, // Active
+        status: 1, // Active
         joinDate,
         mustResetPassword: false,
         version: 0,
@@ -441,8 +441,8 @@ async function seedDummyData(): Promise<void> {
         ? 1 // Manager
         : 2; // Admin (for mgr/payroll/admin requesters)
     const approverId = routedToId === 1 ? mgrEmp.id : adminEmp.id;
-    const statusId = ((i % 5) + 1) as 1 | 2 | 3 | 4 | 5;
-    const decided = statusId === 2 || statusId === 3 || statusId === 4;
+    const status = ((i % 5) + 1) as 1 | 2 | 3 | 4 | 5;
+    const decided = status === 2 || status === 3 || status === 4;
     const from = new Date(Date.UTC(DUMMY_YEAR, 3 + (i % 3), 5 + (i % 20)));
     const to = new Date(from.getTime() + (i % 3) * 86_400_000);
     const days = Math.max(1, Math.round((to.getTime() - from.getTime()) / 86_400_000) + 1);
@@ -454,18 +454,18 @@ async function seedDummyData(): Promise<void> {
       toDate: to,
       days,
       reason: `Sample leave request #${i + 1}`,
-      statusId,
+      status,
       routedToId,
       approverId: decided ? approverId : null,
       decidedAt: decided ? new Date(now.getTime() - (20 - i) * 3_600_000) : null,
       decidedBy: decided ? approverId : null,
-      decisionNote: decided && statusId === 3 ? 'Insufficient notice.' : null,
-      escalatedAt: statusId === 5 ? new Date(now.getTime() - i * 86_400_000) : null,
-      cancelledAt: statusId === 4 ? new Date(now.getTime() - i * 3_600_000) : null,
-      cancelledBy: statusId === 4 ? emp.id : null,
-      cancelledAfterStart: statusId === 4 && i % 2 === 0,
-      deductedDays: statusId === 2 ? days : 0,
-      restoredDays: statusId === 4 ? days : 0,
+      decisionNote: decided && status === 3 ? 'Insufficient notice.' : null,
+      escalatedAt: status === 5 ? new Date(now.getTime() - i * 86_400_000) : null,
+      cancelledAt: status === 4 ? new Date(now.getTime() - i * 3_600_000) : null,
+      cancelledBy: status === 4 ? emp.id : null,
+      cancelledAfterStart: status === 4 && i % 2 === 0,
+      deductedDays: status === 2 ? days : 0,
+      restoredDays: status === 4 ? days : 0,
     };
   });
   await prisma.leaveRequest.createMany({ data: leaveRequestsData });
@@ -512,14 +512,14 @@ async function seedDummyData(): Promise<void> {
       const emp = employees[i % 4]!;
       const dayOffset = Math.floor(i / 4);
       const date = new Date(Date.UTC(DUMMY_YEAR, 4, 5 + dayOffset));
-      const statusId = dayOffset === 4 ? 4 : 1; // last batch = WeeklyOff; rest = Present
-      const checkIn = statusId === 1 ? new Date(date.getTime() + 9 * 3_600_000 + (i % 3) * 1800_000) : null;
+      const status = dayOffset === 4 ? 4 : 1; // last batch = WeeklyOff; rest = Present
+      const checkIn = status === 1 ? new Date(date.getTime() + 9 * 3_600_000 + (i % 3) * 1800_000) : null;
       const checkOut = checkIn ? new Date(checkIn.getTime() + 9 * 3_600_000) : null;
       const late = checkIn ? checkIn.getUTCHours() * 60 + checkIn.getUTCMinutes() > 10 * 60 + 30 : false;
       return {
         employeeId: emp.id,
         date,
-        statusId,
+        status,
         checkInTime: checkIn,
         checkOutTime: checkOut,
         hoursWorkedMinutes: checkIn ? 540 : null,
@@ -546,11 +546,11 @@ async function seedDummyData(): Promise<void> {
   await prisma.regularisationRequest.createMany({
     data: Array.from({ length: 20 }, (_, i) => {
       const emp = employees[i % 4]!;
-      const statusId = ((i % 3) + 1) as 1 | 2 | 3;
+      const status = ((i % 3) + 1) as 1 | 2 | 3;
       const ageDays = (i % 14) + 1;
       const routedToId = ageDays > 7 ? 2 : 1; // BL-029
       const approverId = routedToId === 1 ? mgrEmp.id : adminEmp.id;
-      const decided = statusId !== 1;
+      const decided = status !== 1;
       const date = new Date(Date.UTC(DUMMY_YEAR, 3, 1 + (i % 28)));
       const ci = new Date(date.getTime() + 9 * 3_600_000 + (i % 3) * 1800_000);
       const co = new Date(date.getTime() + 18 * 3_600_000);
@@ -561,13 +561,13 @@ async function seedDummyData(): Promise<void> {
         proposedCheckIn: ci,
         proposedCheckOut: co,
         reason: `Forgot to check in/out — dummy reason #${i + 1}`,
-        statusId,
+        status,
         routedToId,
         ageDaysAtSubmit: ageDays,
         approverId: decided ? approverId : null,
         decidedAt: decided ? new Date(now.getTime() - i * 3_600_000) : null,
         decidedBy: decided ? approverId : null,
-        decisionNote: decided && statusId === 3 ? 'No corroborating evidence.' : null,
+        decisionNote: decided && status === 3 ? 'No corroborating evidence.' : null,
       };
     }),
   });
@@ -582,12 +582,12 @@ async function seedDummyData(): Promise<void> {
   await prisma.leaveEncashment.createMany({
     data: Array.from({ length: 20 }, (_, i) => {
       const emp = employees[i % 4]!;
-      const statusId = ((i % 6) + 1) as 1 | 2 | 3 | 4 | 5 | 6;
-      const routedToId = statusId === 1 ? 1 : 2;
+      const status = ((i % 6) + 1) as 1 | 2 | 3 | 4 | 5 | 6;
+      const routedToId = status === 1 ? 1 : 2;
       const approverId = routedToId === 1 ? mgrEmp.id : adminEmp.id;
-      const decided = statusId !== 1;
+      const decided = status !== 1;
       const daysReq = (i % 5) + 1;
-      const daysApp = statusId >= 3 ? daysReq : null;
+      const daysApp = status >= 3 ? daysReq : null;
       const rate = daysApp ? 200000 : null; // ₹2000/day in paise
       return {
         code: `LE-${DUMMY_YEAR}-${String(i + 1).padStart(4, '0')}`,
@@ -597,15 +597,15 @@ async function seedDummyData(): Promise<void> {
         daysApproved: daysApp,
         ratePerDayPaise: rate,
         amountPaise: daysApp && rate ? daysApp * rate : null,
-        statusId,
+        status,
         routedToId,
         approverId: decided ? approverId : null,
         decidedAt: decided ? new Date(now.getTime() - i * 86_400_000) : null,
         decidedBy: decided ? approverId : null,
-        decisionNote: statusId === 5 ? 'Outside encashment window.' : null,
-        paidAt: statusId === 4 ? new Date(now.getTime() - i * 3_600_000) : null,
-        cancelledAt: statusId === 6 ? new Date(now.getTime() - i * 3_600_000) : null,
-        cancelledBy: statusId === 6 ? emp.id : null,
+        decisionNote: status === 5 ? 'Outside encashment window.' : null,
+        paidAt: status === 4 ? new Date(now.getTime() - i * 3_600_000) : null,
+        cancelledAt: status === 6 ? new Date(now.getTime() - i * 3_600_000) : null,
+        cancelledBy: status === 6 ? emp.id : null,
       };
     }),
   });
@@ -627,7 +627,7 @@ async function seedDummyData(): Promise<void> {
       code: `RUN-${DUMMY_YEAR}-${String(m).padStart(2, '0')}`,
       month: m,
       year: DUMMY_YEAR,
-      statusId: finalised ? 3 : 2,
+      status: finalised ? 3 : 2,
       workingDays: 22,
       periodStart,
       periodEnd,
@@ -666,7 +666,7 @@ async function seedDummyData(): Promise<void> {
         employeeId: emp.id,
         month: run.month,
         year: DUMMY_YEAR,
-        statusId: run.statusId,
+        status: run.status,
         periodStart: run.periodStart,
         periodEnd: run.periodEnd,
         workingDays: 22,
@@ -695,7 +695,7 @@ async function seedDummyData(): Promise<void> {
         code: `C-${DUMMY_YEAR - 1}-H2`,
         fyStart: new Date(Date.UTC(DUMMY_YEAR - 1, 9, 1)),
         fyEnd: new Date(Date.UTC(DUMMY_YEAR, 2, 31)),
-        statusId: 4, // Closed
+        status: 4, // Closed
         selfReviewDeadline: new Date(Date.UTC(DUMMY_YEAR, 1, 15)),
         managerReviewDeadline: new Date(Date.UTC(DUMMY_YEAR, 2, 1)),
         closedAt: new Date(Date.UTC(DUMMY_YEAR, 2, 5)),
@@ -706,7 +706,7 @@ async function seedDummyData(): Promise<void> {
         code: `C-${DUMMY_YEAR}-H1`,
         fyStart: new Date(Date.UTC(DUMMY_YEAR, 3, 1)),
         fyEnd: new Date(Date.UTC(DUMMY_YEAR, 8, 30)),
-        statusId: 1, // Open
+        status: 1, // Open
         selfReviewDeadline: new Date(Date.UTC(DUMMY_YEAR, 7, 15)),
         managerReviewDeadline: new Date(Date.UTC(DUMMY_YEAR, 8, 1)),
         createdBy: adminEmp.id,
@@ -719,7 +719,7 @@ async function seedDummyData(): Promise<void> {
   // 4 employees × 2 cycles = 8 reviews
   for (const cycle of cycles) {
     for (const emp of employees) {
-      const isClosed = cycle.statusId === 4;
+      const isClosed = cycle.status === 4;
       // Manager: emp's reportingManager OR a peer admin for admin/payroll
       let managerId: number | null = emp.reportingManagerId;
       if (!managerId) managerId = adminEmp.id === emp.id ? null : adminEmp.id;
@@ -746,7 +746,7 @@ async function seedDummyData(): Promise<void> {
   const reviews = await prisma.performanceReview.findMany({ orderBy: { id: 'asc' } });
   let goalCount = 0;
   for (const r of reviews) {
-    const isClosed = cycles.find((c) => c.id === r.cycleId)!.statusId === 4;
+    const isClosed = cycles.find((c) => c.id === r.cycleId)!.status === 4;
     const goalsPerReview = isClosed ? 2 : 3;
     for (let g = 0; g < goalsPerReview; g++) {
       goalCount++;

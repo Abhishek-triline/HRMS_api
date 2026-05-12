@@ -30,60 +30,65 @@ datasource db {
 
 /// Master list of roles.
 /// Seed (frozen IDs): 1=Employee, 2=Manager, 3=PayrollOfficer, 4=Admin.
-/// status_id: 1=Active, 2=Deprecated.
+/// status: 1=Active, 2=Deprecated.
 model Role {
-  id        Int      @id @default(autoincrement())
-  name      String   @unique
-  statusId  Int      @default(1) @map("status_id")
-  createdAt DateTime @default(now()) @map("created_at")
-  updatedAt DateTime @updatedAt @map("updated_at")
+  id        Int        @id @default(autoincrement())
+  name      String     @unique
+  status    Int        @default(1)
+  createdAt DateTime   @default(now()) @map("created_at")
+  updatedAt DateTime   @updatedAt @map("updated_at")
   employees Employee[]
+
   @@map("roles")
 }
 
 /// Master list of employment types.
 /// Seed (frozen IDs): 1=Permanent, 2=Contract, 3=Probation, 4=Intern.
 model EmploymentType {
-  id        Int      @id @default(autoincrement())
-  name      String   @unique
-  statusId  Int      @default(1) @map("status_id")
-  createdAt DateTime @default(now()) @map("created_at")
-  updatedAt DateTime @updatedAt @map("updated_at")
+  id        Int        @id @default(autoincrement())
+  name      String     @unique
+  status    Int        @default(1)
+  createdAt DateTime   @default(now()) @map("created_at")
+  updatedAt DateTime   @updatedAt @map("updated_at")
   employees Employee[]
+
   @@map("employment_types")
 }
 
 /// Master list of departments. Admin can add new ones via the Admin UI.
 model Department {
-  id        Int      @id @default(autoincrement())
-  name      String   @unique
-  statusId  Int      @default(1) @map("status_id")
-  createdAt DateTime @default(now()) @map("created_at")
-  updatedAt DateTime @updatedAt @map("updated_at")
+  id        Int        @id @default(autoincrement())
+  name      String     @unique
+  status    Int        @default(1)
+  createdAt DateTime   @default(now()) @map("created_at")
+  updatedAt DateTime   @updatedAt @map("updated_at")
   employees Employee[]
+
   @@map("departments")
 }
 
 /// Master list of designations / job titles. Admin can add new ones.
 model Designation {
-  id        Int      @id @default(autoincrement())
-  name      String   @unique
-  statusId  Int      @default(1) @map("status_id")
-  createdAt DateTime @default(now()) @map("created_at")
-  updatedAt DateTime @updatedAt @map("updated_at")
+  id        Int        @id @default(autoincrement())
+  name      String     @unique
+  status    Int        @default(1)
+  createdAt DateTime   @default(now()) @map("created_at")
+  updatedAt DateTime   @updatedAt @map("updated_at")
   employees Employee[]
+
   @@map("designations")
 }
 
 /// Master list of genders.
 /// Seed (frozen IDs): 1=Male, 2=Female, 3=Other, 4=PreferNotToSay.
 model Gender {
-  id        Int      @id @default(autoincrement())
-  name      String   @unique
-  statusId  Int      @default(1) @map("status_id")
-  createdAt DateTime @default(now()) @map("created_at")
-  updatedAt DateTime @updatedAt @map("updated_at")
+  id        Int        @id @default(autoincrement())
+  name      String     @unique
+  status    Int        @default(1)
+  createdAt DateTime   @default(now()) @map("created_at")
+  updatedAt DateTime   @updatedAt @map("updated_at")
   employees Employee[]
+
   @@map("genders")
 }
 
@@ -91,12 +96,13 @@ model Gender {
 /// Seed (frozen IDs): 1=auth, 2=employees, 3=leave, 4=payroll, 5=attendance,
 /// 6=performance, 7=notifications, 8=audit, 9=configuration.
 model AuditModule {
-  id        Int      @id @default(autoincrement())
-  name      String   @unique
-  statusId  Int      @default(1) @map("status_id")
-  createdAt DateTime @default(now()) @map("created_at")
-  updatedAt DateTime @updatedAt @map("updated_at")
+  id        Int        @id @default(autoincrement())
+  name      String     @unique
+  status    Int        @default(1)
+  createdAt DateTime   @default(now()) @map("created_at")
+  updatedAt DateTime   @updatedAt @map("updated_at")
   auditLogs AuditLog[]
+
   @@map("audit_modules")
 }
 
@@ -109,7 +115,7 @@ model LeaveType {
   requiresAdminApproval Boolean  @map("requires_admin_approval")
   carryForwardCap       Int?     @map("carry_forward_cap")
   maxDaysPerEvent       Int?     @map("max_days_per_event")
-  statusId              Int      @default(1) @map("status_id")
+  status                Int      @default(1)
   createdAt             DateTime @default(now()) @map("created_at")
   updatedAt             DateTime @updatedAt @map("updated_at")
 
@@ -117,6 +123,7 @@ model LeaveType {
   balances      LeaveBalance[]
   requests      LeaveRequest[]
   ledgerEntries LeaveBalanceLedger[]
+
   @@map("leave_types")
 }
 
@@ -125,77 +132,76 @@ model LeaveType {
 // ════════════════════════════════════════════════════════════════════════════
 
 /// Core employee record. BL-008: code is EMP-YYYY-NNNN and never reused.
-/// status_id (§3.1): 1=Active, 2=OnNotice, 3=OnLeave, 4=Inactive, 5=Exited.
+/// status (§3.1): 1=Active, 2=OnNotice, 3=OnLeave, 4=Inactive, 5=Exited.
 model Employee {
-  id           Int      @id @default(autoincrement())
+  id           Int    @id @default(autoincrement())
   /// BL-008 — unique, never reused, generated transactionally per year
-  code         String   @unique
-  email        String   @unique
+  code         String @unique
+  email        String @unique
   name         String
-  passwordHash String   @map("password_hash")
+  passwordHash String @map("password_hash")
 
   // Master FKs — INT columns; no DB-level FK constraints (relationMode=prisma)
-  roleId             Int      @map("role_id")
-  role               Role     @relation(fields: [roleId], references: [id], onDelete: NoAction, onUpdate: NoAction)
-  employmentTypeId   Int      @default(1) @map("employment_type_id")
-  employmentType     EmploymentType @relation(fields: [employmentTypeId], references: [id], onDelete: NoAction, onUpdate: NoAction)
-  departmentId       Int?     @map("department_id")
-  department         Department? @relation(fields: [departmentId], references: [id], onDelete: NoAction, onUpdate: NoAction)
-  designationId      Int?     @map("designation_id")
-  designation        Designation? @relation(fields: [designationId], references: [id], onDelete: NoAction, onUpdate: NoAction)
-  genderId           Int?     @map("gender_id")
-  gender             Gender?  @relation(fields: [genderId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  roleId           Int            @map("role_id")
+  role             Role           @relation(fields: [roleId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  employmentTypeId Int            @default(1) @map("employment_type_id")
+  employmentType   EmploymentType @relation(fields: [employmentTypeId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  departmentId     Int?           @map("department_id")
+  department       Department?    @relation(fields: [departmentId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  designationId    Int?           @map("designation_id")
+  designation      Designation?   @relation(fields: [designationId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  genderId         Int?           @map("gender_id")
+  gender           Gender?        @relation(fields: [genderId], references: [id], onDelete: NoAction, onUpdate: NoAction)
 
   /// §3.1 status code. Default 4=Inactive (pre-first-login).
-  statusId           Int      @default(4) @map("status_id")
-
+  status      Int       @default(4)
   // Optional personal info
-  phone        String?
-  dateOfBirth  DateTime? @db.Date @map("date_of_birth")
+  phone       String?
+  dateOfBirth DateTime? @map("date_of_birth") @db.Date
 
   // Self-relation: reporting manager
-  reportingManagerId         Int?      @map("reporting_manager_id")
-  reportingManager           Employee? @relation("EmployeeManager", fields: [reportingManagerId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  reportingManagerId         Int?       @map("reporting_manager_id")
+  reportingManager           Employee?  @relation("EmployeeManager", fields: [reportingManagerId], references: [id], onDelete: NoAction, onUpdate: NoAction)
   reports                    Employee[] @relation("EmployeeManager")
-  previousReportingManagerId Int?      @map("previous_reporting_manager_id")
+  previousReportingManagerId Int?       @map("previous_reporting_manager_id")
 
-  joinDate          DateTime  @db.Date @map("join_date")
-  exitDate          DateTime? @db.Date @map("exit_date")
+  joinDate          DateTime  @map("join_date") @db.Date
+  exitDate          DateTime? @map("exit_date") @db.Date
   mustResetPassword Boolean   @default(false) @map("must_reset_password")
 
-  version           Int       @default(0)
-  createdAt         DateTime  @default(now()) @map("created_at")
-  updatedAt         DateTime  @updatedAt @map("updated_at")
+  version   Int      @default(0)
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
 
   // Back-references
-  sessions                  Session[]
-  passwordResetTokens       PasswordResetToken[]
-  loginAttempts             LoginAttempt[]
-  auditActorEntries         AuditLog[] @relation("AuditActor")
-  salaryStructures          SalaryStructure[]
-  reportingManagerHistory   ReportingManagerHistory[] @relation("EmployeeHistory")
-  managedHistories          ReportingManagerHistory[] @relation("ManagerHistory")
-  leaveRequests             LeaveRequest[] @relation("EmployeeLeaveRequests")
-  leaveRequestsApproving    LeaveRequest[] @relation("LeaveApprover")
-  leaveBalances             LeaveBalance[]
-  leaveBalanceLedger        LeaveBalanceLedger[] @relation("EmployeeLedger")
-  attendanceRecords         AttendanceRecord[] @relation("EmployeeAttendance")
-  regularisations           RegularisationRequest[] @relation("EmployeeRegularisations")
-  regularisationsApproving  RegularisationRequest[] @relation("RegularisationApprover")
-  lateLedger                AttendanceLateLedger[] @relation("EmployeeLateLedger")
-  payrollRunsInitiated      PayrollRun[] @relation("PayrollInitiator")
-  payrollRunsFinalised      PayrollRun[] @relation("PayrollFinaliser")
-  payrollRunsReversed       PayrollRun[] @relation("PayrollReverser")
-  payslips                  Payslip[] @relation("EmployeePayslips")
-  idempotencyKeys           IdempotencyKey[] @relation("EmployeeIdempotencyKeys")
-  performanceCyclesCreated  PerformanceCycle[] @relation("CycleCreatedBy")
-  performanceCyclesClosed   PerformanceCycle[] @relation("CycleClosedBy")
-  reviewsAsEmployee         PerformanceReview[] @relation("ReviewEmployee")
-  reviewsAsManager          PerformanceReview[] @relation("ReviewManager")
-  reviewsAsPreviousManager  PerformanceReview[] @relation("ReviewPreviousManager")
-  notifications             Notification[] @relation("EmployeeNotifications")
-  leaveEncashments          LeaveEncashment[] @relation("EmployeeEncashments")
-  encashmentsApproving      LeaveEncashment[] @relation("EncashmentApprover")
+  sessions                 Session[]
+  passwordResetTokens      PasswordResetToken[]
+  loginAttempts            LoginAttempt[]
+  auditActorEntries        AuditLog[]                @relation("AuditActor")
+  salaryStructures         SalaryStructure[]
+  reportingManagerHistory  ReportingManagerHistory[] @relation("EmployeeHistory")
+  managedHistories         ReportingManagerHistory[] @relation("ManagerHistory")
+  leaveRequests            LeaveRequest[]            @relation("EmployeeLeaveRequests")
+  leaveRequestsApproving   LeaveRequest[]            @relation("LeaveApprover")
+  leaveBalances            LeaveBalance[]
+  leaveBalanceLedger       LeaveBalanceLedger[]      @relation("EmployeeLedger")
+  attendanceRecords        AttendanceRecord[]        @relation("EmployeeAttendance")
+  regularisations          RegularisationRequest[]   @relation("EmployeeRegularisations")
+  regularisationsApproving RegularisationRequest[]   @relation("RegularisationApprover")
+  lateLedger               AttendanceLateLedger[]    @relation("EmployeeLateLedger")
+  payrollRunsInitiated     PayrollRun[]              @relation("PayrollInitiator")
+  payrollRunsFinalised     PayrollRun[]              @relation("PayrollFinaliser")
+  payrollRunsReversed      PayrollRun[]              @relation("PayrollReverser")
+  payslips                 Payslip[]                 @relation("EmployeePayslips")
+  idempotencyKeys          IdempotencyKey[]          @relation("EmployeeIdempotencyKeys")
+  performanceCyclesCreated PerformanceCycle[]        @relation("CycleCreatedBy")
+  performanceCyclesClosed  PerformanceCycle[]        @relation("CycleClosedBy")
+  reviewsAsEmployee        PerformanceReview[]       @relation("ReviewEmployee")
+  reviewsAsManager         PerformanceReview[]       @relation("ReviewManager")
+  reviewsAsPreviousManager PerformanceReview[]       @relation("ReviewPreviousManager")
+  notifications            Notification[]            @relation("EmployeeNotifications")
+  leaveEncashments         LeaveEncashment[]         @relation("EmployeeEncashments")
+  encashmentsApproving     LeaveEncashment[]         @relation("EncashmentApprover")
 
   @@index([email])
   @@index([reportingManagerId])
@@ -205,7 +211,7 @@ model Employee {
   @@index([departmentId])
   @@index([designationId])
   @@index([genderId])
-  @@index([statusId])
+  @@index([status])
   @@map("employees")
 }
 
@@ -217,15 +223,15 @@ model SalaryStructure {
   employee        Employee @relation(fields: [employeeId], references: [id], onDelete: NoAction, onUpdate: NoAction)
   basicPaise      Int      @map("basic_paise")
   allowancesPaise Int      @map("allowances_paise")
-  effectiveFrom   DateTime @db.Date @map("effective_from")
+  effectiveFrom   DateTime @map("effective_from") @db.Date
   createdAt       DateTime @default(now()) @map("created_at")
   version         Int      @default(0)
 
   // Optional component breakdown
-  hraPaise        Int?     @map("hra_paise")
-  transportPaise  Int?     @map("transport_paise")
-  otherPaise      Int?     @map("other_paise")
-  daPaise         Int?     @map("da_paise")
+  hraPaise       Int? @map("hra_paise")
+  transportPaise Int? @map("transport_paise")
+  otherPaise     Int? @map("other_paise")
+  daPaise        Int? @map("da_paise")
 
   @@index([employeeId, effectiveFrom(sort: Desc)])
   @@map("salary_structures")
@@ -239,8 +245,8 @@ model ReportingManagerHistory {
   employee   Employee  @relation("EmployeeHistory", fields: [employeeId], references: [id], onDelete: NoAction, onUpdate: NoAction)
   managerId  Int?      @map("manager_id")
   manager    Employee? @relation("ManagerHistory", fields: [managerId], references: [id], onDelete: NoAction, onUpdate: NoAction)
-  fromDate   DateTime  @db.Date @map("from_date")
-  toDate     DateTime? @db.Date @map("to_date")
+  fromDate   DateTime  @map("from_date") @db.Date
+  toDate     DateTime? @map("to_date") @db.Date
   reasonId   Int       @map("reason_id")
   createdAt  DateTime  @default(now()) @map("created_at")
 
@@ -251,15 +257,15 @@ model ReportingManagerHistory {
 
 /// Session row. iron-session data maps to this.
 model Session {
-  id         Int       @id @default(autoincrement())
+  id         Int      @id @default(autoincrement())
   /// Public session token returned in the cookie (random hex).
-  token      String    @unique
-  employeeId Int       @map("employee_id")
-  employee   Employee  @relation(fields: [employeeId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  token      String   @unique
+  employeeId Int      @map("employee_id")
+  employee   Employee @relation(fields: [employeeId], references: [id], onDelete: NoAction, onUpdate: NoAction)
   ip         String?
-  userAgent  String?   @db.Text @map("user_agent")
-  expiresAt  DateTime  @map("expires_at")
-  createdAt  DateTime  @default(now()) @map("created_at")
+  userAgent  String?  @map("user_agent") @db.Text
+  expiresAt  DateTime @map("expires_at")
+  createdAt  DateTime @default(now()) @map("created_at")
 
   @@index([employeeId])
   @@index([expiresAt])
@@ -304,11 +310,11 @@ model PasswordResetToken {
 
 /// Leave quotas — days per year per leave type per employment type.
 model LeaveQuota {
-  id               Int        @id @default(autoincrement())
-  leaveTypeId      Int        @map("leave_type_id")
-  leaveType        LeaveType  @relation(fields: [leaveTypeId], references: [id], onDelete: NoAction, onUpdate: NoAction)
-  employmentTypeId Int        @map("employment_type_id")
-  daysPerYear      Int        @map("days_per_year")
+  id               Int       @id @default(autoincrement())
+  leaveTypeId      Int       @map("leave_type_id")
+  leaveType        LeaveType @relation(fields: [leaveTypeId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  employmentTypeId Int       @map("employment_type_id")
+  daysPerYear      Int       @map("days_per_year")
 
   @@unique([leaveTypeId, employmentTypeId])
   @@map("leave_quotas")
@@ -356,6 +362,7 @@ model LeaveBalanceLedger {
 model LeaveCodeCounter {
   year   Int @id
   number Int @default(0)
+
   @@map("leave_code_counters")
 }
 
@@ -363,11 +370,12 @@ model LeaveCodeCounter {
 model EncashmentCodeCounter {
   year   Int @id
   number Int @default(0)
+
   @@map("encashment_code_counters")
 }
 
 /// Leave request.
-/// status_id (§3.2): 1=Pending, 2=Approved, 3=Rejected, 4=Cancelled, 5=Escalated.
+/// status (§3.2): 1=Pending, 2=Approved, 3=Rejected, 4=Cancelled, 5=Escalated.
 /// routed_to_id (§3.2): 1=Manager, 2=Admin.
 model LeaveRequest {
   id                  Int       @id @default(autoincrement())
@@ -376,17 +384,17 @@ model LeaveRequest {
   employee            Employee  @relation("EmployeeLeaveRequests", fields: [employeeId], references: [id], onDelete: NoAction, onUpdate: NoAction)
   leaveTypeId         Int       @map("leave_type_id")
   leaveType           LeaveType @relation(fields: [leaveTypeId], references: [id], onDelete: NoAction, onUpdate: NoAction)
-  fromDate            DateTime  @db.Date @map("from_date")
-  toDate              DateTime  @db.Date @map("to_date")
+  fromDate            DateTime  @map("from_date") @db.Date
+  toDate              DateTime  @map("to_date") @db.Date
   days                Int
   reason              String    @db.Text
-  statusId            Int       @default(1) @map("status_id")
+  status              Int       @default(1)
   routedToId          Int       @map("routed_to_id")
   approverId          Int?      @map("approver_id")
   approver            Employee? @relation("LeaveApprover", fields: [approverId], references: [id], onDelete: NoAction, onUpdate: NoAction)
   decidedAt           DateTime? @map("decided_at")
   decidedBy           Int?      @map("decided_by")
-  decisionNote        String?   @db.Text @map("decision_note")
+  decisionNote        String?   @map("decision_note") @db.Text
   escalatedAt         DateTime? @map("escalated_at")
   cancelledAt         DateTime? @map("cancelled_at")
   cancelledBy         Int?      @map("cancelled_by")
@@ -397,9 +405,9 @@ model LeaveRequest {
   createdAt           DateTime  @default(now()) @map("created_at")
   updatedAt           DateTime  @updatedAt @map("updated_at")
 
-  @@index([employeeId, statusId])
-  @@index([approverId, statusId])
-  @@index([statusId, escalatedAt])
+  @@index([employeeId, status])
+  @@index([approverId, status])
+  @@index([status, escalatedAt])
   @@map("leave_requests")
 }
 
@@ -422,29 +430,29 @@ model AttendanceLateLedger {
 }
 
 /// Attendance record. BL-023: one row per active employee per day.
-/// status_id (§3.4): 1=Present, 2=Absent, 3=OnLeave, 4=WeeklyOff, 5=Holiday.
+/// status (§3.4): 1=Present, 2=Absent, 3=OnLeave, 4=WeeklyOff, 5=Holiday.
 /// source_id (§3.4): 1=system, 2=regularisation.
 model AttendanceRecord {
-  id                 Int       @id @default(autoincrement())
-  employeeId         Int       @map("employee_id")
-  employee           Employee  @relation("EmployeeAttendance", fields: [employeeId], references: [id], onDelete: NoAction, onUpdate: NoAction)
-  date               DateTime  @db.Date
-  statusId           Int       @map("status_id")
-  checkInTime        DateTime? @map("check_in_time")
-  checkOutTime       DateTime? @map("check_out_time")
-  hoursWorkedMinutes Int?      @map("hours_worked_minutes")
-  late               Boolean   @default(false)
-  lateMonthCount     Int       @default(0) @map("late_month_count")
-  lopApplied         Boolean   @default(false) @map("lop_applied")
-  sourceId           Int       @map("source_id")
-  regularisationId   Int?      @map("regularisation_id")
+  id                 Int                    @id @default(autoincrement())
+  employeeId         Int                    @map("employee_id")
+  employee           Employee               @relation("EmployeeAttendance", fields: [employeeId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  date               DateTime               @db.Date
+  status             Int
+  checkInTime        DateTime?              @map("check_in_time")
+  checkOutTime       DateTime?              @map("check_out_time")
+  hoursWorkedMinutes Int?                   @map("hours_worked_minutes")
+  late               Boolean                @default(false)
+  lateMonthCount     Int                    @default(0) @map("late_month_count")
+  lopApplied         Boolean                @default(false) @map("lop_applied")
+  sourceId           Int                    @map("source_id")
+  regularisationId   Int?                   @map("regularisation_id")
   regularisation     RegularisationRequest? @relation(fields: [regularisationId], references: [id], onDelete: NoAction, onUpdate: NoAction)
-  version            Int       @default(0)
-  createdAt          DateTime  @default(now()) @map("created_at")
+  version            Int                    @default(0)
+  createdAt          DateTime               @default(now()) @map("created_at")
 
   @@unique([employeeId, date, sourceId])
   @@index([employeeId, date])
-  @@index([date, statusId])
+  @@index([date, status])
   @@map("attendance_records")
 }
 
@@ -452,11 +460,12 @@ model AttendanceRecord {
 model RegCodeCounter {
   year   Int @id
   number Int @default(0)
+
   @@map("reg_code_counters")
 }
 
 /// Regularisation request.
-/// status_id (§3.4): 1=Pending, 2=Approved, 3=Rejected.
+/// status (§3.4): 1=Pending, 2=Approved, 3=Rejected.
 /// routed_to_id (§3.4): 1=Manager, 2=Admin.
 model RegularisationRequest {
   id                Int       @id @default(autoincrement())
@@ -467,14 +476,14 @@ model RegularisationRequest {
   proposedCheckIn   DateTime? @map("proposed_check_in")
   proposedCheckOut  DateTime? @map("proposed_check_out")
   reason            String    @db.Text
-  statusId          Int       @default(1) @map("status_id")
+  status            Int       @default(1)
   routedToId        Int       @map("routed_to_id")
   ageDaysAtSubmit   Int       @map("age_days_at_submit")
   approverId        Int?      @map("approver_id")
   approver          Employee? @relation("RegularisationApprover", fields: [approverId], references: [id], onDelete: NoAction, onUpdate: NoAction)
   decidedAt         DateTime? @map("decided_at")
   decidedBy         Int?      @map("decided_by")
-  decisionNote      String?   @db.Text @map("decision_note")
+  decisionNote      String?   @map("decision_note") @db.Text
   correctedRecordId Int?      @unique @map("corrected_record_id")
   version           Int       @default(0)
   createdAt         DateTime  @default(now()) @map("created_at")
@@ -482,8 +491,8 @@ model RegularisationRequest {
 
   attendanceRecords AttendanceRecord[]
 
-  @@index([employeeId, statusId])
-  @@index([approverId, statusId])
+  @@index([employeeId, status])
+  @@index([approverId, status])
   @@map("regularisation_requests")
 }
 
@@ -512,20 +521,21 @@ model PayrollCodeCounter {
   year   Int
   month  Int
   number Int @default(0)
+
   @@id([year, month])
   @@map("payroll_code_counters")
 }
 
-/// Payroll run. status_id (§3.5): 1=Draft, 2=Review, 3=Finalised, 4=Reversed.
+/// Payroll run. status (§3.5): 1=Draft, 2=Review, 3=Finalised, 4=Reversed.
 model PayrollRun {
   id              Int       @id @default(autoincrement())
   code            String    @unique
   month           Int
   year            Int
-  statusId        Int       @default(2) @map("status_id")
+  status          Int       @default(2)
   workingDays     Int       @map("working_days")
-  periodStart     DateTime  @db.Date @map("period_start")
-  periodEnd       DateTime  @db.Date @map("period_end")
+  periodStart     DateTime  @map("period_start") @db.Date
+  periodEnd       DateTime  @map("period_end") @db.Date
   initiatedBy     Int       @map("initiated_by")
   initiator       Employee  @relation("PayrollInitiator", fields: [initiatedBy], references: [id], onDelete: NoAction, onUpdate: NoAction)
   initiatedAt     DateTime  @default(now()) @map("initiated_at")
@@ -535,53 +545,53 @@ model PayrollRun {
   reversedBy      Int?      @map("reversed_by")
   reverser        Employee? @relation("PayrollReverser", fields: [reversedBy], references: [id], onDelete: NoAction, onUpdate: NoAction)
   reversedAt      DateTime? @map("reversed_at")
-  reversalReason  String?   @db.Text @map("reversal_reason")
+  reversalReason  String?   @map("reversal_reason") @db.Text
   reversalOfRunId Int?      @map("reversal_of_run_id")
   version         Int       @default(0)
 
   payslips Payslip[]
 
   @@unique([month, year, reversalOfRunId])
-  @@index([statusId, year, month])
+  @@index([status, year, month])
   @@map("payroll_runs")
 }
 
-/// Payslip. status_id (§3.5, same as PayrollRun): 1=Draft, 2=Review, 3=Finalised, 4=Reversed.
+/// Payslip. status (§3.5, same as PayrollRun): 1=Draft, 2=Review, 3=Finalised, 4=Reversed.
 model Payslip {
-  id                   Int       @id @default(autoincrement())
-  code                 String    @unique
-  runId                Int       @map("run_id")
-  run                  PayrollRun @relation(fields: [runId], references: [id], onDelete: NoAction, onUpdate: NoAction)
-  employeeId           Int       @map("employee_id")
-  employee             Employee  @relation("EmployeePayslips", fields: [employeeId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  id                   Int              @id @default(autoincrement())
+  code                 String           @unique
+  runId                Int              @map("run_id")
+  run                  PayrollRun       @relation(fields: [runId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  employeeId           Int              @map("employee_id")
+  employee             Employee         @relation("EmployeePayslips", fields: [employeeId], references: [id], onDelete: NoAction, onUpdate: NoAction)
   month                Int
   year                 Int
-  statusId             Int       @default(2) @map("status_id")
-  periodStart          DateTime  @db.Date @map("period_start")
-  periodEnd            DateTime  @db.Date @map("period_end")
-  workingDays          Int       @map("working_days")
-  daysWorked           Int       @map("days_worked")
-  lopDays              Int       @default(0) @map("lop_days")
-  basicPaise           Int       @map("basic_paise")
-  allowancesPaise      Int       @map("allowances_paise")
-  grossPaise           Int       @map("gross_paise")
-  lopDeductionPaise    Int       @default(0) @map("lop_deduction_paise")
-  referenceTaxPaise    Int       @default(0) @map("reference_tax_paise")
-  finalTaxPaise        Int       @default(0) @map("final_tax_paise")
-  otherDeductionsPaise Int       @default(0) @map("other_deductions_paise")
-  netPayPaise          Int       @map("net_pay_paise")
-  encashmentDays       Int       @default(0) @map("encashment_days")
-  encashmentPaise      Int       @default(0) @map("encashment_paise")
-  encashmentId         Int?      @unique @map("encashment_id")
+  status               Int              @default(2)
+  periodStart          DateTime         @map("period_start") @db.Date
+  periodEnd            DateTime         @map("period_end") @db.Date
+  workingDays          Int              @map("working_days")
+  daysWorked           Int              @map("days_worked")
+  lopDays              Int              @default(0) @map("lop_days")
+  basicPaise           Int              @map("basic_paise")
+  allowancesPaise      Int              @map("allowances_paise")
+  grossPaise           Int              @map("gross_paise")
+  lopDeductionPaise    Int              @default(0) @map("lop_deduction_paise")
+  referenceTaxPaise    Int              @default(0) @map("reference_tax_paise")
+  finalTaxPaise        Int              @default(0) @map("final_tax_paise")
+  otherDeductionsPaise Int              @default(0) @map("other_deductions_paise")
+  netPayPaise          Int              @map("net_pay_paise")
+  encashmentDays       Int              @default(0) @map("encashment_days")
+  encashmentPaise      Int              @default(0) @map("encashment_paise")
+  encashmentId         Int?             @unique @map("encashment_id")
   encashment           LeaveEncashment? @relation("PayslipEncashment", fields: [encashmentId], references: [id], onDelete: NoAction, onUpdate: NoAction)
-  finalisedAt          DateTime? @map("finalised_at")
-  reversalOfPayslipId  Int?      @unique @map("reversal_of_payslip_id")
-  reversedByPayslipId  Int?      @unique @map("reversed_by_payslip_id")
-  reversedByPayslip    Payslip?  @relation("PayslipReversedBy", fields: [reversedByPayslipId], references: [id], onDelete: NoAction, onUpdate: NoAction)
-  reversedByPayslipRef Payslip[] @relation("PayslipReversedBy")
-  version              Int       @default(0)
-  createdAt            DateTime  @default(now()) @map("created_at")
-  updatedAt            DateTime  @updatedAt @map("updated_at")
+  finalisedAt          DateTime?        @map("finalised_at")
+  reversalOfPayslipId  Int?             @unique @map("reversal_of_payslip_id")
+  reversedByPayslipId  Int?             @unique @map("reversed_by_payslip_id")
+  reversedByPayslip    Payslip?         @relation("PayslipReversedBy", fields: [reversedByPayslipId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  reversedByPayslipRef Payslip[]        @relation("PayslipReversedBy")
+  version              Int              @default(0)
+  createdAt            DateTime         @default(now()) @map("created_at")
+  updatedAt            DateTime         @updatedAt @map("updated_at")
 
   @@unique([runId, employeeId])
   @@index([employeeId, year, month])
@@ -593,7 +603,7 @@ model Payslip {
 // ════════════════════════════════════════════════════════════════════════════
 
 /// Leave encashment request.
-/// status_id (§3.3): 1=Pending, 2=ManagerApproved, 3=AdminFinalised, 4=Paid, 5=Rejected, 6=Cancelled.
+/// status (§3.3): 1=Pending, 2=ManagerApproved, 3=AdminFinalised, 4=Paid, 5=Rejected, 6=Cancelled.
 /// routed_to_id (§3.3): 1=Manager, 2=Admin.
 model LeaveEncashment {
   id              Int       @id @default(autoincrement())
@@ -605,13 +615,13 @@ model LeaveEncashment {
   daysApproved    Int?      @map("days_approved")
   ratePerDayPaise Int?      @map("rate_per_day_paise")
   amountPaise     Int?      @map("amount_paise")
-  statusId        Int       @default(1) @map("status_id")
+  status          Int       @default(1)
   routedToId      Int       @map("routed_to_id")
   approverId      Int?      @map("approver_id")
   approver        Employee? @relation("EncashmentApprover", fields: [approverId], references: [id], onDelete: NoAction, onUpdate: NoAction)
   decidedAt       DateTime? @map("decided_at")
   decidedBy       Int?      @map("decided_by")
-  decisionNote    String?   @db.Text @map("decision_note")
+  decisionNote    String?   @map("decision_note") @db.Text
   escalatedAt     DateTime? @map("escalated_at")
   paidAt          DateTime? @map("paid_at")
   cancelledAt     DateTime? @map("cancelled_at")
@@ -620,9 +630,9 @@ model LeaveEncashment {
   createdAt       DateTime  @default(now()) @map("created_at")
   updatedAt       DateTime  @updatedAt @map("updated_at")
 
-  paidInPayslip   Payslip[] @relation("PayslipEncashment")
+  paidInPayslip Payslip[] @relation("PayslipEncashment")
 
-  @@index([employeeId, year, statusId])
+  @@index([employeeId, year, status])
   @@map("leave_encashments")
 }
 
@@ -631,15 +641,15 @@ model LeaveEncashment {
 // ════════════════════════════════════════════════════════════════════════════
 
 /// Performance cycle.
-/// status_id (§3.6): 1=Open, 2=SelfReview, 3=ManagerReview, 4=Closed.
+/// status (§3.6): 1=Open, 2=SelfReview, 3=ManagerReview, 4=Closed.
 model PerformanceCycle {
   id                    Int       @id @default(autoincrement())
   code                  String    @unique
-  fyStart               DateTime  @db.Date @map("fy_start")
-  fyEnd                 DateTime  @db.Date @map("fy_end")
-  statusId              Int       @default(1) @map("status_id")
-  selfReviewDeadline    DateTime  @db.Date @map("self_review_deadline")
-  managerReviewDeadline DateTime  @db.Date @map("manager_review_deadline")
+  fyStart               DateTime  @map("fy_start") @db.Date
+  fyEnd                 DateTime  @map("fy_end") @db.Date
+  status                Int       @default(1)
+  selfReviewDeadline    DateTime  @map("self_review_deadline") @db.Date
+  managerReviewDeadline DateTime  @map("manager_review_deadline") @db.Date
   closedAt              DateTime? @map("closed_at")
   closedBy              Int?      @map("closed_by")
   closer                Employee? @relation("CycleClosedBy", fields: [closedBy], references: [id], onDelete: NoAction, onUpdate: NoAction)
@@ -656,25 +666,25 @@ model PerformanceCycle {
 
 /// Performance review row per (cycle, employee).
 model PerformanceReview {
-  id                  Int       @id @default(autoincrement())
-  cycleId             Int       @map("cycle_id")
+  id                  Int              @id @default(autoincrement())
+  cycleId             Int              @map("cycle_id")
   cycle               PerformanceCycle @relation(fields: [cycleId], references: [id], onDelete: NoAction, onUpdate: NoAction)
-  employeeId          Int       @map("employee_id")
-  employee            Employee  @relation("ReviewEmployee", fields: [employeeId], references: [id], onDelete: NoAction, onUpdate: NoAction)
-  managerId           Int?      @map("manager_id")
-  manager             Employee? @relation("ReviewManager", fields: [managerId], references: [id], onDelete: NoAction, onUpdate: NoAction)
-  previousManagerId   Int?      @map("previous_manager_id")
-  previousManager     Employee? @relation("ReviewPreviousManager", fields: [previousManagerId], references: [id], onDelete: NoAction, onUpdate: NoAction)
-  selfRating          Int?      @map("self_rating")
-  selfNote            String?   @db.Text @map("self_note")
-  managerRating       Int?      @map("manager_rating")
-  managerNote         String?   @db.Text @map("manager_note")
-  managerOverrodeSelf Boolean   @default(false) @map("manager_overrode_self")
-  finalRating         Int?      @map("final_rating")
-  lockedAt            DateTime? @map("locked_at")
-  version             Int       @default(0)
-  createdAt           DateTime  @default(now()) @map("created_at")
-  updatedAt           DateTime  @updatedAt @map("updated_at")
+  employeeId          Int              @map("employee_id")
+  employee            Employee         @relation("ReviewEmployee", fields: [employeeId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  managerId           Int?             @map("manager_id")
+  manager             Employee?        @relation("ReviewManager", fields: [managerId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  previousManagerId   Int?             @map("previous_manager_id")
+  previousManager     Employee?        @relation("ReviewPreviousManager", fields: [previousManagerId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  selfRating          Int?             @map("self_rating")
+  selfNote            String?          @map("self_note") @db.Text
+  managerRating       Int?             @map("manager_rating")
+  managerNote         String?          @map("manager_note") @db.Text
+  managerOverrodeSelf Boolean          @default(false) @map("manager_overrode_self")
+  finalRating         Int?             @map("final_rating")
+  lockedAt            DateTime?        @map("locked_at")
+  version             Int              @default(0)
+  createdAt           DateTime         @default(now()) @map("created_at")
+  updatedAt           DateTime         @updatedAt @map("updated_at")
 
   goals Goal[]
 
@@ -686,15 +696,15 @@ model PerformanceReview {
 /// Goal under a review.
 /// outcome_id (§3.6): 1=Pending, 2=Met, 3=Partial, 4=Missed.
 model Goal {
-  id                 Int       @id @default(autoincrement())
-  reviewId           Int       @map("review_id")
+  id                 Int               @id @default(autoincrement())
+  reviewId           Int               @map("review_id")
   review             PerformanceReview @relation(fields: [reviewId], references: [id], onDelete: NoAction, onUpdate: NoAction)
-  text               String    @db.Text
-  outcomeId          Int       @default(1) @map("outcome_id")
-  proposedByEmployee Boolean   @default(false) @map("proposed_by_employee")
-  version            Int       @default(0)
-  createdAt          DateTime  @default(now()) @map("created_at")
-  updatedAt          DateTime  @updatedAt @map("updated_at")
+  text               String            @db.Text
+  outcomeId          Int               @default(1) @map("outcome_id")
+  proposedByEmployee Boolean           @default(false) @map("proposed_by_employee")
+  version            Int               @default(0)
+  createdAt          DateTime          @default(now()) @map("created_at")
+  updatedAt          DateTime          @updatedAt @map("updated_at")
 
   @@index([reviewId])
   @@map("goals")
@@ -708,16 +718,16 @@ model Goal {
 /// category_id (§3.7): 1=Leave, 2=Attendance, 3=Payroll, 4=Performance, 5=Status,
 /// 6=Configuration, 7=Auth, 8=System.
 model Notification {
-  id          Int       @id @default(autoincrement())
-  recipientId Int       @map("recipient_id")
-  recipient   Employee  @relation("EmployeeNotifications", fields: [recipientId], references: [id], onDelete: NoAction, onUpdate: NoAction)
-  categoryId  Int       @map("category_id")
+  id          Int      @id @default(autoincrement())
+  recipientId Int      @map("recipient_id")
+  recipient   Employee @relation("EmployeeNotifications", fields: [recipientId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  categoryId  Int      @map("category_id")
   title       String
-  body        String    @db.Text
+  body        String   @db.Text
   link        String?
-  unread      Boolean   @default(true)
-  auditLogId  Int?      @map("audit_log_id")
-  createdAt   DateTime  @default(now()) @map("created_at")
+  unread      Boolean  @default(true)
+  auditLogId  Int?     @map("audit_log_id")
+  createdAt   DateTime @default(now()) @map("created_at")
 
   @@index([recipientId, unread, createdAt(sort: Desc)])
   @@index([createdAt])
@@ -732,19 +742,19 @@ model Notification {
 /// actor_role_id (§3.9): 1=Employee, 2=Manager, 3=PayrollOfficer, 4=Admin, 99=unknown, 100=system.
 /// module_id: FK to audit_modules master.
 model AuditLog {
-  id            Int       @id @default(autoincrement())
-  actorId       Int?      @map("actor_id")
-  actor         Employee? @relation("AuditActor", fields: [actorId], references: [id], onDelete: NoAction, onUpdate: NoAction)
-  actorRoleId   Int       @map("actor_role_id")
-  actorIp       String?   @map("actor_ip")
-  action        String
-  targetTypeId  Int?      @map("target_type_id")
-  targetId      Int?      @map("target_id")
-  moduleId      Int       @map("module_id")
-  module        AuditModule @relation(fields: [moduleId], references: [id], onDelete: NoAction, onUpdate: NoAction)
-  before        Json?
-  after         Json?
-  createdAt     DateTime  @default(now()) @map("created_at")
+  id           Int         @id @default(autoincrement())
+  actorId      Int?        @map("actor_id")
+  actor        Employee?   @relation("AuditActor", fields: [actorId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  actorRoleId  Int         @map("actor_role_id")
+  actorIp      String?     @map("actor_ip")
+  action       String
+  targetTypeId Int?        @map("target_type_id")
+  targetId     Int?        @map("target_id")
+  moduleId     Int         @map("module_id")
+  module       AuditModule @relation(fields: [moduleId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  before       Json?
+  after        Json?
+  createdAt    DateTime    @default(now()) @map("created_at")
 
   @@index([actorId])
   @@index([action])
@@ -760,18 +770,19 @@ model Configuration {
   value     Json
   updatedBy String?  @map("updated_by")
   updatedAt DateTime @updatedAt @map("updated_at")
+
   @@map("configurations")
 }
 
 /// Idempotency key store for guarded mutation endpoints.
 model IdempotencyKey {
-  id               Int       @id @default(autoincrement())
-  key              String    @unique
-  employeeId       Int       @map("employee_id")
-  employee         Employee  @relation("EmployeeIdempotencyKeys", fields: [employeeId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  id               Int      @id @default(autoincrement())
+  key              String   @unique
+  employeeId       Int      @map("employee_id")
+  employee         Employee @relation("EmployeeIdempotencyKeys", fields: [employeeId], references: [id], onDelete: NoAction, onUpdate: NoAction)
   endpoint         String
-  responseSnapshot Json      @map("response_snapshot")
-  createdAt        DateTime  @default(now()) @map("created_at")
+  responseSnapshot Json     @map("response_snapshot")
+  createdAt        DateTime @default(now()) @map("created_at")
 
   @@index([createdAt])
   @@map("idempotency_keys")
