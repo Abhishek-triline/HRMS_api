@@ -37,8 +37,8 @@ import {
 import { ErrorEnvelopeSchema } from '@nexora/contracts/errors';
 import {
   EmployeeStatusSchema,
-  EmploymentTypeSchema,
-  RoleSchema,
+  EmploymentTypeIdSchema,
+  RoleIdSchema,
 } from '@nexora/contracts/common';
 import {
   CreateEmployeeRequestSchema,
@@ -60,9 +60,8 @@ import {
   SalaryStructureSchema,
 } from '@nexora/contracts/employees';
 import {
-  LeaveTypeSchema,
+  LeaveTypeIdSchema,
   LeaveStatusSchema,
-  RoutedToSchema,
   LeaveBalanceSchema,
   LeaveBalancesResponseSchema,
   LeaveTypeCatalogItemSchema,
@@ -88,7 +87,7 @@ import {
 } from '@nexora/contracts/leave';
 import {
   AttendanceStatusSchema,
-  AttendanceSourceSchema,
+  AttendanceSourceIdSchema,
   AttendanceRecordSchema,
   AttendanceCalendarItemSchema,
   CheckInRequestSchema,
@@ -99,7 +98,6 @@ import {
   AttendanceListResponseSchema,
   TodayAttendanceResponseSchema,
   RegStatusSchema,
-  RegRoutedToSchema,
   RegularisationRequestSchema,
   RegularisationSummarySchema,
   CreateRegularisationRequestSchema,
@@ -144,7 +142,7 @@ import {
 } from '@nexora/contracts/payroll';
 import {
   CycleStatusSchema,
-  GoalOutcomeSchema,
+  GoalOutcomeIdSchema,
   GoalSchema,
   PerformanceCycleSchema,
   PerformanceCycleSummarySchema,
@@ -174,7 +172,7 @@ import {
   MissingReviewsResponseSchema,
 } from '@nexora/contracts/performance';
 import {
-  NotificationCategorySchema,
+  NotificationCategoryIdSchema,
   NotificationSchema,
   NotificationListQuerySchema,
   NotificationListResponseSchema,
@@ -203,9 +201,9 @@ const registry = new OpenAPIRegistry();
 
 // ── Components — shared schemas ─────────────────────────────────────────────
 
-registry.register('Role', RoleSchema);
+registry.register('RoleId', RoleIdSchema);
 registry.register('EmployeeStatus', EmployeeStatusSchema);
-registry.register('EmploymentType', EmploymentTypeSchema);
+registry.register('EmploymentTypeId', EmploymentTypeIdSchema);
 registry.register('AuthUser', AuthUserSchema);
 registry.register('ErrorEnvelope', ErrorEnvelopeSchema);
 
@@ -652,9 +650,8 @@ registry.registerPath({
 
 // ── Phase 2 — Leave Management ─────────────────────────────────────────────
 
-registry.register('LeaveType', LeaveTypeSchema);
+registry.register('LeaveTypeId', LeaveTypeIdSchema);
 registry.register('LeaveStatus', LeaveStatusSchema);
-registry.register('RoutedTo', RoutedToSchema);
 registry.register('LeaveBalance', LeaveBalanceSchema);
 registry.register('LeaveBalancesResponse', LeaveBalancesResponseSchema);
 registry.register('LeaveTypeCatalogItem', LeaveTypeCatalogItemSchema);
@@ -934,7 +931,7 @@ registry.registerPath({
 // ── Phase 3 — Attendance & Regularisation components ────────────────────────
 
 registry.register('AttendanceStatus', AttendanceStatusSchema);
-registry.register('AttendanceSource', AttendanceSourceSchema);
+registry.register('AttendanceSourceId', AttendanceSourceIdSchema);
 registry.register('AttendanceRecord', AttendanceRecordSchema);
 registry.register('AttendanceCalendarItem', AttendanceCalendarItemSchema);
 registry.register('CheckInRequest', CheckInRequestSchema);
@@ -945,7 +942,6 @@ registry.register('AttendanceListQuery', AttendanceListQuerySchema);
 registry.register('AttendanceListResponse', AttendanceListResponseSchema);
 registry.register('TodayAttendanceResponse', TodayAttendanceResponseSchema);
 registry.register('RegStatus', RegStatusSchema);
-registry.register('RegRoutedTo', RegRoutedToSchema);
 registry.register('RegularisationRequest', RegularisationRequestSchema);
 registry.register('RegularisationSummary', RegularisationSummarySchema);
 registry.register('CreateRegularisationRequest', CreateRegularisationRequestSchema);
@@ -1562,7 +1558,7 @@ registry.registerPath({
 // ── Phase 5 — Performance Reviews ───────────────────────────────────────────
 
 registry.register('CycleStatus', CycleStatusSchema);
-registry.register('GoalOutcome', GoalOutcomeSchema);
+registry.register('GoalOutcomeId', GoalOutcomeIdSchema);
 registry.register('Goal', GoalSchema);
 registry.register('PerformanceCycle', PerformanceCycleSchema);
 registry.register('PerformanceCycleSummary', PerformanceCycleSummarySchema);
@@ -1875,7 +1871,7 @@ registry.registerPath({
 
 // ── Phase 6 — Notifications ──────────────────────────────────────────────────
 
-registry.register('NotificationCategory', NotificationCategorySchema);
+registry.register('NotificationCategoryId', NotificationCategoryIdSchema);
 registry.register('Notification', NotificationSchema);
 registry.register('NotificationListQuery', NotificationListQuerySchema);
 registry.register('NotificationListResponse', NotificationListResponseSchema);

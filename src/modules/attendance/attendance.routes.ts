@@ -1,15 +1,16 @@
 /**
- * Attendance routes — Phase 3.
+ * Attendance routes — v2 (INT IDs, INT status codes).
  *
  * Mounted at /api/v1/attendance
  *
  * Endpoints:
- *   POST  /check-in          requireSession — E-06 (BL-024/BL-027/BL-028)
- *   POST  /check-out         requireSession — E-06 (BL-025)
- *   GET   /me                requireSession — E-05 (own records, calendar month default)
- *   GET   /me/today          requireSession — E-05 (today's panel state)
- *   GET   /team              Manager        — M-05 (scoped to subordinates)
- *   GET   /                  Admin          — A-09 (org-wide, optional ?department)
+ *   POST  /check-in          requireSession
+ *   POST  /check-out         requireSession
+ *   POST  /check-out/undo    requireSession
+ *   GET   /me/today          requireSession
+ *   GET   /me                requireSession
+ *   GET   /team              Manager / Admin
+ *   GET   /                  Admin
  */
 
 import { Router } from 'express';
@@ -23,13 +24,13 @@ import { AttendanceListQuerySchema } from '@nexora/contracts/attendance';
 import { getSubordinateIds } from '../employees/hierarchy.js';
 import { logger } from '../../lib/logger.js';
 import { getAttendanceConfig } from '../../lib/config.js';
+import { RoleId, AttendanceSource } from '../../lib/statusInt.js';
 import {
   recordCheckIn,
   recordCheckOut,
   undoCheckOutForEmployee,
   findOpenAttendance,
   formatAttendanceRecord,
-  mapAttendanceStatusToDb,
 } from './attendance.service.js';
 
 export const attendanceRouter = Router();
@@ -45,7 +46,7 @@ attendanceRouter.post(
 
     try {
       const result = await prisma.$transaction(async (tx) => {
-        return recordCheckIn(user.id, now, tx, { role: user.role, ip: req.ip ?? null });
+        return recordCheckIn(user.id, now, tx, { roleId: user.roleId, ip: req.ip ?? null });
       });
 
       res.status(200).json({
@@ -56,7 +57,7 @@ attendanceRouter.post(
         },
       });
     } catch (err: unknown) {
-      logger.error({ err, userId: user.id }, 'attendance.check-in: error');
+      logger.error({ err, employeeId: user.id }, 'attendance.check-in: error');
       res
         .status(500)
         .json(errorEnvelope(ErrorCode.INTERNAL_ERROR, 'Failed to record check-in.'));
@@ -75,11 +76,10 @@ attendanceRouter.post(
 
     try {
       const result = await prisma.$transaction(async (tx) => {
-        return recordCheckOut(user.id, now, tx, { role: user.role, ip: req.ip ?? null });
+        return recordCheckOut(user.id, now, tx, { roleId: user.roleId, ip: req.ip ?? null });
       });
 
       if (!result) {
-        // BL-024: no check-in for today
         res.status(400).json(
           errorEnvelope(
             ErrorCode.VALIDATION_FAILED,
@@ -97,7 +97,7 @@ attendanceRouter.post(
         },
       });
     } catch (err: unknown) {
-      logger.error({ err, userId: user.id }, 'attendance.check-out: error');
+      logger.error({ err, employeeId: user.id }, 'attendance.check-out: error');
       res
         .status(500)
         .json(errorEnvelope(ErrorCode.INTERNAL_ERROR, 'Failed to record check-out.'));
@@ -116,7 +116,7 @@ attendanceRouter.post(
 
     try {
       const result = await prisma.$transaction(async (tx) => {
-        return undoCheckOutForEmployee(user.id, now, tx, { role: user.role, ip: req.ip ?? null });
+        return undoCheckOutForEmployee(user.id, now, tx, { roleId: user.roleId, ip: req.ip ?? null });
       });
 
       res.status(200).json({
@@ -132,7 +132,7 @@ attendanceRouter.post(
         res.status(409).json(errorEnvelope(e.code, e.message ?? 'Conflict'));
         return;
       }
-      logger.error({ err, userId: user.id }, 'attendance.check-out.undo: error');
+      logger.error({ err, employeeId: user.id }, 'attendance.check-out.undo: error');
       res
         .status(500)
         .json(errorEnvelope(ErrorCode.INTERNAL_ERROR, 'Failed to undo check-out.'));
@@ -158,15 +158,14 @@ attendanceRouter.get(
       const lateThreshold = attendanceCfg.lateThresholdTime;
       const standardDailyHours = attendanceCfg.standardDailyHours;
 
-      // Derive panel state
-      let panelState: 'Ready' | 'Working' | 'Confirm' = 'Ready';
+      // Derive panel state: 1=Ready, 2=Working, 3=Confirm
+      let panelStateId = 1;
       if (record?.checkInTime && !record.checkOutTime) {
-        panelState = 'Working';
+        panelStateId = 2;
       } else if (record?.checkInTime && record.checkOutTime) {
-        panelState = 'Confirm';
+        panelStateId = 3;
       }
 
-      // Get monthly late count
       const now = new Date();
       const year = now.getUTCFullYear();
       const month = now.getUTCMonth() + 1;
@@ -176,18 +175,18 @@ attendanceRouter.get(
 
       res.status(200).json({
         data: {
-          record: record ? formatAttendanceRecord(record) : null,
-          panelState,
+          record: record ? formatAttendanceRecord(record as Parameters<typeof formatAttendanceRecord>[0]) : null,
+          panelStateId,
           lateThreshold,
           standardDailyHours,
           lateMonthCount: lateLedger?.count ?? 0,
         },
       });
     } catch (err: unknown) {
-      logger.error({ err, userId: user.id }, 'attendance.me.today: error');
+      logger.error({ err, employeeId: user.id }, 'attendance.me.today: error');
       res
         .status(500)
-        .json(errorEnvelope(ErrorCode.INTERNAL_ERROR, 'Failed to load today\'s attendance.'));
+        .json(errorEnvelope(ErrorCode.INTERNAL_ERROR, "Failed to load today's attendance."));
     }
   },
 );
@@ -203,7 +202,7 @@ attendanceRouter.get(
     const q = req.query as unknown as {
       from?: string;
       to?: string;
-      status?: string;
+      status?: number;
       date?: string;
       cursor?: string;
       limit?: number;
@@ -215,7 +214,7 @@ attendanceRouter.get(
 
       const where: Record<string, unknown> = {
         employeeId: user.id,
-        source: 'system',
+        sourceId: AttendanceSource.system,
       };
 
       if (dateFilter) {
@@ -224,7 +223,7 @@ attendanceRouter.get(
         where['date'] = { gte: from, lte: to };
       }
 
-      if (statusFilter) {
+      if (statusFilter !== undefined) {
         where['status'] = statusFilter;
       }
 
@@ -232,7 +231,7 @@ attendanceRouter.get(
         where,
         orderBy: { date: 'asc' },
         take: limit + 1,
-        ...(q.cursor ? { cursor: { id: q.cursor }, skip: 1 } : {}),
+        ...(q.cursor ? { cursor: { id: Number(q.cursor) }, skip: 1 } : {}),
         include: {
           employee: { select: { name: true, code: true } },
         },
@@ -240,19 +239,19 @@ attendanceRouter.get(
 
       const hasMore = rows.length > limit;
       const items = hasMore ? rows.slice(0, limit) : rows;
-      const nextCursor = hasMore ? items[items.length - 1]!.id : null;
+      const nextCursor = hasMore ? String(items[items.length - 1]!.id) : null;
 
       res.status(200).json({
         data: items.map((r) => ({
           ...formatAttendanceCalendarItem(r),
           employeeId: r.employeeId,
-          employeeName: r.employee.name,
-          employeeCode: r.employee.code,
+          employeeName: r.employee?.name,
+          employeeCode: r.employee?.code,
         })),
         nextCursor,
       });
     } catch (err: unknown) {
-      logger.error({ err, userId: user.id }, 'attendance.me: error');
+      logger.error({ err, employeeId: user.id }, 'attendance.me: error');
       res
         .status(500)
         .json(errorEnvelope(ErrorCode.INTERNAL_ERROR, 'Failed to load attendance.'));
@@ -265,22 +264,21 @@ attendanceRouter.get(
 attendanceRouter.get(
   '/team',
   requireSession(),
-  requireRole('Manager', 'Admin'),
+  requireRole(RoleId.Manager, RoleId.Admin),
   validateQuery(AttendanceListQuerySchema),
   async (req: Request, res: Response): Promise<void> => {
     const user = req.user!;
     const q = req.query as unknown as {
       from?: string;
       to?: string;
-      status?: string;
-      employeeId?: string;
+      status?: number;
+      employeeId?: number;
       date?: string;
       cursor?: string;
       limit?: number;
     };
 
     try {
-      // Scope: subordinates of the requesting manager
       const subIds = await getSubordinateIds(user.id);
       if (subIds.length === 0) {
         res.status(200).json({ data: [], nextCursor: null });
@@ -290,14 +288,12 @@ attendanceRouter.get(
       const { from, to, statusFilter, dateFilter } = resolveListDateRange(q);
       const limit = Number(q.limit ?? 20);
 
-      // Optional: filter to a specific employee within the team
-      const employeeFilter = q.employeeId && subIds.includes(q.employeeId)
-        ? [q.employeeId]
-        : subIds;
+      const employeeFilter =
+        q.employeeId && subIds.includes(q.employeeId) ? [q.employeeId] : subIds;
 
       const where: Record<string, unknown> = {
         employeeId: { in: employeeFilter },
-        source: 'system',
+        sourceId: AttendanceSource.system,
       };
 
       if (dateFilter) {
@@ -306,7 +302,7 @@ attendanceRouter.get(
         where['date'] = { gte: from, lte: to };
       }
 
-      if (statusFilter) {
+      if (statusFilter !== undefined) {
         where['status'] = statusFilter;
       }
 
@@ -314,7 +310,7 @@ attendanceRouter.get(
         where,
         orderBy: [{ date: 'asc' }, { employeeId: 'asc' }],
         take: limit + 1,
-        ...(q.cursor ? { cursor: { id: q.cursor }, skip: 1 } : {}),
+        ...(q.cursor ? { cursor: { id: Number(q.cursor) }, skip: 1 } : {}),
         include: {
           employee: { select: { name: true, code: true } },
         },
@@ -322,19 +318,19 @@ attendanceRouter.get(
 
       const hasMore = rows.length > limit;
       const items = hasMore ? rows.slice(0, limit) : rows;
-      const nextCursor = hasMore ? items[items.length - 1]!.id : null;
+      const nextCursor = hasMore ? String(items[items.length - 1]!.id) : null;
 
       res.status(200).json({
         data: items.map((r) => ({
           ...formatAttendanceCalendarItem(r),
           employeeId: r.employeeId,
-          employeeName: r.employee.name,
-          employeeCode: r.employee.code,
+          employeeName: r.employee?.name,
+          employeeCode: r.employee?.code,
         })),
         nextCursor,
       });
     } catch (err: unknown) {
-      logger.error({ err, userId: user.id }, 'attendance.team: error');
+      logger.error({ err, employeeId: user.id }, 'attendance.team: error');
       res
         .status(500)
         .json(errorEnvelope(ErrorCode.INTERNAL_ERROR, 'Failed to load team attendance.'));
@@ -347,16 +343,16 @@ attendanceRouter.get(
 attendanceRouter.get(
   '/',
   requireSession(),
-  requireRole('Admin'),
+  requireRole(RoleId.Admin),
   validateQuery(AttendanceListQuerySchema),
   async (req: Request, res: Response): Promise<void> => {
     const user = req.user!;
     const q = req.query as unknown as {
       from?: string;
       to?: string;
-      status?: string;
-      employeeId?: string;
-      department?: string;
+      status?: number;
+      employeeId?: number;
+      departmentId?: number;
       date?: string;
       cursor?: string;
       limit?: number;
@@ -366,19 +362,13 @@ attendanceRouter.get(
       const { from, to, statusFilter, dateFilter } = resolveListDateRange(q);
       const limit = Number(q.limit ?? 20);
 
-      // Build employee filter
-      const employeeWhere: Record<string, unknown> = {};
-      if (q.department) {
-        employeeWhere['department'] = q.department;
-      }
-      if (q.employeeId) {
-        employeeWhere['id'] = q.employeeId;
-      }
-
       const where: Record<string, unknown> = {
-        source: 'system',
-        employee: Object.keys(employeeWhere).length > 0 ? employeeWhere : undefined,
+        sourceId: AttendanceSource.system,
       };
+
+      if (q.employeeId) {
+        where['employeeId'] = q.employeeId;
+      }
 
       if (dateFilter) {
         where['date'] = dateFilter;
@@ -386,7 +376,7 @@ attendanceRouter.get(
         where['date'] = { gte: from, lte: to };
       }
 
-      if (statusFilter) {
+      if (statusFilter !== undefined) {
         where['status'] = statusFilter;
       }
 
@@ -394,7 +384,7 @@ attendanceRouter.get(
         where,
         orderBy: [{ date: 'asc' }, { employeeId: 'asc' }],
         take: limit + 1,
-        ...(q.cursor ? { cursor: { id: q.cursor }, skip: 1 } : {}),
+        ...(q.cursor ? { cursor: { id: Number(q.cursor) }, skip: 1 } : {}),
         include: {
           employee: { select: { name: true, code: true } },
         },
@@ -402,19 +392,19 @@ attendanceRouter.get(
 
       const hasMore = rows.length > limit;
       const items = hasMore ? rows.slice(0, limit) : rows;
-      const nextCursor = hasMore ? items[items.length - 1]!.id : null;
+      const nextCursor = hasMore ? String(items[items.length - 1]!.id) : null;
 
       res.status(200).json({
         data: items.map((r) => ({
           ...formatAttendanceCalendarItem(r),
           employeeId: r.employeeId,
-          employeeName: r.employee.name,
-          employeeCode: r.employee.code,
+          employeeName: r.employee?.name,
+          employeeCode: r.employee?.code,
         })),
         nextCursor,
       });
     } catch (err: unknown) {
-      logger.error({ err, userId: user.id }, 'attendance.org: error');
+      logger.error({ err, employeeId: user.id }, 'attendance.org: error');
       res
         .status(500)
         .json(errorEnvelope(ErrorCode.INTERNAL_ERROR, 'Failed to load attendance.'));
@@ -424,21 +414,15 @@ attendanceRouter.get(
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/**
- * Resolve the date range for list queries.
- * - If `?date` is provided, use that single day.
- * - If `?from` / `?to` are provided, use that range.
- * - Default: current calendar month.
- */
 function resolveListDateRange(q: {
   from?: string;
   to?: string;
-  status?: string;
+  status?: number;
   date?: string;
 }): {
   from: Date;
   to: Date;
-  statusFilter: string | undefined;
+  statusFilter: number | undefined;
   dateFilter: { gte: Date; lte: Date } | undefined;
 } {
   const now = new Date();
@@ -458,26 +442,18 @@ function resolveListDateRange(q: {
 
   const toDate = q.to
     ? new Date(q.to)
-    : new Date(
-        Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 0, 23, 59, 59, 999),
-      );
+    : new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 0, 23, 59, 59, 999));
 
-  const statusFilter = q.status
-    ? mapAttendanceStatusToDb(q.status)
-    : undefined;
+  // status is already an INT from the coerce schema
+  const statusFilter = q.status !== undefined ? q.status : undefined;
 
-  return {
-    from: fromDate,
-    to: toDate,
-    statusFilter,
-    dateFilter,
-  };
+  return { from: fromDate, to: toDate, statusFilter, dateFilter };
 }
 
-/** Format a DB row to the AttendanceCalendarItem shape (without employee fields). */
+/** Format a DB row to the AttendanceCalendarItem shape (v2 INT status). */
 function formatAttendanceCalendarItem(row: {
   date: Date;
-  status: string;
+  status: number;
   checkInTime: Date | null;
   checkOutTime: Date | null;
   hoursWorkedMinutes: number | null;
@@ -485,21 +461,7 @@ function formatAttendanceCalendarItem(row: {
 }) {
   return {
     date: row.date.toISOString().split('T')[0]!,
-    status: (() => {
-      const m: Record<string, string> = {
-        Present: 'Present',
-        Absent: 'Absent',
-        OnLeave: 'On-Leave',
-        WeeklyOff: 'Weekly-Off',
-        Holiday: 'Holiday',
-      };
-      return (m[row.status] ?? 'Absent') as
-        | 'Present'
-        | 'Absent'
-        | 'On-Leave'
-        | 'Weekly-Off'
-        | 'Holiday';
-    })(),
+    status: row.status,
     checkInTime: row.checkInTime?.toISOString() ?? null,
     checkOutTime: row.checkOutTime?.toISOString() ?? null,
     hoursWorkedMinutes: row.hoursWorkedMinutes ?? null,

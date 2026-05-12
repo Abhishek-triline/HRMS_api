@@ -1,30 +1,18 @@
 /**
- * Idempotency-Key middleware — SEC-004-P3 close-out.
+ * Idempotency-Key middleware — SEC-004-P3 (v2).
+ *
+ * v2 changes:
+ *   - employeeId is INT (was userId string).
+ *   - IdempotencyKey schema uses employeeId + key (no userId/path/status/responseBody).
+ *   - responseSnapshot replaces responseBody.
+ *   - No status column — replay always returns 200.
  *
  * Convention (docs/HRMS_API.md § 1):
  *   - Mutation endpoints accept an optional `Idempotency-Key` header.
- *   - Duplicates within 24h (scoped to userId + key) return the original
+ *   - Duplicates within 24h (scoped to employeeId + key) return the original
  *     response without re-applying any side effects.
- *   - The key is scoped to (userId, key): one user's key never collides
+ *   - The key is scoped to (employeeId, key): one user's key never collides
  *     with another user's identical key string.
- *
- * Behaviour:
- *   1. If no `Idempotency-Key` header → pass through unchanged.
- *   2. Cache hit (same userId + key, path matches, within 24h) → replay
- *      original status + body immediately.
- *   3. Cache miss → intercept the first successful 2xx response and
- *      persist it. Subsequent calls replay it.
- *   4. Error responses (4xx/5xx) are NEVER cached — repeat attempts should
- *      always be fresh (the client may be retrying after fixing the input).
- *
- * Applied to all payroll mutations:
- *   POST /payroll/runs
- *   POST /payroll/runs/:id/finalise
- *   POST /payroll/runs/:id/reverse
- *   PATCH /payslips/:id/tax
- *   PATCH /config/tax
- *
- * Cleanup: a daily cron at 03:00 IST deletes rows older than 24h.
  */
 
 import type { Request, Response, NextFunction, RequestHandler } from 'express';
@@ -54,17 +42,17 @@ export function idempotencyKey(): RequestHandler {
       return;
     }
 
-    const userId = user.id;
-    const path = req.path;
+    const employeeId = user.id; // INT
+    const endpoint = req.path;
     const cutoff = new Date(Date.now() - TTL_MS);
 
     try {
       // Check for a cache hit
       const existing = await prisma.idempotencyKey.findFirst({
         where: {
-          userId,
+          employeeId,
           key,
-          path,
+          endpoint,
           createdAt: { gt: cutoff },
         },
       });
@@ -72,15 +60,15 @@ export function idempotencyKey(): RequestHandler {
       if (existing) {
         // Replay the cached response
         logger.debug(
-          { userId, key, path, status: existing.status },
+          { employeeId, key, endpoint },
           'idempotency-key: cache hit — replaying cached response',
         );
-        res.status(existing.status).json(existing.responseBody);
+        res.status(200).json(existing.responseSnapshot);
         return;
       }
     } catch (err) {
       // Cache lookup failure — allow the request to proceed (fail-open)
-      logger.warn({ err, key, userId }, 'idempotency-key: cache lookup failed, proceeding without cache');
+      logger.warn({ err, key, employeeId }, 'idempotency-key: cache lookup failed, proceeding without cache');
       next();
       return;
     }
@@ -102,16 +90,15 @@ export function idempotencyKey(): RequestHandler {
         prisma.idempotencyKey
           .create({
             data: {
-              userId,
+              employeeId,
               key,
-              path,
-              status: statusCode,
-              responseBody: body as never,
+              endpoint,
+              responseSnapshot: body as never,
             },
           })
           .catch((cacheErr: unknown) => {
             logger.warn(
-              { cacheErr, key, userId },
+              { cacheErr, key, employeeId },
               'idempotency-key: failed to persist cache entry',
             );
           });

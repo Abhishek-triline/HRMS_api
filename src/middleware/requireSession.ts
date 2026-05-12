@@ -1,25 +1,31 @@
 /**
- * requireSession — session authentication middleware.
+ * requireSession — session authentication middleware (v2).
  *
- * Reads the session cookie, loads the employee row, attaches req.user.
+ * Reads the signed session cookie, looks up the Session row by token,
+ * attaches req.user with INT IDs (employeeId: number, roleId: number).
  * Rejects with 401 UNAUTHENTICATED on any miss or expired session.
  *
- * Usage:
- *   router.get('/me', requireSession(), handler)
+ * v2 changes from Phase 3:
+ *   - Session.id is INT; looked up by Session.token (public random hex).
+ *   - req.user.id is INT (was string cuid).
+ *   - req.user.roleId is INT (replaces string role field).
+ *   - Employee status comparison uses EmployeeStatus INT constants.
+ *   - Employee includes department/designation via master relations.
  */
 
 import type { Request, Response, NextFunction, RequestHandler } from 'express';
 import { errorEnvelope, ErrorCode } from '@nexora/contracts/errors';
 import type { AuthUser } from '@nexora/contracts/auth';
 import { prisma } from '../lib/prisma.js';
+import { EmployeeStatus } from '../lib/statusInt.js';
 
 // Augment Express Request to carry the authenticated user.
 declare global {
   // eslint-disable-next-line @typescript-eslint/no-namespace
   namespace Express {
     interface Request {
-      user?: AuthUser & { sessionId: string };
-      sessionId?: string;
+      user?: AuthUser & { sessionId: number };
+      sessionId?: number;
     }
   }
 }
@@ -33,22 +39,30 @@ export function requireSession(): RequestHandler {
     const signedCookies = (req as any).signedCookies as Record<string, string | false> | undefined;
     const rawCookie = signedCookies?.[COOKIE_NAME];
     // cookie-parser returns `false` for cookies with invalid signatures
-    const sessionId = typeof rawCookie === 'string' ? rawCookie : undefined;
+    const sessionToken = typeof rawCookie === 'string' ? rawCookie : undefined;
 
-    if (!sessionId) {
+    if (!sessionToken) {
       res.status(401).json(errorEnvelope(ErrorCode.UNAUTHENTICATED, 'No active session.'));
       return;
     }
 
+    // Look up session by public token, include employee with master relations
     const session = await prisma.session.findUnique({
-      where: { id: sessionId },
-      include: { employee: true },
+      where: { token: sessionToken },
+      include: {
+        employee: {
+          include: {
+            department: { select: { name: true } },
+            designation: { select: { name: true } },
+          },
+        },
+      },
     });
 
     if (!session || session.expiresAt < new Date()) {
       // Delete stale session if found
       if (session) {
-        await prisma.session.delete({ where: { id: sessionId } }).catch(() => undefined);
+        await prisma.session.delete({ where: { id: session.id } }).catch(() => undefined);
       }
       res
         .clearCookie(COOKIE_NAME)
@@ -59,12 +73,8 @@ export function requireSession(): RequestHandler {
 
     const { employee } = session;
 
-    // SEC-002-P2: a session belonging to an Exited or Inactive employee must
-    // not authenticate further requests, even if the cookie hasn't expired.
-    // We delete the row defensively so subsequent calls also fail fast, and
-    // surface the same UNAUTHENTICATED envelope so the caller can't tell
-    // whether the session is missing or just disabled.
-    if (employee.status === 'Exited' || employee.status === 'Inactive') {
+    // SEC-002-P2: Exited (5) or Inactive (4) employees must not authenticate.
+    if (employee.status === EmployeeStatus.Exited || employee.status === EmployeeStatus.Inactive) {
       await prisma.session.delete({ where: { id: session.id } }).catch(() => undefined);
       res.clearCookie(COOKIE_NAME, { path: '/' });
       res
@@ -73,26 +83,15 @@ export function requireSession(): RequestHandler {
       return;
     }
 
-    // Map DB EmployeeStatus enum (no hyphens) → zod enum (with hyphens)
-    const statusMap: Record<string, AuthUser['status']> = {
-      Active: 'Active',
-      OnNotice: 'On-Notice',
-      Exited: 'Exited',
-      OnLeave: 'On-Leave',
-      Inactive: 'Inactive',
-    };
-
-    const mappedStatus = statusMap[employee.status] ?? 'Inactive';
-
     req.user = {
       id: employee.id,
       code: employee.code,
       email: employee.email,
       name: employee.name,
-      role: employee.role,
-      status: mappedStatus,
-      department: employee.department ?? null,
-      designation: employee.designation ?? null,
+      roleId: employee.roleId,
+      status: employee.status,
+      department: employee.department?.name ?? null,
+      designation: employee.designation?.name ?? null,
       reportingManagerId: employee.reportingManagerId ?? null,
       mustResetPassword: employee.mustResetPassword,
       sessionId: session.id,

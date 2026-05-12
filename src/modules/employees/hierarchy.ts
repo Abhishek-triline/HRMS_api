@@ -1,5 +1,5 @@
 /**
- * Hierarchy helpers — BL-005 / BL-022 / BL-022a.
+ * Hierarchy helpers — BL-005 / BL-022 / BL-022a (v2 INT IDs).
  *
  * Uses raw SQL with recursive CTEs because Prisma core does not support them
  * natively. All queries are parameterised — no string interpolation.
@@ -11,20 +11,22 @@ import { prisma as defaultPrisma } from '../../lib/prisma.js';
 // ── Types ────────────────────────────────────────────────────────────────────
 
 export interface PastTeamMember {
-  historyId: string;
-  managerId: string | null;
+  historyId: number;
+  managerId: number | null;
   fromDate: Date;
   toDate: Date | null;
-  reason: string;
+  reasonId: number;
   // Employee fields
-  id: string;
+  id: number;
   code: string;
   name: string;
   email: string;
-  role: string;
-  status: string;
-  employmentType: string;
+  roleId: number;
+  status: number;
+  employmentTypeId: number;
+  departmentId: number | null;
   department: string | null;
+  designationId: number | null;
   designation: string | null;
   joinDate: Date;
 }
@@ -34,29 +36,25 @@ export interface PastTeamMember {
 /**
  * Return the IDs of ALL employees who directly or indirectly report to
  * `rootEmployeeId`, via a recursive CTE.
- *
- * Time-complexity: O(N) with the reporting tree; no caching — always fresh.
  */
 export async function getSubordinateIds(
-  rootEmployeeId: string,
+  rootEmployeeId: number,
   tx?: Prisma.TransactionClient,
-): Promise<string[]> {
+): Promise<number[]> {
   const db = tx ?? defaultPrisma;
 
   // MySQL 8 supports recursive CTEs.
-  const rows = await db.$queryRaw<Array<{ id: string }>>`
+  const rows = await db.$queryRaw<Array<{ id: number }>>`
     WITH RECURSIVE subordinates AS (
-      -- Anchor: direct reports of the root employee
       SELECT id
       FROM employees
-      WHERE reportingManagerId = ${rootEmployeeId}
+      WHERE reporting_manager_id = ${rootEmployeeId}
 
       UNION ALL
 
-      -- Recursive: reports of reports
       SELECT e.id
       FROM employees e
-      INNER JOIN subordinates s ON e.reportingManagerId = s.id
+      INNER JOIN subordinates s ON e.reporting_manager_id = s.id
     )
     SELECT id FROM subordinates
   `;
@@ -69,18 +67,13 @@ export async function getSubordinateIds(
 /**
  * Returns true if setting `newManagerId` as the manager for `employeeId`
  * would create a circular reporting chain (BL-005).
- *
- * A cycle exists when `newManagerId` is already a subordinate (direct or
- * indirect) of `employeeId` — i.e. `employeeId` would end up reporting to
- * someone below them in the tree.
  */
 export async function wouldCreateCycle(
-  employeeId: string,
-  newManagerId: string | null,
+  employeeId: number,
+  newManagerId: number | null,
   tx?: Prisma.TransactionClient,
 ): Promise<boolean> {
   if (!newManagerId) return false;
-  // If setting manager to self, that's circular too
   if (newManagerId === employeeId) return true;
 
   const subordinateIds = await getSubordinateIds(employeeId, tx);
@@ -94,10 +87,9 @@ export async function wouldCreateCycle(
  * manager, joined with their employee record.
  *
  * BL-022a: surfaced on GET /employees/{id}/team as the `past` array.
- * "Past" means the row has been closed (toDate IS NOT NULL).
  */
 export async function getPastTeamMembers(
-  managerId: string,
+  managerId: number,
   tx?: Prisma.TransactionClient,
 ): Promise<PastTeamMember[]> {
   const db = tx ?? defaultPrisma;
@@ -105,25 +97,25 @@ export async function getPastTeamMembers(
   const rows = await db.$queryRaw<PastTeamMember[]>`
     SELECT
       rmh.id            AS historyId,
-      rmh.managerId     AS managerId,
-      rmh.fromDate      AS fromDate,
-      rmh.toDate        AS toDate,
-      rmh.reason        AS reason,
+      rmh.manager_id    AS managerId,
+      rmh.from_date     AS fromDate,
+      rmh.to_date       AS toDate,
+      rmh.reason_id     AS reasonId,
       e.id              AS id,
       e.code            AS code,
       e.name            AS name,
       e.email           AS email,
-      e.role            AS role,
+      e.role_id         AS roleId,
       e.status          AS status,
-      e.employmentType  AS employmentType,
-      e.department      AS department,
-      e.designation     AS designation,
-      e.joinDate        AS joinDate
+      e.employment_type_id AS employmentTypeId,
+      e.department_id   AS departmentId,
+      e.designation_id  AS designationId,
+      e.join_date       AS joinDate
     FROM reporting_manager_history rmh
-    INNER JOIN employees e ON e.id = rmh.employeeId
-    WHERE rmh.managerId = ${managerId}
-      AND rmh.toDate IS NOT NULL
-    ORDER BY rmh.toDate DESC
+    INNER JOIN employees e ON e.id = rmh.employee_id
+    WHERE rmh.manager_id = ${managerId}
+      AND rmh.to_date IS NOT NULL
+    ORDER BY rmh.to_date DESC
   `;
 
   return rows;

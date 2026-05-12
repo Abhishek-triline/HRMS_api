@@ -1,5 +1,5 @@
 /**
- * Leave management routes — Phase 2.
+ * Leave management routes — Phase 2 (v2 INT schema).
  *
  * Mounted at /api/v1/leave
  *
@@ -14,8 +14,8 @@
  *   POST   /requests/:id/cancel       — cancel (BL-019 / BL-020)
  *   POST   /balances/adjust           — admin balance adjustment (A-07)
  *   GET    /config/types              — same as /types (sugar for admin config UI)
- *   PATCH  /config/types/:type        — update type config (A-08)
- *   PATCH  /config/quotas/:type       — update quota (A-08)
+ *   PATCH  /config/types/:typeId      — update type config (A-08)
+ *   PATCH  /config/quotas/:typeId     — update quota (A-08)
  */
 
 import { Router } from 'express';
@@ -36,7 +36,6 @@ import {
   AdjustBalanceRequestSchema,
   UpdateLeaveTypeRequestSchema,
   UpdateLeaveQuotaRequestSchema,
-  LeaveTypeSchema,
 } from '@nexora/contracts/leave';
 import {
   computeLeaveDays,
@@ -51,6 +50,16 @@ import { generateLeaveCode } from './leaveCode.js';
 import { getSubordinateIds } from '../employees/hierarchy.js';
 import { logger } from '../../lib/logger.js';
 import { notify } from '../../lib/notifications.js';
+import {
+  RoleId,
+  EmployeeStatus,
+  LeaveStatus,
+  RoutedTo,
+  LedgerReason,
+  CancelledByRole,
+  type RoleIdValue,
+  type AuditActorRoleValue,
+} from '../../lib/statusInt.js';
 
 // ── Router ────────────────────────────────────────────────────────────────────
 
@@ -61,25 +70,25 @@ export const leaveRouter = Router();
 /** Map a raw Prisma LeaveRequest row to the contract shape. */
 function formatRequest(
   req: {
-    id: string;
+    id: number;
     code: string;
-    employeeId: string;
+    employeeId: number;
     employee: { name: string; code: string };
-    leaveType: { name: string };
+    leaveType: { id?: number; name: string };
     fromDate: Date;
     toDate: Date;
     days: number;
     reason: string;
-    status: string;
-    routedTo: string;
-    approverId: string | null;
+    status: number;
+    routedToId: number;
+    approverId: number | null;
     approver?: { name: string } | null;
     decidedAt: Date | null;
-    decidedBy: string | null;
+    decidedBy: number | null;
     decisionNote: string | null;
     escalatedAt: Date | null;
     cancelledAt: Date | null;
-    cancelledBy: string | null;
+    cancelledBy: number | null;
     cancelledAfterStart: boolean;
     deductedDays: number;
     restoredDays: number;
@@ -87,7 +96,8 @@ function formatRequest(
     updatedAt: Date;
     version: number;
   },
-  canceller?: { name: string; role: 'Self' | 'Manager' | 'Admin' } | null,
+  cancelledByRoleId?: number | null,
+  cancelledByName?: string | null,
 ) {
   return {
     id: req.id,
@@ -95,28 +105,24 @@ function formatRequest(
     employeeId: req.employeeId,
     employeeName: req.employee.name,
     employeeCode: req.employee.code,
-    type: req.leaveType.name as ReturnType<typeof LeaveTypeSchema.parse>,
+    leaveTypeId: req.leaveType.id ?? 0,
+    leaveTypeName: req.leaveType.name,
     fromDate: req.fromDate.toISOString().split('T')[0]!,
     toDate: req.toDate.toISOString().split('T')[0]!,
     days: req.days,
     reason: req.reason,
-    status: req.status as
-      | 'Pending'
-      | 'Approved'
-      | 'Rejected'
-      | 'Cancelled'
-      | 'Escalated',
-    routedTo: req.routedTo as 'Manager' | 'Admin',
-    approverId: req.approverId,
+    status: req.status,
+    routedToId: req.routedToId,
+    approverId: req.approverId ?? null,
     approverName: req.approver?.name ?? null,
     decidedAt: req.decidedAt?.toISOString() ?? null,
-    decidedBy: req.decidedBy,
-    decisionNote: req.decisionNote,
+    decidedBy: req.decidedBy ?? null,
+    decisionNote: req.decisionNote ?? null,
     escalatedAt: req.escalatedAt?.toISOString() ?? null,
     cancelledAt: req.cancelledAt?.toISOString() ?? null,
-    cancelledBy: req.cancelledBy,
-    cancelledByName: canceller?.name ?? null,
-    cancelledByRole: canceller?.role ?? null,
+    cancelledBy: req.cancelledBy ?? null,
+    cancelledByName: cancelledByName ?? null,
+    cancelledByRoleId: cancelledByRoleId ?? null,
     cancelledAfterStart: req.cancelledAfterStart,
     deductedDays: req.deductedDays,
     restoredDays: req.restoredDays,
@@ -129,64 +135,51 @@ function formatRequest(
 const requestInclude = {
   employee: { select: { name: true, code: true } },
   approver: { select: { name: true } },
-  leaveType: { select: { name: true } },
+  leaveType: { select: { id: true, name: true } },
 } as const;
 
 /**
- * Look up the canceller's name and compute their role label.
- *
- * Role mapping:
- *   'Self'    — cancelledBy === request.employeeId
- *   'Admin'   — canceller's DB role is 'Admin'
- *   'Manager' — otherwise (manager in the approval chain)
- *
- * Returns null when cancelledBy is null (never cancelled).
- * Uses a direct Prisma query — no Prisma relation added to schema.
+ * Look up the canceller's name and compute their roleId tag.
+ * CancelledByRole: 1=Self, 2=Manager, 3=Admin
  */
 async function resolveCanceller(
-  cancelledBy: string | null,
-  employeeId: string,
-): Promise<{ name: string; role: 'Self' | 'Manager' | 'Admin' } | null> {
+  cancelledBy: number | null,
+  employeeId: number,
+): Promise<{ name: string; cancelledByRoleId: number } | null> {
   if (!cancelledBy) return null;
 
   const canceller = await prisma.employee.findUnique({
     where: { id: cancelledBy },
-    select: { name: true, role: true },
+    select: { name: true, roleId: true },
   });
 
   if (!canceller) return null;
 
-  let roleLabel: 'Self' | 'Manager' | 'Admin';
+  let cancelledByRoleId: number;
   if (cancelledBy === employeeId) {
-    roleLabel = 'Self';
-  } else if (canceller.role === 'Admin') {
-    roleLabel = 'Admin';
+    cancelledByRoleId = CancelledByRole.Self;
+  } else if (canceller.roleId === RoleId.Admin) {
+    cancelledByRoleId = CancelledByRole.Admin;
   } else {
-    roleLabel = 'Manager';
+    cancelledByRoleId = CancelledByRole.Manager;
   }
 
-  return { name: canceller.name, role: roleLabel };
+  return { name: canceller.name, cancelledByRoleId };
 }
 
 /**
  * Check if the calling user can see a specific leave request.
- *
- * Returns true when the user is:
- *   - the owner (employeeId)
- *   - the current approverId
- *   - an Admin
- *   - a Manager whose subordinate tree contains the employee
  */
 async function canSeeRequest(
-  userId: string,
-  userRole: string,
-  request: { employeeId: string; approverId: string | null },
+  userId: number,
+  userRoleId: number,
+  request: { employeeId: number; approverId: number | null },
 ): Promise<boolean> {
-  if (userRole === 'Admin') return true;
+  if (userRoleId === RoleId.Admin) return true;
   if (request.employeeId === userId) return true;
   if (request.approverId === userId) return true;
 
-  if (userRole === 'Manager') {
+  if (userRoleId === RoleId.Manager) {
     const subordinates = await getSubordinateIds(userId);
     return subordinates.includes(request.employeeId);
   }
@@ -197,163 +190,195 @@ async function canSeeRequest(
 // ── GET /leave/types ─────────────────────────────────────────────────────────
 
 leaveRouter.get('/types', requireSession(), async (_req: Request, res: Response): Promise<void> => {
-  const types = await prisma.leaveType.findMany({
-    include: {
-      quotas: { select: { employmentType: true, daysPerYear: true } },
-    },
-    orderBy: { name: 'asc' },
-  });
-
-  res.status(200).json({
-    data: types.map((t) => ({
-      type: t.name,
-      isEventBased: t.isEventBased,
-      requiresAdminApproval: t.requiresAdminApproval,
-      carryForwardCap: t.carryForwardCap,
-      maxDaysPerEvent: t.maxDaysPerEvent,
-      quotas: t.quotas,
-    })),
-  });
-});
-
-// ── GET /leave/config/types (Admin-only mirror for the config UI) ───────────
-// SEC-005-P2: this path was sharing the catalogue with everyone via just
-// requireSession(). The /types endpoint above is the public catalogue;
-// /config/types is for the admin Leave Config screen and gets locked down.
-
-leaveRouter.get('/config/types', requireSession(), requireRole('Admin'), async (_req: Request, res: Response): Promise<void> => {
-  const types = await prisma.leaveType.findMany({
-    include: { quotas: { select: { employmentType: true, daysPerYear: true } } },
-    orderBy: { name: 'asc' },
-  });
-
-  res.status(200).json({
-    data: types.map((t) => ({
-      type: t.name,
-      isEventBased: t.isEventBased,
-      requiresAdminApproval: t.requiresAdminApproval,
-      carryForwardCap: t.carryForwardCap,
-      maxDaysPerEvent: t.maxDaysPerEvent,
-      quotas: t.quotas,
-    })),
-  });
-});
-
-// ── PATCH /leave/config/types/:type (Admin — A-08) ──────────────────────────
-
-leaveRouter.patch(
-  '/config/types/:type',
-  requireSession(),
-  requireRole('Admin'),
-  validateBody(UpdateLeaveTypeRequestSchema),
-  async (req: Request, res: Response): Promise<void> => {
-    const { type } = req.params;
-    const updates = req.body as { carryForwardCap?: number | null; maxDaysPerEvent?: number | null };
-
-    const leaveType = await prisma.leaveType.findUnique({ where: { name: type } });
-    if (!leaveType) {
-      res.status(404).json(errorEnvelope(ErrorCode.NOT_FOUND, `Leave type '${type}' not found.`));
-      return;
-    }
-
-    const before = {
-      carryForwardCap: leaveType.carryForwardCap,
-      maxDaysPerEvent: leaveType.maxDaysPerEvent,
-    };
-
-    const updated = await prisma.leaveType.update({
-      where: { id: leaveType.id },
-      data: {
-        ...(updates.carryForwardCap !== undefined ? { carryForwardCap: updates.carryForwardCap } : {}),
-        ...(updates.maxDaysPerEvent !== undefined ? { maxDaysPerEvent: updates.maxDaysPerEvent } : {}),
+  try {
+    const types = await prisma.leaveType.findMany({
+      include: {
+        quotas: { select: { employmentTypeId: true, daysPerYear: true } },
       },
-    });
-
-    await audit({
-      actorId: req.user!.id,
-      actorRole: req.user!.role,
-      actorIp: req.ip ?? null,
-      action: 'config.leave-type.update',
-      targetType: 'LeaveType',
-      targetId: leaveType.id,
-      module: 'leave',
-      before,
-      after: {
-        carryForwardCap: updated.carryForwardCap,
-        maxDaysPerEvent: updated.maxDaysPerEvent,
-      },
+      orderBy: { name: 'asc' },
     });
 
     res.status(200).json({
-      data: {
-        type: updated.name,
-        carryForwardCap: updated.carryForwardCap,
-        maxDaysPerEvent: updated.maxDaysPerEvent,
-      },
+      data: types.map((t) => ({
+        id: t.id,
+        name: t.name,
+        isEventBased: t.isEventBased,
+        requiresAdminApproval: t.requiresAdminApproval,
+        carryForwardCap: t.carryForwardCap,
+        maxDaysPerEvent: t.maxDaysPerEvent,
+        quotas: t.quotas,
+      })),
     });
+  } catch (err: unknown) {
+    logger.error({ err }, 'leave.types.error');
+    res.status(500).json(errorEnvelope(ErrorCode.INTERNAL_ERROR, 'Failed to fetch leave types.'));
+  }
+});
+
+// ── GET /leave/config/types (Admin-only mirror for the config UI) ───────────
+
+leaveRouter.get(
+  '/config/types',
+  requireSession(),
+  requireRole(RoleId.Admin),
+  async (_req: Request, res: Response): Promise<void> => {
+    try {
+      const types = await prisma.leaveType.findMany({
+        include: { quotas: { select: { employmentTypeId: true, daysPerYear: true } } },
+        orderBy: { name: 'asc' },
+      });
+
+      res.status(200).json({
+        data: types.map((t) => ({
+          id: t.id,
+          name: t.name,
+          isEventBased: t.isEventBased,
+          requiresAdminApproval: t.requiresAdminApproval,
+          carryForwardCap: t.carryForwardCap,
+          maxDaysPerEvent: t.maxDaysPerEvent,
+          quotas: t.quotas,
+        })),
+      });
+    } catch (err: unknown) {
+      logger.error({ err }, 'leave.config.types.error');
+      res.status(500).json(errorEnvelope(ErrorCode.INTERNAL_ERROR, 'Failed to fetch leave config.'));
+    }
   },
 );
 
-// ── PATCH /leave/config/quotas/:type (Admin — A-08) ─────────────────────────
+// ── PATCH /leave/config/types/:typeId (Admin — A-08) ──────────────────────
 
 leaveRouter.patch(
-  '/config/quotas/:type',
+  '/config/types/:typeId',
   requireSession(),
-  requireRole('Admin'),
-  validateBody(UpdateLeaveQuotaRequestSchema),
+  requireRole(RoleId.Admin),
+  validateBody(UpdateLeaveTypeRequestSchema),
   async (req: Request, res: Response): Promise<void> => {
-    const { type } = req.params;
-    const { employmentType, daysPerYear } = req.body as {
-      employmentType: string;
-      daysPerYear: number;
-    };
+    const typeId = Number(req.params['typeId']);
+    const updates = req.body as { carryForwardCap?: number | null; maxDaysPerEvent?: number | null };
 
-    const leaveType = await prisma.leaveType.findUnique({ where: { name: type } });
-    if (!leaveType) {
-      res.status(404).json(errorEnvelope(ErrorCode.NOT_FOUND, `Leave type '${type}' not found.`));
+    if (isNaN(typeId)) {
+      res.status(404).json(errorEnvelope(ErrorCode.NOT_FOUND, 'Leave type not found.'));
       return;
     }
 
-    const existing = await prisma.leaveQuota.findUnique({
-      where: {
-        leaveTypeId_employmentType: {
-          leaveTypeId: leaveType.id,
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          employmentType: employmentType as any,
+    try {
+      const leaveType = await prisma.leaveType.findUnique({ where: { id: typeId } });
+      if (!leaveType) {
+        res.status(404).json(errorEnvelope(ErrorCode.NOT_FOUND, `Leave type ${typeId} not found.`));
+        return;
+      }
+
+      const before = {
+        carryForwardCap: leaveType.carryForwardCap,
+        maxDaysPerEvent: leaveType.maxDaysPerEvent,
+      };
+
+      const updated = await prisma.leaveType.update({
+        where: { id: leaveType.id },
+        data: {
+          ...(updates.carryForwardCap !== undefined ? { carryForwardCap: updates.carryForwardCap } : {}),
+          ...(updates.maxDaysPerEvent !== undefined ? { maxDaysPerEvent: updates.maxDaysPerEvent } : {}),
         },
-      },
-    });
+      });
 
-    const quota = await prisma.leaveQuota.upsert({
-      where: {
-        leaveTypeId_employmentType: {
-          leaveTypeId: leaveType.id,
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          employmentType: employmentType as any,
+      await audit({
+        actorId: req.user!.id,
+        actorRole: req.user!.roleId as AuditActorRoleValue,
+        actorIp: req.ip ?? null,
+        action: 'config.leave-type.update',
+        targetType: 'LeaveRequest',
+        targetId: leaveType.id,
+        module: 'leave',
+        before,
+        after: {
+          carryForwardCap: updated.carryForwardCap,
+          maxDaysPerEvent: updated.maxDaysPerEvent,
         },
-      },
-      create: {
-        leaveTypeId: leaveType.id,
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        employmentType: employmentType as any,
-        daysPerYear,
-      },
-      update: { daysPerYear },
-    });
+      });
 
-    await audit({
-      actorId: req.user!.id,
-      actorRole: req.user!.role,
-      actorIp: req.ip ?? null,
-      action: 'config.leave-quota.update',
-      targetType: 'LeaveQuota',
-      targetId: quota.id,
-      module: 'leave',
-      before: existing ? { daysPerYear: existing.daysPerYear } : null,
-      after: { daysPerYear },
-    });
+      res.status(200).json({
+        data: {
+          id: updated.id,
+          name: updated.name,
+          carryForwardCap: updated.carryForwardCap,
+          maxDaysPerEvent: updated.maxDaysPerEvent,
+        },
+      });
+    } catch (err: unknown) {
+      logger.error({ err }, 'leave.config.types.update.error');
+      res.status(500).json(errorEnvelope(ErrorCode.INTERNAL_ERROR, 'Failed to update leave type.'));
+    }
+  },
+);
 
-    res.status(200).json({ data: { leaveType: type, employmentType, daysPerYear } });
+// ── PATCH /leave/config/quotas/:typeId (Admin — A-08) ─────────────────────
+
+leaveRouter.patch(
+  '/config/quotas/:typeId',
+  requireSession(),
+  requireRole(RoleId.Admin),
+  validateBody(UpdateLeaveQuotaRequestSchema),
+  async (req: Request, res: Response): Promise<void> => {
+    const typeId = Number(req.params['typeId']);
+    const { employmentTypeId, daysPerYear } = req.body as {
+      employmentTypeId: number;
+      daysPerYear: number;
+    };
+
+    if (isNaN(typeId)) {
+      res.status(404).json(errorEnvelope(ErrorCode.NOT_FOUND, 'Leave type not found.'));
+      return;
+    }
+
+    try {
+      const leaveType = await prisma.leaveType.findUnique({ where: { id: typeId } });
+      if (!leaveType) {
+        res.status(404).json(errorEnvelope(ErrorCode.NOT_FOUND, `Leave type ${typeId} not found.`));
+        return;
+      }
+
+      const existing = await prisma.leaveQuota.findUnique({
+        where: {
+          leaveTypeId_employmentTypeId: {
+            leaveTypeId: leaveType.id,
+            employmentTypeId,
+          },
+        },
+      });
+
+      const quota = await prisma.leaveQuota.upsert({
+        where: {
+          leaveTypeId_employmentTypeId: {
+            leaveTypeId: leaveType.id,
+            employmentTypeId,
+          },
+        },
+        create: {
+          leaveTypeId: leaveType.id,
+          employmentTypeId,
+          daysPerYear,
+        },
+        update: { daysPerYear },
+      });
+
+      await audit({
+        actorId: req.user!.id,
+        actorRole: req.user!.roleId as AuditActorRoleValue,
+        actorIp: req.ip ?? null,
+        action: 'config.leave-quota.update',
+        targetType: 'LeaveRequest',
+        targetId: quota.id,
+        module: 'leave',
+        before: existing ? { daysPerYear: existing.daysPerYear } : null,
+        after: { daysPerYear },
+      });
+
+      res.status(200).json({ data: { leaveTypeId: typeId, employmentTypeId, daysPerYear } });
+    } catch (err: unknown) {
+      logger.error({ err }, 'leave.config.quotas.update.error');
+      res.status(500).json(errorEnvelope(ErrorCode.INTERNAL_ERROR, 'Failed to update leave quota.'));
+    }
   },
 );
 
@@ -363,98 +388,93 @@ leaveRouter.get(
   '/balances/:employeeId',
   requireSession(),
   async (req: Request, res: Response): Promise<void> => {
-    const employeeId = req.params['employeeId'] as string;
+    const employeeId = Number(req.params['employeeId']);
     const user = req.user!;
 
-    // Access control: SELF, or Manager-of-team, or Admin
-    if (user.role !== 'Admin') {
-      if (user.id !== employeeId) {
-        if (user.role === 'Manager') {
-          const subs = await getSubordinateIds(user.id);
-          if (!subs.includes(employeeId)) {
-            res
-              .status(404)
-              .json(
-                errorEnvelope(ErrorCode.NOT_FOUND, 'Employee not found or outside your scope.'),
-              );
-            return;
-          }
-        } else {
-          res
-            .status(403)
-            .json(errorEnvelope(ErrorCode.FORBIDDEN, 'You are not authorised for this action.'));
-          return;
-        }
-      }
-    }
-
-    const employee = await prisma.employee.findUnique({
-      where: { id: employeeId },
-      select: { id: true, employmentType: true },
-    });
-
-    if (!employee) {
+    if (isNaN(employeeId)) {
       res.status(404).json(errorEnvelope(ErrorCode.NOT_FOUND, 'Employee not found.'));
       return;
     }
 
-    const year = new Date().getFullYear();
-    const leaveTypes = await prisma.leaveType.findMany({
-      include: { quotas: true },
-    });
+    try {
+      // Access control: SELF, or Manager-of-team, or Admin
+      if (user.roleId !== RoleId.Admin) {
+        if (user.id !== employeeId) {
+          if (user.roleId === RoleId.Manager) {
+            const subs = await getSubordinateIds(user.id);
+            if (!subs.includes(employeeId)) {
+              res.status(404).json(
+                errorEnvelope(ErrorCode.NOT_FOUND, 'Employee not found or outside your scope.'),
+              );
+              return;
+            }
+          } else {
+            res.status(403).json(errorEnvelope(ErrorCode.FORBIDDEN, 'You are not authorised for this action.'));
+            return;
+          }
+        }
+      }
 
-    const balances = await Promise.all(
-      leaveTypes.map(async (lt) => {
-        if (lt.isEventBased) {
-          // Event-based: show daysUsed (no remaining concept per standard balance)
-          await prisma.leaveBalance.findUnique({
+      const employee = await prisma.employee.findUnique({
+        where: { id: employeeId },
+        select: { id: true, employmentTypeId: true },
+      });
+
+      if (!employee) {
+        res.status(404).json(errorEnvelope(ErrorCode.NOT_FOUND, 'Employee not found.'));
+        return;
+      }
+
+      const year = new Date().getFullYear();
+      const leaveTypes = await prisma.leaveType.findMany({
+        include: { quotas: true },
+      });
+
+      const balances = await Promise.all(
+        leaveTypes.map(async (lt) => {
+          if (lt.isEventBased) {
+            return {
+              leaveTypeId: lt.id,
+              remaining: null as number | null,
+              total: null as number | null,
+              carryForwardCap: null as number | null,
+              eligible: true,
+            };
+          }
+
+          const quota = lt.quotas.find((q) => q.employmentTypeId === employee.employmentTypeId);
+          const total = quota?.daysPerYear ?? null;
+
+          const balRow = await prisma.leaveBalance.upsert({
             where: {
               employeeId_leaveTypeId_year: { employeeId: employee.id, leaveTypeId: lt.id, year },
             },
+            create: {
+              employeeId: employee.id,
+              leaveTypeId: lt.id,
+              year,
+              daysRemaining: total ?? 0,
+              daysUsed: 0,
+              version: 0,
+            },
+            update: {},
           });
+
           return {
-            type: lt.name,
-            remaining: null as number | null,
-            total: null as number | null,
-            carryForwardCap: null as number | null,
-            eligible: true, // Phase 2 stub — eligibility logic (gender etc.) is out of scope for v1
-            // TODO: BUG-CFG-002 — enforce maxDaysPerEvent from leave_types table when
-            // eligibility checks land. PUT /config/leave now keeps maxDaysPerEvent in
-            // sync for Maternity and Paternity rows, so the correct value will be
-            // available here without further migration when that enforcement is added.
-          };
-        }
-
-        const quota = lt.quotas.find((q) => q.employmentType === employee.employmentType);
-        const total = quota?.daysPerYear ?? null;
-
-        // Get or create balance row
-        const balRow = await prisma.leaveBalance.upsert({
-          where: {
-            employeeId_leaveTypeId_year: { employeeId: employee.id, leaveTypeId: lt.id, year },
-          },
-          create: {
-            employeeId: employee.id,
             leaveTypeId: lt.id,
-            year,
-            daysRemaining: total ?? 0,
-            daysUsed: 0,
-            version: 0,
-          },
-          update: {},
-        });
+            remaining: balRow.daysRemaining,
+            total,
+            carryForwardCap: lt.carryForwardCap,
+            eligible: null as boolean | null,
+          };
+        }),
+      );
 
-        return {
-          type: lt.name,
-          remaining: balRow.daysRemaining,
-          total,
-          carryForwardCap: lt.carryForwardCap,
-          eligible: null as boolean | null,
-        };
-      }),
-    );
-
-    res.status(200).json({ data: { employeeId, year, balances } });
+      res.status(200).json({ data: { employeeId, year, balances } });
+    } catch (err: unknown) {
+      logger.error({ err }, 'leave.balances.error');
+      res.status(500).json(errorEnvelope(ErrorCode.INTERNAL_ERROR, 'Failed to fetch leave balances.'));
+    }
   },
 );
 
@@ -463,117 +483,111 @@ leaveRouter.get(
 leaveRouter.post(
   '/balances/adjust',
   requireSession(),
-  requireRole('Admin'),
+  requireRole(RoleId.Admin),
   validateBody(AdjustBalanceRequestSchema),
   async (req: Request, res: Response): Promise<void> => {
-    const { employeeId, type, delta, reason } = req.body as {
-      employeeId: string;
-      type: string;
+    const { employeeId, leaveTypeId, delta, reason } = req.body as {
+      employeeId: number;
+      leaveTypeId: number;
       delta: number;
       reason: string;
     };
 
-    const employee = await prisma.employee.findUnique({ where: { id: employeeId } });
-    if (!employee) {
-      res.status(404).json(errorEnvelope(ErrorCode.NOT_FOUND, 'Employee not found.'));
-      return;
-    }
+    try {
+      const employee = await prisma.employee.findUnique({ where: { id: employeeId } });
+      if (!employee) {
+        res.status(404).json(errorEnvelope(ErrorCode.NOT_FOUND, 'Employee not found.'));
+        return;
+      }
 
-    const leaveType = await prisma.leaveType.findUnique({ where: { name: type } });
-    if (!leaveType) {
-      res.status(404).json(errorEnvelope(ErrorCode.NOT_FOUND, `Leave type '${type}' not found.`));
-      return;
-    }
+      const leaveType = await prisma.leaveType.findUnique({ where: { id: leaveTypeId } });
+      if (!leaveType) {
+        res.status(404).json(errorEnvelope(ErrorCode.NOT_FOUND, `Leave type ${leaveTypeId} not found.`));
+        return;
+      }
 
-    const year = new Date().getFullYear();
+      const year = new Date().getFullYear();
 
-    const result = await prisma.$transaction(async (tx) => {
-      const before = await tx.leaveBalance.findUnique({
+      const result = await prisma.$transaction(async (tx) => {
+        const before = await tx.leaveBalance.findUnique({
+          where: {
+            employeeId_leaveTypeId_year: { employeeId, leaveTypeId, year },
+          },
+        });
+
+        const currentRemaining = before?.daysRemaining ?? 0;
+        const target = Math.max(0, currentRemaining + delta);
+
+        const balRow = await tx.leaveBalance.upsert({
+          where: {
+            employeeId_leaveTypeId_year: { employeeId, leaveTypeId, year },
+          },
+          create: {
+            employeeId,
+            leaveTypeId,
+            year,
+            daysRemaining: target,
+            daysUsed: 0,
+            version: 0,
+          },
+          update: {
+            daysRemaining: target,
+            version: { increment: 1 },
+          },
+        });
+
+        await tx.leaveBalanceLedger.create({
+          data: {
+            employeeId,
+            leaveTypeId,
+            year,
+            delta,
+            reasonId: LedgerReason.Adjustment,
+            relatedRequestId: null,
+            createdBy: req.user!.id,
+          },
+        });
+
+        await audit({
+          tx,
+          actorId: req.user!.id,
+          actorRole: req.user!.roleId as AuditActorRoleValue,
+          actorIp: req.ip ?? null,
+          action: 'leave.balance.adjust',
+          targetType: 'LeaveRequest',
+          targetId: balRow.id,
+          module: 'leave',
+          before: before ? { daysRemaining: before.daysRemaining } : null,
+          after: { daysRemaining: balRow.daysRemaining, delta, reason },
+        });
+
+        return balRow;
+      });
+
+      const quota = await prisma.leaveQuota.findUnique({
         where: {
-          employeeId_leaveTypeId_year: { employeeId, leaveTypeId: leaveType.id, year },
+          leaveTypeId_employmentTypeId: {
+            leaveTypeId,
+            employmentTypeId: employee.employmentTypeId,
+          },
         },
       });
 
-      // SEC-003-P2: clamp the post-adjustment balance at 0. We pre-fetch
-      // the existing remainder so we can compute the correct floor without
-      // racing the increment.
-      const existing = await tx.leaveBalance.findUnique({
-        where: {
-          employeeId_leaveTypeId_year: { employeeId, leaveTypeId: leaveType.id, year },
-        },
-        select: { daysRemaining: true },
-      });
-      const currentRemaining = existing?.daysRemaining ?? 0;
-      const target = Math.max(0, currentRemaining + delta);
-
-      const balRow = await tx.leaveBalance.upsert({
-        where: {
-          employeeId_leaveTypeId_year: { employeeId, leaveTypeId: leaveType.id, year },
-        },
-        create: {
-          employeeId,
-          leaveTypeId: leaveType.id,
-          year,
-          daysRemaining: target,
-          daysUsed: 0,
-          version: 0,
-        },
-        update: {
-          daysRemaining: target,
-          version: { increment: 1 },
-        },
-      });
-
-      // Ledger entry
-      await tx.leaveBalanceLedger.create({
+      res.status(200).json({
         data: {
-          employeeId,
-          leaveTypeId: leaveType.id,
-          year,
-          delta,
-          reason: 'Adjustment',
-          relatedRequestId: null,
-          createdBy: req.user!.id,
+          balance: {
+            leaveTypeId,
+            remaining: result.daysRemaining,
+            total: quota?.daysPerYear ?? null,
+            carryForwardCap: leaveType.carryForwardCap,
+            eligible: null,
+          },
         },
       });
-
-      await audit({
-        tx,
-        actorId: req.user!.id,
-        actorRole: req.user!.role,
-        actorIp: req.ip ?? null,
-        action: 'leave.balance.adjust',
-        targetType: 'LeaveBalance',
-        targetId: balRow.id,
-        module: 'leave',
-        before: before ? { daysRemaining: before.daysRemaining } : null,
-        after: { daysRemaining: balRow.daysRemaining, delta, reason },
-      });
-
-      return balRow;
-    });
-
-    // Find quota for total
-    const quota = await prisma.leaveQuota.findUnique({
-      where: {
-        leaveTypeId_employmentType: {
-          leaveTypeId: leaveType.id,
-          employmentType: employee.employmentType,
-        },
-      },
-    });
-
-    res.status(200).json({
-      data: {
-        balance: {
-          type,
-          remaining: result.daysRemaining,
-          total: quota?.daysPerYear ?? null,
-          carryForwardCap: leaveType.carryForwardCap,
-          eligible: null,
-        },
-      },
-    });
+    } catch (err: unknown) {
+      logger.error({ err }, 'leave.balance.adjust.error');
+      res.status(500).json(errorEnvelope(ErrorCode.INTERNAL_ERROR, 'Failed to adjust leave balance.'));
+    }
   },
 );
 
@@ -585,8 +599,8 @@ leaveRouter.post(
   validateBody(CreateLeaveRequestSchema),
   async (req: Request, res: Response): Promise<void> => {
     const user = req.user!;
-    const { type, fromDate: fromDateStr, toDate: toDateStr, reason } = req.body as {
-      type: string;
+    const { leaveTypeId, fromDate: fromDateStr, toDate: toDateStr, reason } = req.body as {
+      leaveTypeId: number;
       fromDate: string;
       toDate: string;
       reason: string;
@@ -595,7 +609,6 @@ leaveRouter.post(
     const fromDate = new Date(fromDateStr + 'T00:00:00.000Z');
     const toDate = new Date(toDateStr + 'T00:00:00.000Z');
 
-    // Validate dates
     if (fromDate > toDate) {
       res.status(400).json(
         errorEnvelope(ErrorCode.INVALID_DATE_RANGE, 'fromDate must be on or before toDate.'),
@@ -612,10 +625,9 @@ leaveRouter.post(
     let result;
     try {
       result = await prisma.$transaction(async (tx) => {
-        // Load the leave type
-        const leaveType = await tx.leaveType.findUnique({ where: { name: type } });
+        const leaveType = await tx.leaveType.findUnique({ where: { id: leaveTypeId } });
         if (!leaveType) {
-          const e: TxError = new Error(`Leave type '${type}' not found.`);
+          const e: TxError = new Error(`Leave type ${leaveTypeId} not found.`);
           e.statusCode = 404;
           e.code = ErrorCode.NOT_FOUND;
           throw e;
@@ -641,41 +653,31 @@ leaveRouter.post(
           throw e;
         }
 
-        // BL-010: check overlap with regularisation (Phase 2 stub — always null).
-        // SEC-004-P2: when Phase 3 wires this in, we MUST emit `details`
-        // matching LeaveConflictDetailsSchema (DN-19 — never a generic error).
-        // The shape below assumes the regularisation row exposes at least
-        // { id, date, status, code? } — Phase 3 must align its return type.
+        // BL-010: check overlap with regularisation
         const regConflict = await findOverlappingRegularisation(user.id, fromDate, toDate, tx);
         if (regConflict) {
-          const r = regConflict as {
-            id: string;
-            code?: string | null;
-            date: Date;
-            status: string;
-          };
-          const conflictDate = r.date.toISOString().split('T')[0]!;
+          const conflictDate = regConflict.date.toISOString().split('T')[0]!;
           const e: TxError = new Error('Leave dates conflict with an approved regularisation.');
           e.statusCode = 409;
           e.code = ErrorCode.LEAVE_REG_CONFLICT;
           e.ruleId = 'BL-010';
           e.details = {
             conflictType: 'Regularisation',
-            conflictId: r.id,
-            conflictCode: r.code ?? '',
+            conflictId: regConflict.id,
+            conflictCode: regConflict.code ?? '',
             conflictFrom: conflictDate,
             conflictTo: null,
-            conflictStatus: r.status,
+            conflictStatus: regConflict.status,
           };
           throw e;
         }
 
         // BL-014: balance check for accrual types
-        if (!leaveType.isEventBased && type !== 'Unpaid') {
+        if (!leaveType.isEventBased && leaveTypeId !== 4 /* Unpaid */) {
           const bal = await currentBalance(user.id, leaveType.id, year, tx);
           if (bal.remaining < days) {
             const e: TxError = new Error(
-              `Insufficient ${type} leave balance. Requested: ${days}, Available: ${bal.remaining}`,
+              `Insufficient leave balance. Requested: ${days}, Available: ${bal.remaining}`,
             );
             e.statusCode = 409;
             e.code = ErrorCode.INSUFFICIENT_BALANCE;
@@ -686,12 +688,11 @@ leaveRouter.post(
         }
 
         // Resolve routing (BL-015 / BL-016 / BL-017 / BL-022)
-        const routing = await resolveRouting(user.id, type, tx);
+        const routing = await resolveRouting(user.id, leaveTypeId, tx);
 
         // Generate L-YYYY-NNNN code
         const code = await generateLeaveCode(year, tx);
 
-        // Insert the request
         const created = await tx.leaveRequest.create({
           data: {
             code,
@@ -701,8 +702,8 @@ leaveRouter.post(
             toDate,
             days,
             reason,
-            status: 'Pending',
-            routedTo: routing.routedTo,
+            status: LeaveStatus.Pending,
+            routedToId: routing.routedToId,
             approverId: routing.approverId,
             deductedDays: 0,
             restoredDays: 0,
@@ -714,7 +715,7 @@ leaveRouter.post(
         await audit({
           tx,
           actorId: user.id,
-          actorRole: user.role,
+          actorRole: user.roleId as AuditActorRoleValue,
           actorIp: req.ip ?? null,
           action: 'leave.create',
           targetType: 'LeaveRequest',
@@ -723,37 +724,35 @@ leaveRouter.post(
           before: null,
           after: {
             code: created.code,
-            type,
+            leaveTypeId,
             fromDate: fromDateStr,
             toDate: toDateStr,
             days,
-            status: 'Pending',
-            routedTo: routing.routedTo,
+            status: LeaveStatus.Pending,
+            routedToId: routing.routedToId,
             approverId: routing.approverId,
           },
         });
 
-        // Notify the approver(s). For Manager routing this is the assigned
-        // reporting manager. For Admin routing (Maternity/Paternity, no
-        // manager, or manager Exited) HR = Admin and the queue is open to all
-        // admins (see /requests handler), so fan out to every active Admin —
-        // mirroring the escalation-sweep behaviour (leave.service.ts:602-608).
-        let recipientIds: string | string[] = routing.approverId;
-        if (routing.routedTo === 'Admin') {
+        // Notify the approver(s)
+        let recipientIds: number | number[] = routing.approverId ?? 0;
+        if (routing.routedToId === RoutedTo.Admin || !routing.approverId) {
           const activeAdmins = await tx.employee.findMany({
-            where: { role: 'Admin', status: 'Active' },
+            where: { roleId: RoleId.Admin, status: EmployeeStatus.Active },
             select: { id: true },
           });
           recipientIds = activeAdmins.map((a) => a.id);
         }
-        await notify({
-          tx,
-          recipientIds,
-          category: 'Leave',
-          title: `New leave request from ${created.employee.name}`,
-          body: `${type} leave for ${days} day(s) (${fromDateStr} to ${toDateStr}) is pending your approval.`,
-          link: `/${routing.routedTo === 'Manager' ? 'manager' : 'admin'}/leave-queue/${created.id}`,
-        });
+        if (Array.isArray(recipientIds) ? recipientIds.length > 0 : recipientIds > 0) {
+          await notify({
+            tx,
+            recipientIds,
+            category: 'Leave',
+            title: `New leave request from ${created.employee.name}`,
+            body: `${leaveType.name} leave for ${days} day(s) (${fromDateStr} to ${toDateStr}) is pending your approval.`,
+            link: `/${routing.routedToId === RoutedTo.Manager ? 'manager' : 'admin'}/leave-queue/${created.id}`,
+          });
+        }
 
         return created;
       });
@@ -765,28 +764,23 @@ leaveRouter.post(
           .json(errorEnvelope(txErr.code, txErr.message, { details: txErr.details, ruleId: txErr.ruleId }));
         return;
       }
-      throw err; // re-throw unexpected errors to the global error handler
+      logger.error({ err }, 'leave.create.error');
+      res.status(500).json(errorEnvelope(ErrorCode.INTERNAL_ERROR, 'Failed to create leave request.'));
+      return;
     }
 
-    // Get balance snapshot for the response (balance NOT yet deducted — deduction on approval)
-    const leaveType = await prisma.leaveType.findUnique({ where: { name: type } });
+    // Balance snapshot for the response
+    const leaveType = await prisma.leaveType.findUnique({ where: { id: leaveTypeId } });
     let balanceAfterSubmit = null;
 
-    if (leaveType && !leaveType.isEventBased && type !== 'Unpaid') {
+    if (leaveType && !leaveType.isEventBased && leaveTypeId !== 4) {
       const snapshot = await currentBalance(user.id, leaveType.id, year, prisma);
-      const quota = await prisma.leaveQuota.findFirst({
-        where: {
-          leaveTypeId: leaveType.id,
-          employmentType: (
-            await prisma.employee.findUnique({
-              where: { id: user.id },
-              select: { employmentType: true },
-            })
-          )?.employmentType,
-        },
-      });
+      const emp = await prisma.employee.findUnique({ where: { id: user.id }, select: { employmentTypeId: true } });
+      const quota = emp ? await prisma.leaveQuota.findFirst({
+        where: { leaveTypeId: leaveType.id, employmentTypeId: emp.employmentTypeId },
+      }) : null;
       balanceAfterSubmit = {
-        type,
+        leaveTypeId,
         remaining: snapshot.remaining,
         total: quota?.daysPerYear ?? null,
         carryForwardCap: leaveType.carryForwardCap,
@@ -794,7 +788,6 @@ leaveRouter.post(
       };
     }
 
-    // result is guaranteed to be set here — catch block either returns or re-throws
     res.status(201).json({
       data: {
         leaveRequest: formatRequest(result!),
@@ -813,12 +806,12 @@ leaveRouter.get(
   async (req: Request, res: Response): Promise<void> => {
     const user = req.user!;
     const query = req.query as {
-      status?: string;
-      type?: string;
+      status?: number;
+      leaveTypeId?: number;
       fromDate?: string;
       toDate?: string;
-      employeeId?: string;
-      routedTo?: string;
+      employeeId?: number;
+      routedToId?: number;
       cursor?: string;
       limit?: string;
       sort?: string;
@@ -827,75 +820,67 @@ leaveRouter.get(
     const limit = Number(query.limit ?? 20);
     const cursor = query.cursor as string | undefined;
 
-    // Build where clause based on role
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const where: Record<string, any> = {};
 
-    if (user.role === 'Employee') {
-      // Employee: only own requests
-      where['employeeId'] = user.id;
-    } else if (user.role === 'Manager') {
-      // Manager: own requests + subordinates' requests where they are the approver
-      if (query.employeeId) {
-        const subs = await getSubordinateIds(user.id);
-        if (subs.includes(query.employeeId) || query.employeeId === user.id) {
-          where['employeeId'] = query.employeeId;
+    try {
+      if (user.roleId === RoleId.Employee) {
+        where['employeeId'] = user.id;
+      } else if (user.roleId === RoleId.Manager) {
+        if (query.employeeId) {
+          const subs = await getSubordinateIds(user.id);
+          const empId = Number(query.employeeId);
+          if (subs.includes(empId) || empId === user.id) {
+            where['employeeId'] = empId;
+          } else {
+            res.status(200).json({ data: [], nextCursor: null });
+            return;
+          }
         } else {
-          // No access to that employee
-          res.status(200).json({ data: [], nextCursor: null });
-          return;
+          const subs = await getSubordinateIds(user.id);
+          where['OR'] = [
+            { employeeId: user.id },
+            { employeeId: { in: subs }, approverId: user.id },
+          ];
         }
-      } else {
-        // Own requests + requests assigned to them as approver in their subordinate tree
-        const subs = await getSubordinateIds(user.id);
-        where['OR'] = [
-          { employeeId: user.id },
-          {
-            employeeId: { in: subs },
-            approverId: user.id,
-          },
-        ];
+      } else if (user.roleId === RoleId.Admin) {
+        if (query.employeeId) where['employeeId'] = Number(query.employeeId);
+        if (query.routedToId) where['routedToId'] = Number(query.routedToId);
+      } else if (user.roleId === RoleId.PayrollOfficer) {
+        where['employeeId'] = user.id;
       }
-    } else if (user.role === 'Admin') {
-      // Admin sees all; apply optional filters
-      if (query.employeeId) where['employeeId'] = query.employeeId;
-      if (query.routedTo) where['routedTo'] = query.routedTo;
-    } else if (user.role === 'PayrollOfficer') {
-      // SEC-001-P2: PayrollOfficer is scoped to own leave only (BL-004 —
-      // every role is also an employee; SRS § 3.5 P-09 lists "My Leave"
-      // and the leave queue is NOT a PO route).
-      where['employeeId'] = user.id;
+
+      if (query.status) where['status'] = Number(query.status);
+      if (query.leaveTypeId) where['leaveTypeId'] = Number(query.leaveTypeId);
+      if (query.fromDate) where['fromDate'] = { gte: new Date(query.fromDate) };
+      if (query.toDate) where['toDate'] = { lte: new Date(query.toDate) };
+
+      if (cursor) {
+        const cursorId = Number(cursor);
+        if (!isNaN(cursorId)) {
+          where['id'] = { gt: cursorId };
+        }
+      }
+
+      const requests = await prisma.leaveRequest.findMany({
+        where,
+        orderBy: { createdAt: 'desc' },
+        take: limit + 1,
+        include: requestInclude,
+      });
+
+      const hasMore = requests.length > limit;
+      const page = hasMore ? requests.slice(0, limit) : requests;
+      const nextCursor = hasMore ? String(page[page.length - 1]?.id ?? '') : null;
+
+      res.status(200).json({
+        data: page.map((r) => formatRequest(r)),
+        nextCursor,
+      });
+    } catch (err: unknown) {
+      logger.error({ err }, 'leave.list.error');
+      res.status(500).json(errorEnvelope(ErrorCode.INTERNAL_ERROR, 'Failed to list leave requests.'));
     }
-
-    // Common filters
-    if (query.status) where['status'] = query.status;
-    if (query.type) {
-      const lt = await prisma.leaveType.findUnique({ where: { name: query.type } });
-      if (lt) where['leaveTypeId'] = lt.id;
-    }
-    if (query.fromDate) where['fromDate'] = { gte: new Date(query.fromDate) };
-    if (query.toDate) where['toDate'] = { lte: new Date(query.toDate) };
-
-    // Cursor pagination
-    if (cursor) {
-      where['id'] = { gt: cursor };
-    }
-
-    const requests = await prisma.leaveRequest.findMany({
-      where,
-      orderBy: { createdAt: 'desc' },
-      take: limit + 1,
-      include: requestInclude,
-    });
-
-    const hasMore = requests.length > limit;
-    const page = hasMore ? requests.slice(0, limit) : requests;
-    const nextCursor = hasMore ? (page[page.length - 1]?.id ?? null) : null;
-
-    res.status(200).json({
-      data: page.map((r) => formatRequest(r)),
-      nextCursor,
-    });
   },
 );
 
@@ -906,27 +891,38 @@ leaveRouter.get(
   requireSession(),
   async (req: Request, res: Response): Promise<void> => {
     const user = req.user!;
-    const id = req.params['id'] as string;
+    const id = Number(req.params['id']);
 
-    const request = await prisma.leaveRequest.findUnique({
-      where: { id },
-      include: requestInclude,
-    });
-
-    if (!request) {
+    if (isNaN(id)) {
       res.status(404).json(errorEnvelope(ErrorCode.NOT_FOUND, 'Leave request not found.'));
       return;
     }
 
-    const visible = await canSeeRequest(user.id, user.role, request);
-    if (!visible) {
-      // Do not leak existence
-      res.status(404).json(errorEnvelope(ErrorCode.NOT_FOUND, 'Leave request not found.'));
-      return;
-    }
+    try {
+      const request = await prisma.leaveRequest.findUnique({
+        where: { id },
+        include: requestInclude,
+      });
 
-    const canceller = await resolveCanceller(request.cancelledBy, request.employeeId);
-    res.status(200).json({ data: formatRequest(request, canceller) });
+      if (!request) {
+        res.status(404).json(errorEnvelope(ErrorCode.NOT_FOUND, 'Leave request not found.'));
+        return;
+      }
+
+      const visible = await canSeeRequest(user.id, user.roleId, request);
+      if (!visible) {
+        res.status(404).json(errorEnvelope(ErrorCode.NOT_FOUND, 'Leave request not found.'));
+        return;
+      }
+
+      const canceller = await resolveCanceller(request.cancelledBy, request.employeeId);
+      res.status(200).json({
+        data: formatRequest(request, canceller?.cancelledByRoleId, canceller?.name),
+      });
+    } catch (err: unknown) {
+      logger.error({ err }, 'leave.getById.error');
+      res.status(500).json(errorEnvelope(ErrorCode.INTERNAL_ERROR, 'Failed to fetch leave request.'));
+    }
   },
 );
 
@@ -938,73 +934,80 @@ leaveRouter.post(
   validateBody(ApproveLeaveRequestSchema),
   async (req: Request, res: Response): Promise<void> => {
     const user = req.user!;
-    const id = req.params['id'] as string;
+    const id = Number(req.params['id']);
     const { note, version } = req.body as { note?: string; version: number };
 
-    const request = await prisma.leaveRequest.findUnique({
-      where: { id },
-      include: { leaveType: true },
-    });
-
-    if (!request) {
+    if (isNaN(id)) {
       res.status(404).json(errorEnvelope(ErrorCode.NOT_FOUND, 'Leave request not found.'));
       return;
     }
 
-    // Access check: (Manager AND approverId == self) OR Admin
-    if (user.role !== 'Admin') {
-      if (user.role !== 'Manager' || request.approverId !== user.id) {
-        res.status(403).json(errorEnvelope(ErrorCode.FORBIDDEN, 'You are not authorised to approve this request.'));
+    try {
+      const request = await prisma.leaveRequest.findUnique({
+        where: { id },
+        include: { leaveType: true },
+      });
+
+      if (!request) {
+        res.status(404).json(errorEnvelope(ErrorCode.NOT_FOUND, 'Leave request not found.'));
         return;
       }
-    }
 
-    // Must be Pending or Escalated
-    if (request.status !== 'Pending' && request.status !== 'Escalated') {
-      res.status(409).json(
-        errorEnvelope(ErrorCode.VALIDATION_FAILED, `Cannot approve a request with status '${request.status}'.`),
-      );
-      return;
-    }
+      // Access check: (Manager AND approverId == self) OR Admin
+      if (user.roleId !== RoleId.Admin) {
+        if (user.roleId !== RoleId.Manager || request.approverId !== user.id) {
+          res.status(403).json(errorEnvelope(ErrorCode.FORBIDDEN, 'You are not authorised to approve this request.'));
+          return;
+        }
+      }
 
-    // Optimistic concurrency
-    if (request.version !== version) {
-      res.status(409).json(
-        errorEnvelope(ErrorCode.VERSION_MISMATCH, 'The request has been modified by another action. Please refresh and retry.'),
-      );
-      return;
-    }
+      if (request.status !== LeaveStatus.Pending && request.status !== LeaveStatus.Escalated) {
+        res.status(409).json(
+          errorEnvelope(ErrorCode.VALIDATION_FAILED, `Cannot approve a request with status ${request.status}.`),
+        );
+        return;
+      }
 
-    const updated = await prisma.$transaction(async (tx) => {
-      const result = await applyApproval(id, user.id, note, tx);
+      if (request.version !== version) {
+        res.status(409).json(
+          errorEnvelope(ErrorCode.VERSION_MISMATCH, 'The request has been modified. Please refresh and retry.'),
+        );
+        return;
+      }
 
-      await audit({
-        tx,
-        actorId: user.id,
-        actorRole: user.role,
-        actorIp: req.ip ?? null,
-        action: 'leave.approve',
-        targetType: 'LeaveRequest',
-        targetId: id,
-        module: 'leave',
-        before: { status: request.status, version: request.version },
-        after: { status: 'Approved', deductedDays: result.deductedDays },
+      const updated = await prisma.$transaction(async (tx) => {
+        const result = await applyApproval(id, user.id, note, tx);
+
+        await audit({
+          tx,
+          actorId: user.id,
+          actorRole: user.roleId as AuditActorRoleValue,
+          actorIp: req.ip ?? null,
+          action: 'leave.approve',
+          targetType: 'LeaveRequest',
+          targetId: id,
+          module: 'leave',
+          before: { status: request.status, version: request.version },
+          after: { status: LeaveStatus.Approved, deductedDays: result.deductedDays },
+        });
+
+        await notify({
+          tx,
+          recipientIds: result.employeeId,
+          category: 'Leave',
+          title: 'Your leave request was approved',
+          body: `${result.leaveType.name} leave for ${result.days} day(s) (${result.fromDate.toISOString().split('T')[0]} to ${result.toDate.toISOString().split('T')[0]}) was approved.`,
+          link: `/employee/leave/${id}`,
+        });
+
+        return result;
       });
 
-      // Notify the employee that their leave was approved
-      await notify({
-        tx,
-        recipientIds: result.employeeId,
-        category: 'Leave',
-        title: 'Your leave request was approved',
-        body: `${result.leaveType.name} leave for ${result.days} day(s) (${result.fromDate.toISOString().split('T')[0]} to ${result.toDate.toISOString().split('T')[0]}) was approved by ${user.role === 'Admin' ? 'Admin' : result.approver?.name ?? 'your manager'}.`,
-        link: `/employee/leave/${id}`,
-      });
-
-      return result;
-    });
-
-    res.status(200).json({ data: formatRequest(updated) });
+      res.status(200).json({ data: formatRequest(updated) });
+    } catch (err: unknown) {
+      logger.error({ err }, 'leave.approve.error');
+      res.status(500).json(errorEnvelope(ErrorCode.INTERNAL_ERROR, 'Failed to approve leave request.'));
+    }
   },
 );
 
@@ -1016,81 +1019,89 @@ leaveRouter.post(
   validateBody(RejectLeaveRequestSchema),
   async (req: Request, res: Response): Promise<void> => {
     const user = req.user!;
-    const id = req.params['id'] as string;
+    const id = Number(req.params['id']);
     const { note, version } = req.body as { note: string; version: number };
 
-    const request = await prisma.leaveRequest.findUnique({
-      where: { id },
-      include: requestInclude,
-    });
-
-    if (!request) {
+    if (isNaN(id)) {
       res.status(404).json(errorEnvelope(ErrorCode.NOT_FOUND, 'Leave request not found.'));
       return;
     }
 
-    // Access check: (Manager AND approverId == self) OR Admin
-    if (user.role !== 'Admin') {
-      if (user.role !== 'Manager' || request.approverId !== user.id) {
-        res.status(403).json(errorEnvelope(ErrorCode.FORBIDDEN, 'You are not authorised to reject this request.'));
-        return;
-      }
-    }
-
-    if (request.status !== 'Pending' && request.status !== 'Escalated') {
-      res.status(409).json(
-        errorEnvelope(ErrorCode.VALIDATION_FAILED, `Cannot reject a request with status '${request.status}'.`),
-      );
-      return;
-    }
-
-    if (request.version !== version) {
-      res.status(409).json(
-        errorEnvelope(ErrorCode.VERSION_MISMATCH, 'The request has been modified. Please refresh and retry.'),
-      );
-      return;
-    }
-
-    const updated = await prisma.$transaction(async (tx) => {
-      const result = await tx.leaveRequest.update({
+    try {
+      const request = await prisma.leaveRequest.findUnique({
         where: { id },
-        data: {
-          status: 'Rejected',
-          decidedAt: new Date(),
-          decidedBy: user.id,
-          decisionNote: note,
-          version: { increment: 1 },
-        },
         include: requestInclude,
       });
 
-      await audit({
-        tx,
-        actorId: user.id,
-        actorRole: user.role,
-        actorIp: req.ip ?? null,
-        action: 'leave.reject',
-        targetType: 'LeaveRequest',
-        targetId: id,
-        module: 'leave',
-        before: { status: request.status, version: request.version },
-        after: { status: 'Rejected', decisionNote: note },
+      if (!request) {
+        res.status(404).json(errorEnvelope(ErrorCode.NOT_FOUND, 'Leave request not found.'));
+        return;
+      }
+
+      if (user.roleId !== RoleId.Admin) {
+        if (user.roleId !== RoleId.Manager || request.approverId !== user.id) {
+          res.status(403).json(errorEnvelope(ErrorCode.FORBIDDEN, 'You are not authorised to reject this request.'));
+          return;
+        }
+      }
+
+      if (request.status !== LeaveStatus.Pending && request.status !== LeaveStatus.Escalated) {
+        res.status(409).json(
+          errorEnvelope(ErrorCode.VALIDATION_FAILED, `Cannot reject a request with status ${request.status}.`),
+        );
+        return;
+      }
+
+      if (request.version !== version) {
+        res.status(409).json(
+          errorEnvelope(ErrorCode.VERSION_MISMATCH, 'The request has been modified. Please refresh and retry.'),
+        );
+        return;
+      }
+
+      const updated = await prisma.$transaction(async (tx) => {
+        const result = await tx.leaveRequest.update({
+          where: { id },
+          data: {
+            status: LeaveStatus.Rejected,
+            decidedAt: new Date(),
+            decidedBy: user.id,
+            decisionNote: note,
+            version: { increment: 1 },
+          },
+          include: requestInclude,
+        });
+
+        await audit({
+          tx,
+          actorId: user.id,
+          actorRole: user.roleId as AuditActorRoleValue,
+          actorIp: req.ip ?? null,
+          action: 'leave.reject',
+          targetType: 'LeaveRequest',
+          targetId: id,
+          module: 'leave',
+          before: { status: request.status, version: request.version },
+          after: { status: LeaveStatus.Rejected, decisionNote: note },
+        });
+
+        await notify({
+          tx,
+          recipientIds: result.employeeId,
+          category: 'Leave',
+          title: 'Your leave request was rejected',
+          body: `${result.leaveType.name} leave request (${result.fromDate.toISOString().split('T')[0]} to ${result.toDate.toISOString().split('T')[0]}) was rejected${note ? ` — ${note}` : ''}.`,
+          link: `/employee/leave/${id}`,
+        });
+
+        return result;
       });
 
-      // Notify the employee that their leave was rejected
-      await notify({
-        tx,
-        recipientIds: result.employeeId,
-        category: 'Leave',
-        title: 'Your leave request was rejected',
-        body: `${result.leaveType.name} leave request (${result.fromDate.toISOString().split('T')[0]} to ${result.toDate.toISOString().split('T')[0]}) was rejected${note ? ` — ${note}` : ''}.`,
-        link: `/employee/leave/${id}`,
-      });
-
-      return result;
-    });
-
-    res.status(200).json({ data: formatRequest(updated) });
+      res.status(200).json({ data: formatRequest(updated) });
+    } catch (err: unknown) {
+      logger.error({ err }, 'leave.reject.error');
+      res.status(500).json(errorEnvelope(ErrorCode.INTERNAL_ERROR, 'Failed to reject leave request.'));
+    }
   },
 );
 
@@ -1102,129 +1113,132 @@ leaveRouter.post(
   validateBody(CancelLeaveRequestSchema),
   async (req: Request, res: Response): Promise<void> => {
     const user = req.user!;
-    const id = req.params['id'] as string;
+    const id = Number(req.params['id']);
     const { note, version } = req.body as { note?: string; version: number };
 
-    const request = await prisma.leaveRequest.findUnique({
-      where: { id },
-      include: requestInclude,
-    });
-
-    if (!request) {
+    if (isNaN(id)) {
       res.status(404).json(errorEnvelope(ErrorCode.NOT_FOUND, 'Leave request not found.'));
       return;
     }
 
-    // Visibility check
-    const visible = await canSeeRequest(user.id, user.role, request);
-    if (!visible) {
-      res.status(404).json(errorEnvelope(ErrorCode.NOT_FOUND, 'Leave request not found.'));
-      return;
-    }
-
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
-    const fromDay = new Date(request.fromDate);
-    fromDay.setHours(0, 0, 0, 0);
-
-    // BL-019 cancellation rights:
-    //   - Owner: if Pending OR (Approved AND today < fromDate)
-    //   - Manager-in-chain: any time (as long as they can see it)
-    //   - Admin: always
-    const isOwner = request.employeeId === user.id;
-    const isAdmin = user.role === 'Admin';
-
-    let canCancel = false;
-
-    if (isAdmin) {
-      canCancel = true;
-    } else if (user.role === 'Manager') {
-      const subs = await getSubordinateIds(user.id);
-      if (subs.includes(request.employeeId)) {
-        canCancel = true;
-      }
-    }
-
-    if (!canCancel && isOwner) {
-      if (request.status === 'Pending') {
-        canCancel = true;
-      } else if (request.status === 'Approved' && today < fromDay) {
-        canCancel = true;
-      }
-    }
-
-    if (!canCancel) {
-      res.status(403).json(
-        errorEnvelope(
-          ErrorCode.FORBIDDEN,
-          'You are not authorised to cancel this request, or it cannot be cancelled in its current state.',
-        ),
-      );
-      return;
-    }
-
-    // Optimistic concurrency
-    if (request.version !== version) {
-      res.status(409).json(
-        errorEnvelope(ErrorCode.VERSION_MISMATCH, 'The request has been modified. Please refresh and retry.'),
-      );
-      return;
-    }
-
-    // Can only cancel Pending, Approved, or Escalated requests
-    if (!['Pending', 'Approved', 'Escalated'].includes(request.status)) {
-      res.status(409).json(
-        errorEnvelope(ErrorCode.VALIDATION_FAILED, `Cannot cancel a request with status '${request.status}'.`),
-      );
-      return;
-    }
-
-    const { request: updated, restoredDays } = await prisma.$transaction(async (tx) => {
-      const result = await applyCancellation(id, user.id, today, note, tx);
-
-      await audit({
-        tx,
-        actorId: user.id,
-        actorRole: user.role,
-        actorIp: req.ip ?? null,
-        action: 'leave.cancel',
-        targetType: 'LeaveRequest',
-        targetId: id,
-        module: 'leave',
-        before: {
-          status: request.status,
-          deductedDays: request.deductedDays,
-          version: request.version,
-        },
-        after: {
-          status: 'Cancelled',
-          restoredDays: result.restoredDays,
-          cancelledAfterStart: result.request.cancelledAfterStart,
-        },
+    try {
+      const request = await prisma.leaveRequest.findUnique({
+        where: { id },
+        include: requestInclude,
       });
 
-      // Notify the employee of the cancellation and any restored days
-      const restoredMsg = result.restoredDays > 0
-        ? ` ${result.restoredDays} day(s) restored to your balance.`
-        : '';
-      await notify({
-        tx,
-        recipientIds: result.request.employeeId,
-        category: 'Leave',
-        title: 'Your leave was cancelled',
-        body: `${result.request.leaveType.name} leave (${result.request.fromDate.toISOString().split('T')[0]} to ${result.request.toDate.toISOString().split('T')[0]}) has been cancelled.${restoredMsg}`,
-        link: `/employee/leave/${result.request.id}`,
+      if (!request) {
+        res.status(404).json(errorEnvelope(ErrorCode.NOT_FOUND, 'Leave request not found.'));
+        return;
+      }
+
+      const visible = await canSeeRequest(user.id, user.roleId, request);
+      if (!visible) {
+        res.status(404).json(errorEnvelope(ErrorCode.NOT_FOUND, 'Leave request not found.'));
+        return;
+      }
+
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+      const fromDay = new Date(request.fromDate);
+      fromDay.setHours(0, 0, 0, 0);
+
+      const isOwner = request.employeeId === user.id;
+      const isAdmin = user.roleId === RoleId.Admin;
+
+      let canCancel = false;
+
+      if (isAdmin) {
+        canCancel = true;
+      } else if (user.roleId === RoleId.Manager) {
+        const subs = await getSubordinateIds(user.id);
+        if (subs.includes(request.employeeId)) {
+          canCancel = true;
+        }
+      }
+
+      if (!canCancel && isOwner) {
+        if (request.status === LeaveStatus.Pending) {
+          canCancel = true;
+        } else if (request.status === LeaveStatus.Approved && today < fromDay) {
+          canCancel = true;
+        }
+      }
+
+      if (!canCancel) {
+        res.status(403).json(
+          errorEnvelope(
+            ErrorCode.FORBIDDEN,
+            'You are not authorised to cancel this request, or it cannot be cancelled in its current state.',
+          ),
+        );
+        return;
+      }
+
+      if (request.version !== version) {
+        res.status(409).json(
+          errorEnvelope(ErrorCode.VERSION_MISMATCH, 'The request has been modified. Please refresh and retry.'),
+        );
+        return;
+      }
+
+      const cancellableStatuses: number[] = [LeaveStatus.Pending, LeaveStatus.Approved, LeaveStatus.Escalated];
+      if (!cancellableStatuses.includes(request.status)) {
+        res.status(409).json(
+          errorEnvelope(ErrorCode.VALIDATION_FAILED, `Cannot cancel a request with status ${request.status}.`),
+        );
+        return;
+      }
+
+      const { request: updated, restoredDays } = await prisma.$transaction(async (tx) => {
+        const result = await applyCancellation(id, user.id, today, note, tx);
+
+        await audit({
+          tx,
+          actorId: user.id,
+          actorRole: user.roleId as AuditActorRoleValue,
+          actorIp: req.ip ?? null,
+          action: 'leave.cancel',
+          targetType: 'LeaveRequest',
+          targetId: id,
+          module: 'leave',
+          before: {
+            status: request.status,
+            deductedDays: request.deductedDays,
+            version: request.version,
+          },
+          after: {
+            status: LeaveStatus.Cancelled,
+            restoredDays: result.restoredDays,
+            cancelledAfterStart: result.request.cancelledAfterStart,
+          },
+        });
+
+        const restoredMsg = result.restoredDays > 0
+          ? ` ${result.restoredDays} day(s) restored to your balance.`
+          : '';
+        await notify({
+          tx,
+          recipientIds: result.request.employeeId,
+          category: 'Leave',
+          title: 'Your leave was cancelled',
+          body: `${result.request.leaveType.name} leave (${result.request.fromDate.toISOString().split('T')[0]} to ${result.request.toDate.toISOString().split('T')[0]}) has been cancelled.${restoredMsg}`,
+          link: `/employee/leave/${result.request.id}`,
+        });
+
+        return result;
       });
 
-      return result;
-    });
-
-    const canceller = await resolveCanceller(updated.cancelledBy, updated.employeeId);
-    res.status(200).json({
-      data: {
-        leaveRequest: formatRequest(updated, canceller),
-        restoredDays,
-      },
-    });
+      const canceller = await resolveCanceller(updated.cancelledBy, updated.employeeId);
+      res.status(200).json({
+        data: {
+          leaveRequest: formatRequest(updated, canceller?.cancelledByRoleId, canceller?.name),
+          restoredDays,
+        },
+      });
+    } catch (err: unknown) {
+      logger.error({ err }, 'leave.cancel.error');
+      res.status(500).json(errorEnvelope(ErrorCode.INTERNAL_ERROR, 'Failed to cancel leave request.'));
+    }
   },
 );

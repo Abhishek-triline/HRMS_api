@@ -30,6 +30,7 @@ import type {
   EncashmentConfig,
   Weekday,
 } from '@nexora/contracts/configuration';
+import { LeaveTypeId } from './statusInt.js';
 
 const WEEKDAY_TOKENS: readonly Weekday[] = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
 const WEEKDAY_TOKEN_SET: ReadonlySet<string> = new Set(WEEKDAY_TOKENS);
@@ -164,14 +165,14 @@ export function weekdayTokenFromIndex(dayIndex: number): Weekday {
 
 // ── Leave config ──────────────────────────────────────────────────────────────
 
-/** Defaults (Phase 2 hard-coded constants). */
+/** Defaults (Phase 2 hard-coded constants). INT keys = LeaveTypeId values. */
 const DEFAULT_CARRY_FORWARD_CAPS: CarryForwardCaps = {
-  Annual: 10,
-  Sick: 0,
-  Casual: 5,
-  Unpaid: 0,
-  Maternity: 0,
-  Paternity: 0,
+  [LeaveTypeId.Annual]:    10,  // 1
+  [LeaveTypeId.Sick]:      0,   // 2 — BL-012
+  [LeaveTypeId.Casual]:    5,   // 3
+  [LeaveTypeId.Unpaid]:    0,   // 4
+  [LeaveTypeId.Maternity]: 0,   // 5 — event-based BL-014
+  [LeaveTypeId.Paternity]: 0,   // 6 — event-based BL-014
 };
 
 const LEAVE_DEFAULTS: LeaveConfig = {
@@ -200,17 +201,17 @@ export async function getLeaveConfig(): Promise<LeaveConfig> {
     readConfigKey('LEAVE_PATERNITY_DAYS'),
   ]);
 
-  // carryForwardCaps: merge DB value over defaults
+  // carryForwardCaps: merge DB value over defaults. DB stores INT keys (1-6).
   let carryForwardCaps: CarryForwardCaps = { ...DEFAULT_CARRY_FORWARD_CAPS };
   if (capsVal !== null && typeof capsVal === 'object' && !Array.isArray(capsVal)) {
     const raw = capsVal as Record<string, unknown>;
     carryForwardCaps = {
-      Annual:    typeof raw['Annual']    === 'number' ? raw['Annual']    : DEFAULT_CARRY_FORWARD_CAPS.Annual,
-      Sick:      0, // BL-012 — always 0
-      Casual:    typeof raw['Casual']    === 'number' ? raw['Casual']    : DEFAULT_CARRY_FORWARD_CAPS.Casual,
-      Unpaid:    0,
-      Maternity: 0, // BL-014 — event-based
-      Paternity: 0, // BL-014 — event-based
+      [LeaveTypeId.Annual]:    typeof raw[String(LeaveTypeId.Annual)]    === 'number' ? (raw[String(LeaveTypeId.Annual)] as number) : DEFAULT_CARRY_FORWARD_CAPS[LeaveTypeId.Annual],
+      [LeaveTypeId.Sick]:      0, // BL-012 — always 0
+      [LeaveTypeId.Casual]:    typeof raw[String(LeaveTypeId.Casual)]    === 'number' ? (raw[String(LeaveTypeId.Casual)] as number)    : DEFAULT_CARRY_FORWARD_CAPS[LeaveTypeId.Casual],
+      [LeaveTypeId.Unpaid]:    0,
+      [LeaveTypeId.Maternity]: 0, // BL-014 — event-based
+      [LeaveTypeId.Paternity]: 0, // BL-014 — event-based
     };
   }
 
