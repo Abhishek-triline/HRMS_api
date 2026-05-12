@@ -38,6 +38,11 @@ import { escalateStaleEncashments } from '../modules/leave/leave-encashment.serv
 import { runMidnightGenerate } from '../modules/attendance/attendance.service.js';
 import { audit } from './audit.js';
 import { notify } from './notifications.js';
+import {
+  AuditTargetType,
+  CycleStatus,
+  LeaveEncashmentStatus,
+} from './statusInt.js';
 
 const ENABLE_CRON = process.env['ENABLE_CRON'] !== 'false';
 
@@ -176,7 +181,7 @@ export function startScheduler(): void {
       logger.info({ job: jobId }, 'Starting encashment window-closing check');
       try {
         const count = await prisma.leaveEncashment.count({
-          where: { status: { in: ['Pending', 'ManagerApproved'] } },
+          where: { status: { in: [LeaveEncashmentStatus.Pending, LeaveEncashmentStatus.ManagerApproved] } },
         });
         if (count > 0) {
           logger.warn(
@@ -315,7 +320,7 @@ export function startScheduler(): void {
           // Open cycles whose selfReviewDeadline falls within the window
           const cycles = await prisma.performanceCycle.findMany({
             where: {
-              status: 'Open',
+              status: CycleStatus.Open,
               selfReviewDeadline: { gte: windowStart, lte: windowEnd },
             },
             select: { id: true, code: true },
@@ -344,7 +349,7 @@ export function startScheduler(): void {
               const alreadySent = await prisma.auditLog.findFirst({
                 where: {
                   action: actionKey,
-                  targetType: 'PerformanceReview',
+                  targetTypeId: AuditTargetType.PerformanceReview,
                   targetId: review.id,
                   // The actorId for system nudges is null; match on targetId + action
                   createdAt: { gte: thirtyDaysAgo },

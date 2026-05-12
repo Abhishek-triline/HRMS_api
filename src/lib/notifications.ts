@@ -1,5 +1,5 @@
 /**
- * Notification helper — Phase 6.
+ * Notification helper.
  *
  * BL-043: Notifications are system-generated only. EVERY qualifying business
  *         event calls this helper — there is no public POST endpoint.
@@ -11,32 +11,27 @@
  *         action. Errors are caught, logged, and swallowed. The audit_log
  *         row is the canonical source of truth.
  *
- * Usage (always AFTER the audit() call, inside the same transaction):
- *
- *   await audit({ tx, ...auditParams });   // existing — do NOT touch
- *   await notify({                          // NEW
- *     tx,
- *     recipientIds: [employeeId],
- *     category: 'Leave',
- *     title: 'Your leave request was approved',
- *     body: `${type} leave for ${days} day(s) was approved by ${approverName}.`,
- *     link: `/employee/leave/${id}`,
- *   });
+ * v2: recipient IDs are INT employee ids. Categories are INT codes
+ * (HRMS_Schema_v2_Plan §3.7). For ergonomics this helper accepts the friendly
+ * category name (`'Leave'`, `'Payroll'`, ...) and maps it via the frozen
+ * constants in `./statusInt.ts`.
  */
 
 import type { Prisma } from '@prisma/client';
 import { prisma as defaultPrisma } from './prisma.js';
 import { logger } from './logger.js';
-import type { NotificationCategory } from '@nexora/contracts/notifications';
-
-// ── Types ─────────────────────────────────────────────────────────────────────
+import {
+  NotificationCategory,
+  type NotificationCategoryValue,
+} from './statusInt.js';
 
 export interface NotifyParams {
   /** Pass the current Prisma transaction client to roll back on failure. */
   tx?: Prisma.TransactionClient;
-  /** One or many recipient employee IDs. Fan-out via createMany. */
-  recipientIds: string | string[];
-  category: NotificationCategory;
+  /** One or many recipient employee IDs (INT). Fan-out via createMany. */
+  recipientIds: number | number[];
+  /** Friendly category name OR the INT code. */
+  category: keyof typeof NotificationCategory | NotificationCategoryValue;
   /** ≤ 120 chars — truncated silently if the caller passes more. */
   title: string;
   /** ≤ 600 chars — truncated silently. Plain text only (BL-046). */
@@ -44,36 +39,14 @@ export interface NotifyParams {
   /** Deep link to the originating record, e.g. /employee/leave/L-2026-0001 */
   link?: string | null;
   /** Reference to the audit_log row that produced this notification. */
-  auditLogId?: string | null;
+  auditLogId?: number | null;
 }
 
-// ── Category mapping ──────────────────────────────────────────────────────────
-
-/**
- * Map the contract NotificationCategory (used everywhere in application code)
- * to the DB enum value (NotificationCategoryDb). They are identical in this
- * version but this boundary helper makes future divergence safe.
- */
-function mapCategoryToDB(
-  cat: NotificationCategory,
-): 'Leave' | 'Attendance' | 'Payroll' | 'Performance' | 'Status' | 'Configuration' | 'Auth' | 'System' {
-  const map: Record<
-    NotificationCategory,
-    'Leave' | 'Attendance' | 'Payroll' | 'Performance' | 'Status' | 'Configuration' | 'Auth' | 'System'
-  > = {
-    Leave: 'Leave',
-    Attendance: 'Attendance',
-    Payroll: 'Payroll',
-    Performance: 'Performance',
-    Status: 'Status',
-    Configuration: 'Configuration',
-    Auth: 'Auth',
-    System: 'System',
-  };
-  return map[cat];
+function resolveCategory(
+  v: NotifyParams['category'],
+): NotificationCategoryValue {
+  return typeof v === 'number' ? v : NotificationCategory[v];
 }
-
-// ── Core helper ───────────────────────────────────────────────────────────────
 
 /**
  * Create in-app notifications for one or many recipients.
@@ -94,14 +67,10 @@ export async function notify(params: NotifyParams): Promise<void> {
 
   if (recipients.length === 0) return;
 
-  // Defensive de-duplicate
-  const unique = Array.from(new Set(recipients.filter(Boolean)));
+  const unique = Array.from(new Set(recipients.filter((id): id is number => Number.isInteger(id) && id > 0)));
   if (unique.length === 0) return;
 
   // SEC-001-P6: Defence-in-depth — sanitize link even if caller skips contract validation.
-  // A link that doesn't start with '/' (absolute URL, protocol-relative, javascript:, etc.)
-  // is nulled out and a warning is emitted. Truncate to 191 chars for symmetry with
-  // title/body limits (also covers SEC-008-P6 Info).
   let safeLink: string | null = params.link ?? null;
   if (safeLink !== null) {
     if (!/^\//.test(safeLink)) {
@@ -115,22 +84,22 @@ export async function notify(params: NotifyParams): Promise<void> {
     }
   }
 
+  const categoryId = resolveCategory(params.category);
+
   try {
     await db.notification.createMany({
       data: unique.map((recipientId) => ({
         recipientId,
-        category: mapCategoryToDB(params.category),
+        categoryId,
         title: params.title.slice(0, 120),
         body: params.body.slice(0, 600),
         link: safeLink,
         auditLogId: params.auditLogId ?? null,
       })),
-      // createMany with skipDuplicates is intentionally NOT set — every event
-      // should create its own notification row.
     });
   } catch (err: unknown) {
     // BL-047 / BL-043: notifications are derived data. A write failure here
-    // is logged but NEVER re-thrown. The audit_log row is the source of truth.
+    // is logged but NEVER re-thrown.
     logger.error(
       { err, recipientCount: unique.length, category: params.category },
       'notify.error — notification write failed; business action continues',

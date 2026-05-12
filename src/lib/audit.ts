@@ -2,74 +2,79 @@
  * Audit log helper — BL-047 / BL-048.
  *
  * EVERY state-changing action MUST call `audit(...)`.
- * This helper generates a ULID id client-side for monotonic ordering
- * and writes a single append-only row.
- *
- * If `tx` is provided, the write runs inside the caller's transaction.
- * Otherwise a new top-level write is used.
- *
  * The DB enforces append-only via REVOKE UPDATE, DELETE on audit_log
  * (applied in the migration after table creation — BL-047 enforcement point).
+ *
+ * v2: all IDs are INT auto-increment; module, actor role, and target type
+ * are INT codes (HRMS_Schema_v2_Plan §3.9). For ergonomics this helper
+ * accepts the string keys (`'auth'`, `'Manager'`, `'LeaveRequest'`) and maps
+ * them to INT codes via the frozen constants in `./statusInt.ts`.
+ *
+ * If `tx` is provided, the write runs inside the caller's transaction.
+ * Otherwise a top-level write is used.
  */
 
-import { ulid } from 'ulid';
 import type { Prisma } from '@prisma/client';
 import { prisma } from './prisma.js';
+import {
+  AuditActorRole,
+  AuditModuleId,
+  AuditTargetType,
+  type AuditActorRoleValue,
+  type AuditModuleIdValue,
+  type AuditTargetTypeValue,
+} from './statusInt.js';
 
 export type AuditParams = {
   /** The Prisma transaction client — if supplied, the write joins the caller's tx. */
   tx?: Prisma.TransactionClient;
-  /** actorId — null only for system-generated events (cron jobs, etc.) */
-  actorId: string | null;
-  actorRole: string;
+  /** actorId — null for system-generated events (cron jobs, etc.). INT employee id. */
+  actorId: number | null;
+  /** Friendly role name OR the INT code. Resolved to actor_role_id. */
+  actorRole: keyof typeof AuditActorRole | AuditActorRoleValue;
   actorIp?: string | null;
-  /** Dot-separated action name, e.g. "auth.login.success" */
+  /** Dot-separated action name, e.g. "auth.login.success". */
   action: string;
-  targetType?: string | null;
-  targetId?: string | null;
-  /** Top-level module grouping, e.g. "auth", "leave", "payroll" */
-  module: string;
+  /** Target entity type — friendly name OR the INT code. */
+  targetType?: keyof typeof AuditTargetType | AuditTargetTypeValue | null;
+  /** INT target id of the entity. */
+  targetId?: number | null;
+  /** Module name — must be one of the frozen audit_modules keys. */
+  module: keyof typeof AuditModuleId;
   before?: Record<string, unknown> | null;
   after?: Record<string, unknown> | null;
 };
 
+function resolveActorRole(v: AuditParams['actorRole']): AuditActorRoleValue {
+  return typeof v === 'number' ? v : AuditActorRole[v];
+}
+
+function resolveTargetType(
+  v: AuditParams['targetType'],
+): AuditTargetTypeValue | null {
+  if (v == null) return null;
+  return typeof v === 'number' ? v : AuditTargetType[v];
+}
+
 /**
  * Write a single append-only audit entry.
- * Throws on failure — never silently swallows errors.
- *
- * Both PrismaClient and Prisma.TransactionClient expose `auditLog.create`.
- * We accept either via the shared model surface.
+ * Throws on failure — never silently swallows errors (notify() is the helper
+ * that swallows; audit() is the canonical source of truth).
  */
 export async function audit(params: AuditParams): Promise<void> {
-  const {
-    tx,
-    actorId,
-    actorRole,
-    actorIp,
-    action,
-    targetType,
-    targetId,
-    module: mod,
-    before,
-    after,
-  } = params;
-
-  // Use transaction client if provided; otherwise use the global singleton.
-  // Both share the same model methods — the cast to the shared interface is safe.
-  const db = tx ?? prisma;
+  const db = params.tx ?? prisma;
 
   await db.auditLog.create({
     data: {
-      id: ulid(),
-      actorId,
-      actorRole,
-      actorIp: actorIp ?? null,
-      action,
-      targetType: targetType ?? null,
-      targetId: targetId ?? null,
-      module: mod,
-      before: (before ?? undefined) as Prisma.InputJsonValue | undefined,
-      after: (after ?? undefined) as Prisma.InputJsonValue | undefined,
+      actorId: params.actorId,
+      actorRoleId: resolveActorRole(params.actorRole),
+      actorIp: params.actorIp ?? null,
+      action: params.action,
+      targetTypeId: resolveTargetType(params.targetType),
+      targetId: params.targetId ?? null,
+      moduleId: AuditModuleId[params.module],
+      before: (params.before ?? undefined) as Prisma.InputJsonValue | undefined,
+      after: (params.after ?? undefined) as Prisma.InputJsonValue | undefined,
     },
   });
 }
