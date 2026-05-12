@@ -34,13 +34,13 @@ import { validateBody } from '../../middleware/validateBody.js';
 import { audit } from '../../lib/audit.js';
 import { notify } from '../../lib/notifications.js';
 import { logger } from '../../lib/logger.js';
-import { getAttendanceConfig, getLeaveConfig, bustConfigCache } from '../../lib/config.js';
+import { getAttendanceConfig, getLeaveConfig, getEncashmentConfig, bustConfigCache } from '../../lib/config.js';
 import { errorEnvelope, ErrorCode } from '@nexora/contracts/errors';
 import {
   UpdateAttendanceConfigSchema,
   UpdateLeaveConfigSchema,
 } from '@nexora/contracts/configuration';
-import type { AttendanceConfig, LeaveConfig } from '@nexora/contracts/configuration';
+import type { AttendanceConfig, LeaveConfig, EncashmentConfig } from '@nexora/contracts/configuration';
 
 export const configurationRouter = Router();
 
@@ -474,6 +474,123 @@ configurationRouter.put(
       res.status(200).json({ data: updated });
     } catch (err: unknown) {
       logger.error({ err }, 'config.leave.put: unexpected error');
+      res
+        .status(500)
+        .json(errorEnvelope(ErrorCode.INTERNAL_ERROR, 'An unexpected error occurred.'));
+    }
+  },
+);
+
+// ── GET /config/encashment ────────────────────────────────────────────────────
+
+configurationRouter.get(
+  '/encashment',
+  requireSession(),
+  requireRole('Admin'),
+  async (req: Request, res: Response): Promise<void> => {
+    try {
+      const config = await getEncashmentConfig();
+      res.status(200).json({ data: config });
+    } catch (err: unknown) {
+      logger.error({ err }, 'config.encashment.get: unexpected error');
+      res
+        .status(500)
+        .json(errorEnvelope(ErrorCode.INTERNAL_ERROR, 'An unexpected error occurred.'));
+    }
+  },
+);
+
+// ── PUT /config/encashment ────────────────────────────────────────────────────
+
+configurationRouter.put(
+  '/encashment',
+  requireSession(),
+  requireRole('Admin'),
+  async (req: Request, res: Response): Promise<void> => {
+    try {
+      const actorId = req.user!.id;
+      const actorRole = req.user!.role;
+      const actorIp = resolveIp(req);
+      const body = req.body as Partial<EncashmentConfig>;
+
+      const beforeResolved = await getEncashmentConfig();
+      const changedKeys: Array<{ key: string; before: unknown; after: unknown }> = [];
+
+      await prisma.$transaction(async (tx) => {
+        if (body.windowStartMonth !== undefined) {
+          const { before, after } = await upsertConfigKey(
+            tx, 'ENCASHMENT_WINDOW_START_MONTH', body.windowStartMonth, actorId,
+          );
+          changedKeys.push({ key: 'ENCASHMENT_WINDOW_START_MONTH', before, after });
+          await audit({
+            tx, actorId, actorRole, actorIp,
+            action: 'config.encashment.update', module: 'configuration',
+            targetType: 'Configuration', targetId: 'ENCASHMENT_WINDOW_START_MONTH',
+            before: { value: beforeResolved.windowStartMonth }, after: { value: after },
+          });
+        }
+        if (body.windowEndMonth !== undefined) {
+          const { before, after } = await upsertConfigKey(
+            tx, 'ENCASHMENT_WINDOW_END_MONTH', body.windowEndMonth, actorId,
+          );
+          changedKeys.push({ key: 'ENCASHMENT_WINDOW_END_MONTH', before, after });
+          await audit({
+            tx, actorId, actorRole, actorIp,
+            action: 'config.encashment.update', module: 'configuration',
+            targetType: 'Configuration', targetId: 'ENCASHMENT_WINDOW_END_MONTH',
+            before: { value: beforeResolved.windowEndMonth }, after: { value: after },
+          });
+        }
+        if (body.windowEndDay !== undefined) {
+          const { before, after } = await upsertConfigKey(
+            tx, 'ENCASHMENT_WINDOW_END_DAY', body.windowEndDay, actorId,
+          );
+          changedKeys.push({ key: 'ENCASHMENT_WINDOW_END_DAY', before, after });
+          await audit({
+            tx, actorId, actorRole, actorIp,
+            action: 'config.encashment.update', module: 'configuration',
+            targetType: 'Configuration', targetId: 'ENCASHMENT_WINDOW_END_DAY',
+            before: { value: beforeResolved.windowEndDay }, after: { value: after },
+          });
+        }
+        if (body.maxPercent !== undefined) {
+          const { before, after } = await upsertConfigKey(
+            tx, 'ENCASHMENT_MAX_PERCENT', body.maxPercent, actorId,
+          );
+          changedKeys.push({ key: 'ENCASHMENT_MAX_PERCENT', before, after });
+          await audit({
+            tx, actorId, actorRole, actorIp,
+            action: 'config.encashment.update', module: 'configuration',
+            targetType: 'Configuration', targetId: 'ENCASHMENT_MAX_PERCENT',
+            before: { value: beforeResolved.maxPercent }, after: { value: after },
+          });
+        }
+
+        if (changedKeys.length > 0) {
+          const admins = await tx.employee.findMany({
+            where: { role: 'Admin', status: 'Active' },
+            select: { id: true },
+          });
+          const changeSummary = changedKeys
+            .map((k) => `${k.key}: ${JSON.stringify(k.before)} → ${JSON.stringify(k.after)}`)
+            .join('; ');
+          await notify({
+            tx,
+            recipientIds: admins.map((a) => a.id),
+            category: 'Configuration',
+            title: 'Encashment configuration updated',
+            body: `Encashment config changed by ${req.user!.name}: ${changeSummary}`,
+            link: '/admin/leave-config',
+          });
+        }
+      });
+
+      bustConfigCache();
+      const updated = await getEncashmentConfig();
+      logger.info({ actorId, changedKeys: changedKeys.map((k) => k.key) }, 'config.encashment.update: success');
+      res.status(200).json({ data: updated });
+    } catch (err: unknown) {
+      logger.error({ err }, 'config.encashment.put: unexpected error');
       res
         .status(500)
         .json(errorEnvelope(ErrorCode.INTERNAL_ERROR, 'An unexpected error occurred.'));

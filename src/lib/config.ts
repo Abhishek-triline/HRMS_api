@@ -27,6 +27,7 @@ import type {
   AttendanceConfig,
   CarryForwardCaps,
   LeaveConfig,
+  EncashmentConfig,
   Weekday,
 } from '@nexora/contracts/configuration';
 
@@ -238,6 +239,59 @@ export async function getLeaveConfig(): Promise<LeaveConfig> {
     paternityDays,
   };
 
+  cacheSet(CACHE_KEY, result);
+  return result;
+}
+
+// ── Encashment config ─────────────────────────────────────────────────────────
+
+/** Defaults (BL-LE-04). */
+const ENCASHMENT_DEFAULTS: EncashmentConfig = {
+  windowStartMonth: 12,
+  windowEndMonth: 1,
+  windowEndDay: 15,
+  maxPercent: 50,
+};
+
+/**
+ * Returns the current encashment window configuration.
+ * Reads ENCASHMENT_WINDOW_START_MONTH, _END_MONTH, _END_DAY, and
+ * ENCASHMENT_MAX_PERCENT from the configuration table.
+ * Results are cached for 30 seconds.
+ */
+export async function getEncashmentConfig(): Promise<EncashmentConfig> {
+  const CACHE_KEY = 'bucket:encashment';
+  const cached = cacheGet<EncashmentConfig>(CACHE_KEY);
+  if (cached) return cached;
+
+  const [startMonthVal, endMonthVal, endDayVal, maxPctVal] = await Promise.all([
+    readConfigKey('ENCASHMENT_WINDOW_START_MONTH'),
+    readConfigKey('ENCASHMENT_WINDOW_END_MONTH'),
+    readConfigKey('ENCASHMENT_WINDOW_END_DAY'),
+    readConfigKey('ENCASHMENT_MAX_PERCENT'),
+  ]);
+
+  const windowStartMonth =
+    typeof startMonthVal === 'number' && startMonthVal >= 1 && startMonthVal <= 12
+      ? Math.round(startMonthVal)
+      : ENCASHMENT_DEFAULTS.windowStartMonth;
+
+  const windowEndMonth =
+    typeof endMonthVal === 'number' && endMonthVal >= 1 && endMonthVal <= 12
+      ? Math.round(endMonthVal)
+      : ENCASHMENT_DEFAULTS.windowEndMonth;
+
+  const windowEndDay =
+    typeof endDayVal === 'number' && endDayVal >= 1 && endDayVal <= 31
+      ? Math.round(endDayVal)
+      : ENCASHMENT_DEFAULTS.windowEndDay;
+
+  const maxPercent =
+    typeof maxPctVal === 'number' && maxPctVal >= 1 && maxPctVal <= 100
+      ? Math.round(maxPctVal)
+      : ENCASHMENT_DEFAULTS.maxPercent;
+
+  const result: EncashmentConfig = { windowStartMonth, windowEndMonth, windowEndDay, maxPercent };
   cacheSet(CACHE_KEY, result);
   return result;
 }
