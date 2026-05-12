@@ -18,6 +18,10 @@ import { resolveSalaryFor } from './salaryResolver.js';
 import { lopDaysFor } from './lopCalc.js';
 import { daysWorkedFor } from './prorationCalc.js';
 import { generatePayslipCode } from './payrollCode.js';
+import {
+  findUnpaidAdminFinalisedForEmployee,
+  markEncashmentPaid,
+} from '../leave/leave-encashment.service.js';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -38,6 +42,10 @@ export interface PayslipValues {
   finalTaxPaise: number;
   otherDeductionsPaise: number;
   netPayPaise: number;
+  // BL-LE-09: encashment fields (0 / null when no encashment in this run)
+  encashmentDays: number;
+  encashmentPaise: number;
+  encashmentId: string | null;
 }
 
 // ── Engine ────────────────────────────────────────────────────────────────────
@@ -132,7 +140,41 @@ export async function computePayslip(
     lopDeductionPaise = 0;
   }
 
-  // 4. Reference tax (BL-036a)
+  // 4. BL-LE-09: check for an unpaid AdminFinalised encashment for the PREVIOUS year.
+  // The payroll run for month M of year Y picks up encashments for year Y-1.
+  // Example: Jan 2026 payroll run picks up Dec 2025 encashments.
+  const encashmentYear = year - 1;
+  const pendingEncashment = await findUnpaidAdminFinalisedForEmployee(
+    employee.id,
+    encashmentYear,
+    tx,
+  );
+
+  let encashmentDays = 0;
+  let encashmentPaiseFinal = 0;
+  let encashmentId: string | null = null;
+
+  if (pendingEncashment && pendingEncashment.daysApproved !== null) {
+    // BL-LE-07: rate uses THIS RUN's workingDays (paying-month), not the locked snapshot.
+    // The locked ratePerDayPaise at AdminFinalise used APPROX_WORKING_DAYS=26.
+    // Here we override with the actual paying-month workingDays for accuracy.
+    // We update the encashment record's rate + amount at markEncashmentPaid to keep
+    // the audit trail accurate (see leave-encashment.service.ts: markEncashmentPaid).
+    const daForCalc = (salary as SalaryStructure & { daPaise?: number | null }).daPaise ?? 0;
+    const ratePerDay = workingDays > 0
+      ? Math.floor((basicPaise + daForCalc) / workingDays)
+      : 0;
+    const encashmentPaiseComputed = pendingEncashment.daysApproved * ratePerDay;
+
+    encashmentDays = pendingEncashment.daysApproved;
+    encashmentPaiseFinal = encashmentPaiseComputed;
+    encashmentId = pendingEncashment.id;
+
+    // Add encashment to gross BEFORE tax calculation (BL-LE-12: taxable)
+    grossPaise += encashmentPaiseComputed;
+  }
+
+  // 5. Reference tax (BL-036a)
   // TODO(v2): branch on Configuration TAX_GROSS_TAXABLE_BASIS:
   //   - 'GrossMinusStandardDeduction' (default): subtract the standard
   //     deduction before applying slab/rate.
@@ -142,22 +184,22 @@ export async function computePayslip(
   // but ignored by the engine until the slab engine ships.
   const referenceTaxPaise = Math.round(grossPaise * referenceRate);
 
-  // 5. Final tax defaults to reference
+  // 6. Final tax defaults to reference
   const finalTaxPaise = referenceTaxPaise;
 
-  // 6. Other deductions = 0 in v1
+  // 7. Other deductions = 0 in v1
   const otherDeductionsPaise = 0;
 
-  // 7. Net pay — clamp at 0 (no negative payslip)
+  // 8. Net pay — clamp at 0 (no negative payslip)
   const rawNet = grossPaise - lopDeductionPaise - finalTaxPaise - otherDeductionsPaise;
   const netPayPaise = Math.max(0, rawNet);
 
-  // 8. daysWorked value to store
+  // 9. daysWorked value to store
   const daysWorked = isFullPeriod
     ? Math.max(0, workingDays - lopDays)
     : daysWorkedFor(employee, periodStart, periodEnd, workingDays, lopDays);
 
-  // 9. Generate payslip code
+  // 10. Generate payslip code
   const code = await generatePayslipCode(year, month, tx);
 
   return {
@@ -177,7 +219,43 @@ export async function computePayslip(
     finalTaxPaise,
     otherDeductionsPaise,
     netPayPaise,
+    encashmentDays,
+    encashmentPaise: encashmentPaiseFinal,
+    encashmentId,
   };
+}
+
+/**
+ * After a payslip has been created (inside the run transaction), call this to
+ * mark the encashment as Paid and update the rate/amount snapshot to the actual
+ * paying-month values (BL-LE-07).
+ *
+ * Must be called ONLY when computePayslip returned a non-null encashmentId.
+ */
+export async function finaliseEncashmentPayment(
+  values: PayslipValues,
+  payslipId: string,
+  tx: Prisma.TransactionClient,
+): Promise<void> {
+  if (!values.encashmentId) return;
+
+  const workingDays = values.workingDays;
+  // Re-derive ratePerDay using the stored basicPaise from the payslip values.
+  // We don't have daPaise here; the encashment service will update the record.
+  // We pass the engine-computed encashmentPaise and back-calculate rate.
+  const ratePerDay = values.encashmentDays > 0
+    ? Math.floor(values.encashmentPaise / values.encashmentDays)
+    : 0;
+
+  void workingDays; // used implicitly via encashmentPaise
+
+  await markEncashmentPaid(
+    values.encashmentId,
+    payslipId,
+    ratePerDay,
+    values.encashmentPaise,
+    tx,
+  );
 }
 
 /**

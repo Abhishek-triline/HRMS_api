@@ -38,6 +38,11 @@ const CONFIG_DEFAULTS: Array<{ key: string; value: unknown }> = [
   { key: 'NOTIFICATION_RETENTION_DAYS', value: 90 },
   { key: 'STANDARD_TAX_REFERENCE_RATE', value: 0.095 },
   { key: 'TAX_GROSS_TAXABLE_BASIS', value: 'GrossMinusStandardDeduction' },
+  // Leave Encashment window config (BL-LE-04)
+  { key: 'ENCASHMENT_WINDOW_START_MONTH', value: 12 },
+  { key: 'ENCASHMENT_WINDOW_END_MONTH',   value: 1  },
+  { key: 'ENCASHMENT_WINDOW_END_DAY',     value: 15 },
+  { key: 'ENCASHMENT_MAX_PERCENT',        value: 50 },
 ];
 
 // ── Admin defaults (override via env) ────────────────────────────────────────

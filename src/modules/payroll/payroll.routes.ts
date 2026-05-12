@@ -46,7 +46,8 @@ import {
 import { PaginationQuerySchema } from '@nexora/contracts/common';
 import { getSubordinateIds } from '../employees/hierarchy.js';
 import { computeWorkingDays } from './workingDaysCalc.js';
-import { computePayslip, recomputeNet } from './payrollEngine.js';
+import { computePayslip, recomputeNet, finaliseEncashmentPayment } from './payrollEngine.js';
+import { markEncashmentReversed } from '../leave/leave-encashment.service.js';
 import {
   generateRunCode,
   generateReversalRunCode,
@@ -160,6 +161,9 @@ function formatPayslip(
     finalTaxPaise: number;
     otherDeductionsPaise: number;
     netPayPaise: number;
+    encashmentDays?: number;
+    encashmentPaise?: number;
+    encashmentId?: string | null;
     finalisedAt: Date | null;
     reversalOfPayslipId: string | null;
     reversedByPayslipId: string | null;
@@ -194,6 +198,9 @@ function formatPayslip(
     finalTaxPaise: slip.finalTaxPaise,
     otherDeductionsPaise: slip.otherDeductionsPaise,
     netPayPaise: slip.netPayPaise,
+    encashmentDays: slip.encashmentDays ?? 0,
+    encashmentPaise: slip.encashmentPaise ?? 0,
+    encashmentId: slip.encashmentId ?? null,
     finalisedAt: slip.finalisedAt?.toISOString() ?? null,
     reversalOfPayslipId: slip.reversalOfPayslipId,
     reversedByPayslipId: slip.reversedByPayslipId,
@@ -309,7 +316,7 @@ payrollRouter.post(
           try {
             const values = await computePayslip(emp, run, referenceRate, tx);
 
-            await tx.payslip.create({
+            const newPayslip = await tx.payslip.create({
               data: {
                 code: values.code,
                 runId: run.id,
@@ -330,9 +337,18 @@ payrollRouter.post(
                 finalTaxPaise: values.finalTaxPaise,
                 otherDeductionsPaise: values.otherDeductionsPaise,
                 netPayPaise: values.netPayPaise,
+                // BL-LE-09: encashment fields
+                encashmentDays: values.encashmentDays,
+                encashmentPaise: values.encashmentPaise,
+                encashmentId: values.encashmentId ?? undefined,
                 version: 0,
               },
             });
+
+            // BL-LE-09: mark encashment Paid inside same transaction
+            if (values.encashmentId) {
+              await finaliseEncashmentPayment(values, newPayslip.id, tx);
+            }
 
             payslipCount++;
           } catch (empErr: unknown) {
@@ -821,6 +837,8 @@ payrollRouter.post(
           );
 
           // Create reversal payslip (identical money values — UI/PO reads signs)
+          // BL-LE-11: for payslips with encashment, emit negative encashmentPaise
+          // on the reversal payslip. Balance is NOT restored.
           const revSlip = await tx.payslip.create({
             data: {
               code: revSlipCode,
@@ -844,6 +862,11 @@ payrollRouter.post(
               netPayPaise: slip.netPayPaise,
               finalisedAt: slip.finalisedAt,
               reversalOfPayslipId: slip.id,
+              // BL-LE-11: negative encashment line on reversal payslip
+              // (The encashmentId FK is NOT carried to reversal — the FK stays on the
+              // original payslip. The reversal payslip just carries the negative amounts.)
+              encashmentDays: slip.encashmentDays,
+              encashmentPaise: -(slip.encashmentPaise),  // negative = money returned
               version: 0,
             },
           });
@@ -853,6 +876,11 @@ payrollRouter.post(
             where: { id: slip.id },
             data: { reversedByPayslipId: revSlip.id },
           });
+
+          // BL-LE-11: if this payslip had an encashment, write the reverse audit row
+          if (slip.encashmentId) {
+            await markEncashmentReversed(slip.encashmentId, revSlip.id, tx);
+          }
 
           payslipCount++;
         }

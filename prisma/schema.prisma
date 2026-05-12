@@ -119,6 +119,9 @@ model Employee {
   reviewsAsPreviousManager  PerformanceReview[]  @relation("ReviewPreviousManager")
   // Phase 6 — Notifications
   notifications             Notification[]       @relation("EmployeeNotifications")
+  // Leave Encashment (additive)
+  leaveEncashments          LeaveEncashment[]    @relation("EmployeeEncashments")
+  encashmentsApproving      LeaveEncashment[]    @relation("EncashmentApprover")
 
   @@index([email])
   @@index([reportingManagerId])
@@ -143,6 +146,8 @@ model SalaryStructure {
   hraPaise        Int?     /// HRA component in paise
   transportPaise  Int?     /// Transport allowance in paise
   otherPaise      Int?     /// Other allowances in paise
+  /// Dearness Allowance. Nullable; legacy rows default to null → treated as 0 (BL-LE-07).
+  daPaise         Int?
 
   @@index([employeeId, effectiveFrom(sort: Desc)])
   @@map("salary_structures")
@@ -299,6 +304,8 @@ model LeaveBalance {
   year          Int       // calendar year
   daysRemaining Int       @default(0)
   daysUsed      Int       @default(0)  // running tally; for event-based: lifetime used this year
+  /// Days encashed in this year (BL-LE-06). Separate from daysUsed.
+  daysEncashed  Int       @default(0)
   version       Int       @default(0)
 
   @@unique([employeeId, leaveTypeId, year])
@@ -641,6 +648,13 @@ model Payslip {
   /// Net pay = gross − lop − finalTax − other; never negative (BL-035).
   netPayPaise          Int
   finalisedAt          DateTime?
+  /// Encashment days paid in this payslip (BL-LE-09). 0 if no encashment.
+  encashmentDays       Int             @default(0)
+  /// Encashment amount in paise (BL-LE-08). Adds to gross.
+  encashmentPaise      Int             @default(0)
+  /// FK to the encashment record paid in this payslip. Null for payslips without encashment.
+  encashmentId         String?         @unique
+  encashment           LeaveEncashment? @relation("PayslipEncashment", fields: [encashmentId], references: [id])
   /// Set on reversal payslips — points to the original payslip (BL-032).
   reversalOfPayslipId  String?
   reversalOfPayslip    Payslip?        @relation("PayslipReversal", fields: [reversalOfPayslipId], references: [id])
@@ -842,4 +856,70 @@ model Goal {
 
   @@index([reviewId])
   @@map("goals")
+}
+
+// ── Leave Encashment (additive) ───────────────────────────────────────────────
+
+/// BL-LE-05: status machine for leave encashment requests.
+enum LeaveEncashmentStatusDb {
+  Pending
+  ManagerApproved
+  AdminFinalised
+  Paid
+  Rejected
+  Cancelled
+}
+
+/// Leave encashment request. BL-LE-01 to BL-LE-14.
+/// One approved encashment per employee per calendar year (BL-LE-03).
+/// DB-level partial unique index is NOT possible in MySQL; enforced in application
+/// logic via findFirst check at submit + approve time (see leave-encashment.service.ts).
+/// The @@unique([employeeId, year, status]) below is a documentation-only placeholder
+/// that Prisma will NOT create in the DB migration — we rely on app-layer enforcement.
+model LeaveEncashment {
+  id                  String                   @id @default(cuid())
+  /// LE-YYYY-NNNN — globally unique.
+  code                String                   @unique
+  employeeId          String
+  employee            Employee                 @relation("EmployeeEncashments", fields: [employeeId], references: [id])
+  year                Int                      // calendar year the balance was earned in
+  daysRequested       Int                      // employee-stated; server clamps to 50%
+  daysApproved        Int?                     // set at AdminFinalised; null until then
+  /// Locked snapshot at AdminFinalised — basicPaise + daPaise from the active SalaryStructure.
+  ratePerDayPaise     Int?
+  /// daysApproved × ratePerDayPaise; locked at AdminFinalised.
+  amountPaise         Int?
+  status              LeaveEncashmentStatusDb  @default(Pending)
+  /// Same routing model as leave_requests.
+  routedTo            String                   // 'Manager' | 'Admin'
+  approverId          String?                  // current approver
+  approver            Employee?                @relation("EncashmentApprover", fields: [approverId], references: [id])
+  decidedAt           DateTime?
+  decidedBy           String?
+  decisionNote        String?                  @db.Text
+  /// Set when Manager-SLA escalates to Admin.
+  escalatedAt         DateTime?
+  /// Payslip that paid this encashment. Null until payroll run picks it up.
+  paidInPayslipId     String?                  @unique
+  paidInPayslip       Payslip?                 @relation("PayslipEncashment")
+  paidAt              DateTime?
+  /// Cancellation provenance.
+  cancelledAt         DateTime?
+  cancelledBy         String?
+  version             Int                      @default(0)
+  createdAt           DateTime                 @default(now())
+  updatedAt           DateTime                 @updatedAt
+
+  @@index([employeeId, year])
+  @@index([status, year])
+  @@index([approverId, status])
+  @@map("leave_encashments")
+}
+
+/// Counter table for generating LE-YYYY-NNNN codes.
+model EncashmentCodeCounter {
+  year    Int @id
+  lastSeq Int @default(0)
+
+  @@map("encashment_code_counters")
 }

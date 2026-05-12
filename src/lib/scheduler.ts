@@ -34,6 +34,7 @@ import cron from 'node-cron';
 import { prisma } from './prisma.js';
 import { logger } from './logger.js';
 import { escalateStaleRequests, runCarryForward } from '../modules/leave/leave.service.js';
+import { escalateStaleEncashments } from '../modules/leave/leave-encashment.service.js';
 import { runMidnightGenerate } from '../modules/attendance/attendance.service.js';
 import { audit } from './audit.js';
 import { notify } from './notifications.js';
@@ -113,12 +114,15 @@ export function startScheduler(): void {
     },
   );
 
-  // ── leave.carry-forward — Jan 1 at 00:05 IST ──────────────────────────────
+  // ── leave.carry-forward — Jan 1 at 00:01 IST ──────────────────────────────
+  // Adjusted from 00:05 to 00:01 to ensure carry-forward runs AFTER the
+  // Dec 31 23:50 encashment window-check cron and any last-minute finalise
+  // actions (BL-LE-10: encashment must finalise before Jan 1 carry-forward).
   // BL-012: Sick leave resets to zero.
   // BL-013: Annual + Casual carry-forward capped per leaveType.carryForwardCap.
   // BL-014: Maternity/Paternity untouched.
   cron.schedule(
-    '5 0 1 1 *',
+    '1 0 1 1 *',
     async () => {
       const jobId = 'leave.carry-forward';
       const newYear = new Date().getFullYear(); // Jan 1 of the new year at job fire time
@@ -141,6 +145,52 @@ export function startScheduler(): void {
     {
       timezone: 'Asia/Kolkata',
     },
+  );
+
+  // ── leave-encashment.escalation-sweep — hourly ──────────────────────────────
+  // BL-LE-05: mirrors leave escalation — pending encashments > 5 working days
+  // route to Admin. Exited-approver encashments escalate immediately.
+  cron.schedule(
+    '0 * * * *',
+    async () => {
+      const jobId = 'leave-encashment.escalation-sweep';
+      logger.info({ job: jobId }, 'Starting encashment escalation sweep');
+      try {
+        const count = await prisma.$transaction((tx) => escalateStaleEncashments(tx));
+        logger.info({ job: jobId, count }, `Encashment escalation sweep complete — ${count} escalated`);
+      } catch (err: unknown) {
+        logger.error({ job: jobId, err }, 'Encashment escalation sweep failed — server continues normally');
+      }
+    },
+    { timezone: 'Asia/Kolkata' },
+  );
+
+  // ── leave-encashment.windowCheck — Dec 31 23:50 IST ─────────────────────────
+  // BL-LE-10: heads-up log of Pending encashments still in queue before the
+  // Dec 31 window closes and carry-forward runs. No behaviour change — admin
+  // awareness only.
+  cron.schedule(
+    '50 23 31 12 *',
+    async () => {
+      const jobId = 'leave-encashment.windowCheck';
+      logger.info({ job: jobId }, 'Starting encashment window-closing check');
+      try {
+        const count = await prisma.leaveEncashment.count({
+          where: { status: { in: ['Pending', 'ManagerApproved'] } },
+        });
+        if (count > 0) {
+          logger.warn(
+            { job: jobId, pendingCount: count },
+            `ENCASHMENT WINDOW CLOSING: ${count} encashment request(s) are still Pending or ManagerApproved and will not be paid for this year unless acted on before Jan 1 00:01 IST carry-forward.`,
+          );
+        } else {
+          logger.info({ job: jobId, pendingCount: 0 }, 'No pending encashment requests — window closes cleanly.');
+        }
+      } catch (err: unknown) {
+        logger.error({ job: jobId, err }, 'Encashment window-check failed — server continues normally');
+      }
+    },
+    { timezone: 'Asia/Kolkata' },
   );
 
   // ── idempotency-key.cleanup — daily 03:00 IST ─────────────────────────────
@@ -350,6 +400,6 @@ export function startScheduler(): void {
   );
 
   logger.info(
-    'Scheduled jobs started: attendance.midnight-generate (daily 00:00 IST), leave.escalation-sweep (hourly), leave.carry-forward (Jan 1 00:05 IST), idempotency-key.cleanup (daily 03:00 IST), notifications.archive-90d (daily 03:30 IST), performance.review-deadline-nudge (daily 09:00 IST)',
+    'Scheduled jobs started: attendance.midnight-generate (daily 00:00 IST), leave.escalation-sweep (hourly), leave-encashment.escalation-sweep (hourly), leave-encashment.windowCheck (Dec 31 23:50 IST), leave.carry-forward (Jan 1 00:01 IST), idempotency-key.cleanup (daily 03:00 IST), notifications.archive-90d (daily 03:30 IST), performance.review-deadline-nudge (daily 09:00 IST)',
   );
 }

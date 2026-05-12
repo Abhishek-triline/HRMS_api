@@ -10,6 +10,7 @@ import { requireSession } from './middleware/requireSession.js';
 import { authRouter } from './modules/auth/auth.routes.js';
 import { employeesRouter } from './modules/employees/employees.routes.js';
 import { leaveRouter } from './modules/leave/leave.routes.js';
+import { leaveEncashmentRouter } from './modules/leave/leave-encashment.routes.js';
 import { attendanceRouter } from './modules/attendance/attendance.routes.js';
 import { regularisationsRouter } from './modules/attendance/regularisations.routes.js';
 import { holidaysRouter } from './modules/attendance/holidays.routes.js';
@@ -83,6 +84,9 @@ v1Router.use('/employees', employeesRouter);
 
 // Phase 2 — Leave Management
 v1Router.use('/leave', leaveRouter);
+
+// Leave Encashment (additive — BL-LE-01..14)
+v1Router.use('/leave-encashments', leaveEncashmentRouter);
 
 // Phase 3 — Attendance, Regularisation, Holiday Calendar
 v1Router.use('/attendance', attendanceRouter);
