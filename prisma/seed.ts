@@ -89,11 +89,19 @@ const AUDIT_MODULES = [
 const DEFAULT_DEPARTMENTS = ['Engineering', 'Design', 'HR', 'Finance', 'Operations', 'Product', 'Sales'];
 const DEFAULT_DESIGNATIONS = [
   'Software Engineer',
+  'Senior Software Engineer',
   'Engineering Manager',
-  'Head of People',
-  'Payroll Officer',
+  'Designer',
   'Senior Designer',
   'Product Manager',
+  'Sales Manager',
+  'Account Executive',
+  'Operations Lead',
+  'Head of People',
+  'HR Executive',
+  'Recruiter',
+  'Payroll Officer',
+  'Accountant',
 ];
 
 // ── Leave types — also frozen IDs ─────────────────────────────────────────────
@@ -351,612 +359,1085 @@ async function seedDemoAccounts(): Promise<void> {
   }
 }
 
-// ── Dummy data — populates every otherwise-empty table ──────────────────────
+
+// ============================================================================
+// REALISTIC DATA — replaces the earlier mod-i dummy + expanded-attendance
+// blocks with coherent, production-shaped rows so the staging UI feels like
+// a real, working org rather than randomly-rotated placeholder values.
 //
-// Idempotent via a marker check on the first row of every section. Re-running
-// the seed will not duplicate dummy data. Staging-only project — these rows
-// give QA realistic shapes across every module.
+// Idempotent: marker = presence of employee EMP-2024-0005 (the first
+// non-demo realistic employee). If present, the function exits early.
+// Otherwise it wipes all dummy-owned tables in FK-safe order (preserves
+// masters, configurations, holidays, and the four demo accounts) and
+// rebuilds from scratch using the static data tables below.
+//
+// Determinism: every value is derived from a row index or a fixed table;
+// no Math.random anywhere. A fresh DB re-seed produces byte-for-byte
+// identical output.
+// ============================================================================
 
 import crypto from 'node:crypto';
 
-const DUMMY_YEAR = 2026;
+const REALISTIC_YEAR = 2026;
+const REALISTIC_MARKER_CODE = 'EMP-2024-0005';
 
-/** Generate a 32-hex token (used for session + reset tokens). */
-const randomHex = (bytes = 32): string => crypto.randomBytes(bytes).toString('hex');
+// ── New employee roster (20 employees beyond the four demos) ─────────────────
+//
+// Codes EMP-2024-0005..0024. Tree:
+//   Priya Sharma (Admin, HR)
+//     ├─ Arjun Mehta (Manager, Engineering) — engineering team (5 ICs)
+//     ├─ Rohit Khanna (Manager, Design) — 2 designers
+//     ├─ Ananya Singh (Manager, Product) — 1 designer
+//     ├─ Vikram Joshi (Manager, Sales) — 3 AEs (one Exited)
+//     ├─ Ravi Iyer (PayrollOfficer, Finance) — no team
+//     └─ Direct reports for support functions:
+//         Saanvi (HR), Tara (Recruiter), Manav (Accountant),
+//         Neha (Ops, OnNotice), Krishna (Ops), Suresh (HR, Probation)
 
-/** Fixed pseudo-IP rotator so dummy data looks plausible. */
-const fakeIp = (i: number): string => `10.0.${(i >> 8) & 0xff}.${i & 0xff}`;
-
-async function seedDummyData(): Promise<void> {
-  // Marker check — if L-2026-0001 already exists, the dummy block has already run.
-  const marker = await prisma.leaveRequest.findFirst({ where: { code: 'L-2026-0001' } });
-  if (marker) {
-    console.log('  [dummy] already seeded, skipping');
-    return;
-  }
-
-  // Resolve the 4 demo employees by stable email.
-  const [adminEmp, mgrEmp, empEmp, payEmp] = await Promise.all([
-    prisma.employee.findUniqueOrThrow({ where: { email: ADMIN_EMAIL } }),
-    prisma.employee.findUniqueOrThrow({ where: { email: 'manager@triline.co.in' } }),
-    prisma.employee.findUniqueOrThrow({ where: { email: 'employee@triline.co.in' } }),
-    prisma.employee.findUniqueOrThrow({ where: { email: 'payroll@triline.co.in' } }),
-  ]);
-  const employees = [adminEmp, mgrEmp, empEmp, payEmp]; // ids 1..4
-  const empIds = employees.map((e) => e.id);
-
-  // ── sessions (20) — 5 per employee, all active for 30 days ────────────────
-  const now = new Date();
-  await prisma.session.createMany({
-    data: Array.from({ length: 20 }, (_, i) => ({
-      token: randomHex(),
-      employeeId: empIds[i % 4]!,
-      ip: fakeIp(i),
-      userAgent: 'Mozilla/5.0 (X11; Linux x86_64) NexoraSeed/1.0',
-      expiresAt: new Date(now.getTime() + (30 - i) * 86_400_000),
-    })),
-  });
-
-  // ── login_attempts (+17) — mix of success/failure ─────────────────────────
-  await prisma.loginAttempt.createMany({
-    data: Array.from({ length: 17 }, (_, i) => {
-      const emp = employees[i % 4]!;
-      const success = i % 3 !== 0;
-      return {
-        email: emp.email,
-        ip: fakeIp(i + 100),
-        success,
-        employeeId: success ? emp.id : null,
-        createdAt: new Date(now.getTime() - (17 - i) * 3_600_000),
-      };
-    }),
-  });
-
-  // ── password_reset_tokens (20) ───────────────────────────────────────────
-  await prisma.passwordResetToken.createMany({
-    data: Array.from({ length: 20 }, (_, i) => {
-      const used = i % 3 === 0;
-      const expired = i % 4 === 0;
-      const exp = new Date(now.getTime() + (expired ? -86_400_000 : 86_400_000));
-      return {
-        tokenHash: crypto.createHash('sha256').update(`reset-${i}-${Date.now()}`).digest('hex'),
-        employeeId: empIds[i % 4]!,
-        purposeId: i % 5 === 0 ? 1 : 2, // 1=FirstLogin, 2=ResetPassword
-        expiresAt: exp,
-        usedAt: used ? new Date(now.getTime() - 3_600_000 * i) : null,
-      };
-    }),
-  });
-
-  // ── leave_requests (20) + leave_code_counter ──────────────────────────────
-  const leaveRequestsData = Array.from({ length: 20 }, (_, i) => {
-    const emp = employees[i % 4]!;
-    const leaveTypeId = ((i % 6) + 1) as 1 | 2 | 3 | 4 | 5 | 6;
-    const isEventBased = leaveTypeId === 5 || leaveTypeId === 6;
-    // Manager (id=2) approves emp's requests; admin (id=1) approves mgr/payroll;
-    // event-based always goes to admin.
-    const routedToId = isEventBased
-      ? 2 // Admin
-      : emp.id === empEmp.id
-        ? 1 // Manager
-        : 2; // Admin (for mgr/payroll/admin requesters)
-    const approverId = routedToId === 1 ? mgrEmp.id : adminEmp.id;
-    const status = ((i % 5) + 1) as 1 | 2 | 3 | 4 | 5;
-    const decided = status === 2 || status === 3 || status === 4;
-    const from = new Date(Date.UTC(DUMMY_YEAR, 3 + (i % 3), 5 + (i % 20)));
-    const to = new Date(from.getTime() + (i % 3) * 86_400_000);
-    const days = Math.max(1, Math.round((to.getTime() - from.getTime()) / 86_400_000) + 1);
-    return {
-      code: `L-${DUMMY_YEAR}-${String(i + 1).padStart(4, '0')}`,
-      employeeId: emp.id,
-      leaveTypeId,
-      fromDate: from,
-      toDate: to,
-      days,
-      reason: `Sample leave request #${i + 1}`,
-      status,
-      routedToId,
-      approverId: decided ? approverId : null,
-      decidedAt: decided ? new Date(now.getTime() - (20 - i) * 3_600_000) : null,
-      decidedBy: decided ? approverId : null,
-      decisionNote: decided && status === 3 ? 'Insufficient notice.' : null,
-      escalatedAt: status === 5 ? new Date(now.getTime() - i * 86_400_000) : null,
-      cancelledAt: status === 4 ? new Date(now.getTime() - i * 3_600_000) : null,
-      cancelledBy: status === 4 ? emp.id : null,
-      cancelledAfterStart: status === 4 && i % 2 === 0,
-      deductedDays: status === 2 ? days : 0,
-      restoredDays: status === 4 ? days : 0,
-    };
-  });
-  await prisma.leaveRequest.createMany({ data: leaveRequestsData });
-
-  await prisma.leaveCodeCounter.upsert({
-    where: { year: DUMMY_YEAR },
-    create: { year: DUMMY_YEAR, number: 20 },
-    update: { number: 20 },
-  });
-
-  // ── leave_balance_ledger (20) — initial allocations + approval deductions ─
-  const ledgerSeeds: Array<{
-    employeeId: number;
-    leaveTypeId: number;
-    delta: number;
-    reasonId: number;
-  }> = [];
-  // Initial allocation entries — 4 employees × 4 accrual types = 16
-  for (const emp of employees) {
-    for (const lt of [1, 2, 3, 4]) {
-      ledgerSeeds.push({ employeeId: emp.id, leaveTypeId: lt, delta: 12, reasonId: 1 }); // Initial
-    }
-  }
-  // 4 approval deductions
-  for (let i = 0; i < 4; i++) {
-    ledgerSeeds.push({
-      employeeId: empIds[i]!,
-      leaveTypeId: 1,
-      delta: -2,
-      reasonId: 2, // Approval
-    });
-  }
-  await prisma.leaveBalanceLedger.createMany({
-    data: ledgerSeeds.map((s, i) => ({
-      ...s,
-      year: DUMMY_YEAR,
-      createdAt: new Date(now.getTime() - (ledgerSeeds.length - i) * 60_000),
-    })),
-  });
-
-  // ── attendance_records (20) — 5 days × 4 employees, all source=1 (system) ─
-  await prisma.attendanceRecord.createMany({
-    data: Array.from({ length: 20 }, (_, i) => {
-      const emp = employees[i % 4]!;
-      const dayOffset = Math.floor(i / 4);
-      const date = new Date(Date.UTC(DUMMY_YEAR, 4, 5 + dayOffset));
-      const status = dayOffset === 4 ? 4 : 1; // last batch = WeeklyOff; rest = Present
-      const checkIn = status === 1 ? new Date(date.getTime() + 9 * 3_600_000 + (i % 3) * 1800_000) : null;
-      const checkOut = checkIn ? new Date(checkIn.getTime() + 9 * 3_600_000) : null;
-      const late = checkIn ? checkIn.getUTCHours() * 60 + checkIn.getUTCMinutes() > 10 * 60 + 30 : false;
-      return {
-        employeeId: emp.id,
-        date,
-        status,
-        checkInTime: checkIn,
-        checkOutTime: checkOut,
-        hoursWorkedMinutes: checkIn ? 540 : null,
-        late,
-        lateMonthCount: late ? 1 : 0,
-        lopApplied: false,
-        sourceId: 1, // system
-        regularisationId: null,
-      };
-    }),
-  });
-
-  // ── attendance_late_ledger (20) — 4 emps × 5 months ───────────────────────
-  await prisma.attendanceLateLedger.createMany({
-    data: Array.from({ length: 20 }, (_, i) => ({
-      employeeId: empIds[i % 4]!,
-      year: DUMMY_YEAR,
-      month: Math.floor(i / 4) + 1, // 1..5
-      count: i % 4,
-    })),
-  });
-
-  // ── regularisation_requests (20) + counter ────────────────────────────────
-  await prisma.regularisationRequest.createMany({
-    data: Array.from({ length: 20 }, (_, i) => {
-      const emp = employees[i % 4]!;
-      const status = ((i % 3) + 1) as 1 | 2 | 3;
-      const ageDays = (i % 14) + 1;
-      const routedToId = ageDays > 7 ? 2 : 1; // BL-029
-      const approverId = routedToId === 1 ? mgrEmp.id : adminEmp.id;
-      const decided = status !== 1;
-      const date = new Date(Date.UTC(DUMMY_YEAR, 3, 1 + (i % 28)));
-      const ci = new Date(date.getTime() + 9 * 3_600_000 + (i % 3) * 1800_000);
-      const co = new Date(date.getTime() + 18 * 3_600_000);
-      return {
-        code: `R-${DUMMY_YEAR}-${String(i + 1).padStart(4, '0')}`,
-        employeeId: emp.id,
-        date,
-        proposedCheckIn: ci,
-        proposedCheckOut: co,
-        reason: `Forgot to check in/out — dummy reason #${i + 1}`,
-        status,
-        routedToId,
-        ageDaysAtSubmit: ageDays,
-        approverId: decided ? approverId : null,
-        decidedAt: decided ? new Date(now.getTime() - i * 3_600_000) : null,
-        decidedBy: decided ? approverId : null,
-        decisionNote: decided && status === 3 ? 'No corroborating evidence.' : null,
-      };
-    }),
-  });
-
-  await prisma.regCodeCounter.upsert({
-    where: { year: DUMMY_YEAR },
-    create: { year: DUMMY_YEAR, number: 20 },
-    update: { number: 20 },
-  });
-
-  // ── leave_encashments (20) + counter ──────────────────────────────────────
-  await prisma.leaveEncashment.createMany({
-    data: Array.from({ length: 20 }, (_, i) => {
-      const emp = employees[i % 4]!;
-      const status = ((i % 6) + 1) as 1 | 2 | 3 | 4 | 5 | 6;
-      const routedToId = status === 1 ? 1 : 2;
-      const approverId = routedToId === 1 ? mgrEmp.id : adminEmp.id;
-      const decided = status !== 1;
-      const daysReq = (i % 5) + 1;
-      const daysApp = status >= 3 ? daysReq : null;
-      const rate = daysApp ? 200000 : null; // ₹2000/day in paise
-      return {
-        code: `LE-${DUMMY_YEAR}-${String(i + 1).padStart(4, '0')}`,
-        employeeId: emp.id,
-        year: DUMMY_YEAR,
-        daysRequested: daysReq,
-        daysApproved: daysApp,
-        ratePerDayPaise: rate,
-        amountPaise: daysApp && rate ? daysApp * rate : null,
-        status,
-        routedToId,
-        approverId: decided ? approverId : null,
-        decidedAt: decided ? new Date(now.getTime() - i * 86_400_000) : null,
-        decidedBy: decided ? approverId : null,
-        decisionNote: status === 5 ? 'Outside encashment window.' : null,
-        paidAt: status === 4 ? new Date(now.getTime() - i * 3_600_000) : null,
-        cancelledAt: status === 6 ? new Date(now.getTime() - i * 3_600_000) : null,
-        cancelledBy: status === 6 ? emp.id : null,
-      };
-    }),
-  });
-
-  await prisma.encashmentCodeCounter.upsert({
-    where: { year: DUMMY_YEAR },
-    create: { year: DUMMY_YEAR, number: 20 },
-    update: { number: 20 },
-  });
-
-  // ── payroll_runs (5) + counters + payslips (20) ───────────────────────────
-  // 5 runs: Jan–May 2026. Jan–Apr Finalised (status=3), May Review (status=2).
-  const runRows = [];
-  for (let m = 1; m <= 5; m++) {
-    const finalised = m <= 4;
-    const periodStart = new Date(Date.UTC(DUMMY_YEAR, m - 1, 1));
-    const periodEnd = new Date(Date.UTC(DUMMY_YEAR, m, 0));
-    runRows.push({
-      code: `RUN-${DUMMY_YEAR}-${String(m).padStart(2, '0')}`,
-      month: m,
-      year: DUMMY_YEAR,
-      status: finalised ? 3 : 2,
-      workingDays: 22,
-      periodStart,
-      periodEnd,
-      initiatedBy: payEmp.id,
-      initiatedAt: new Date(periodEnd.getTime() - 86_400_000),
-      finalisedBy: finalised ? adminEmp.id : null,
-      finalisedAt: finalised ? new Date(periodEnd.getTime() + 86_400_000) : null,
-    });
-  }
-  await prisma.payrollRun.createMany({ data: runRows });
-
-  await prisma.payrollCodeCounter.createMany({
-    data: runRows.map((r) => ({ year: r.year, month: r.month, number: 1 })),
-  });
-
-  const runs = await prisma.payrollRun.findMany({
-    where: { year: DUMMY_YEAR },
-    orderBy: { month: 'asc' },
-  });
-
-  // Payslips: 5 runs × 4 employees = 20
-  const payslips: Prisma.PayslipCreateManyInput[] = [];
-  let psIdx = 0;
-  for (const run of runs) {
-    for (const emp of employees) {
-      psIdx++;
-      const basic = 5_000_000; // ₹50,000 in paise
-      const allow = 2_000_000; // ₹20,000
-      const gross = basic + allow;
-      const tax = Math.round(gross * 0.095);
-      const other = 200_000;
-      const net = gross - tax - other;
-      payslips.push({
-        code: `P-${DUMMY_YEAR}-${String(run.month).padStart(2, '0')}-${String(psIdx).padStart(4, '0')}`,
-        runId: run.id,
-        employeeId: emp.id,
-        month: run.month,
-        year: DUMMY_YEAR,
-        status: run.status,
-        periodStart: run.periodStart,
-        periodEnd: run.periodEnd,
-        workingDays: 22,
-        daysWorked: 22,
-        lopDays: 0,
-        basicPaise: basic,
-        allowancesPaise: allow,
-        grossPaise: gross,
-        lopDeductionPaise: 0,
-        referenceTaxPaise: tax,
-        finalTaxPaise: tax,
-        otherDeductionsPaise: other,
-        netPayPaise: net,
-        finalisedAt: run.finalisedAt,
-      });
-    }
-  }
-  await prisma.payslip.createMany({ data: payslips });
-
-  // ── performance_cycles (2) + reviews (8) + goals (20) ─────────────────────
-  await prisma.performanceCycle.createMany({
-    data: [
-      {
-        code: `C-${DUMMY_YEAR - 1}-H2`,
-        fyStart: new Date(Date.UTC(DUMMY_YEAR - 1, 9, 1)),
-        fyEnd: new Date(Date.UTC(DUMMY_YEAR, 2, 31)),
-        status: 4, // Closed
-        selfReviewDeadline: new Date(Date.UTC(DUMMY_YEAR, 1, 15)),
-        managerReviewDeadline: new Date(Date.UTC(DUMMY_YEAR, 2, 1)),
-        closedAt: new Date(Date.UTC(DUMMY_YEAR, 2, 5)),
-        closedBy: adminEmp.id,
-        createdBy: adminEmp.id,
-      },
-      {
-        code: `C-${DUMMY_YEAR}-H1`,
-        fyStart: new Date(Date.UTC(DUMMY_YEAR, 3, 1)),
-        fyEnd: new Date(Date.UTC(DUMMY_YEAR, 8, 30)),
-        status: 1, // Open
-        selfReviewDeadline: new Date(Date.UTC(DUMMY_YEAR, 7, 15)),
-        managerReviewDeadline: new Date(Date.UTC(DUMMY_YEAR, 8, 1)),
-        createdBy: adminEmp.id,
-      },
-    ],
-  });
-
-  const cycles = await prisma.performanceCycle.findMany({ orderBy: { fyStart: 'asc' } });
-
-  // 4 employees × 2 cycles = 8 reviews
-  for (const cycle of cycles) {
-    for (const emp of employees) {
-      const isClosed = cycle.status === 4;
-      // Manager: emp's reportingManager OR a peer admin for admin/payroll
-      let managerId: number | null = emp.reportingManagerId;
-      if (!managerId) managerId = adminEmp.id === emp.id ? null : adminEmp.id;
-      const self = isClosed ? 4 : 3;
-      const mgr = isClosed ? 4 : null;
-      await prisma.performanceReview.create({
-        data: {
-          cycleId: cycle.id,
-          employeeId: emp.id,
-          managerId,
-          selfRating: self,
-          selfNote: 'Met all key objectives this cycle.',
-          managerRating: mgr,
-          managerNote: mgr ? 'Solid performance — exceeded expectations on the Q3 launch.' : null,
-          managerOverrodeSelf: mgr !== null && self !== mgr,
-          finalRating: isClosed ? mgr : null,
-          lockedAt: isClosed ? cycle.closedAt : null,
-        },
-      });
-    }
-  }
-
-  // 20 goals = 2 goals × 4 reviews (closed cycle) + 3 goals × 4 reviews (open cycle)
-  const reviews = await prisma.performanceReview.findMany({ orderBy: { id: 'asc' } });
-  let goalCount = 0;
-  for (const r of reviews) {
-    const isClosed = cycles.find((c) => c.id === r.cycleId)!.status === 4;
-    const goalsPerReview = isClosed ? 2 : 3;
-    for (let g = 0; g < goalsPerReview; g++) {
-      goalCount++;
-      await prisma.goal.create({
-        data: {
-          reviewId: r.id,
-          text: `Goal #${g + 1}: deliver the Q${g + 1} milestone on time and within budget.`,
-          outcomeId: isClosed ? ((g % 3) + 2) : 1, // closed=Met/Partial/Missed; open=Pending
-          proposedByEmployee: g === 0,
-        },
-      });
-    }
-  }
-
-  // ── notifications (20) ────────────────────────────────────────────────────
-  await prisma.notification.createMany({
-    data: Array.from({ length: 20 }, (_, i) => {
-      const recipient = employees[i % 4]!;
-      const categoryId = ((i % 8) + 1) as 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8;
-      const titles: Record<number, string> = {
-        1: 'Leave request approved',
-        2: 'Late mark recorded for today',
-        3: 'Payslip ready for download',
-        4: 'Self-review window opens tomorrow',
-        5: 'Your reporting manager has changed',
-        6: 'Late threshold updated by Admin',
-        7: 'New session signed in from 10.0.0.42',
-        8: 'System maintenance window: Saturday 2 AM IST',
-      };
-      return {
-        recipientId: recipient.id,
-        categoryId,
-        title: titles[categoryId]!,
-        body: `Dummy notification body #${i + 1} — auto-generated for staging QA.`,
-        link: null,
-        unread: i % 3 !== 0,
-        createdAt: new Date(now.getTime() - (20 - i) * 1_800_000),
-      };
-    }),
-  });
-
-  // ── audit_log (20) ────────────────────────────────────────────────────────
-  const auditActions = [
-    { action: 'auth.login.success',           moduleId: 1, targetTypeId: 1 },
-    { action: 'auth.login.failure',           moduleId: 1, targetTypeId: 1 },
-    { action: 'employee.created',             moduleId: 2, targetTypeId: 1 },
-    { action: 'employee.status.changed',      moduleId: 2, targetTypeId: 1 },
-    { action: 'employee.salary.updated',      moduleId: 2, targetTypeId: 12 },
-    { action: 'leave.request.created',        moduleId: 3, targetTypeId: 2 },
-    { action: 'leave.request.approved',       moduleId: 3, targetTypeId: 2 },
-    { action: 'leave.request.rejected',       moduleId: 3, targetTypeId: 2 },
-    { action: 'leave.encashment.created',     moduleId: 3, targetTypeId: 3 },
-    { action: 'leave.encashment.approved',    moduleId: 3, targetTypeId: 3 },
-    { action: 'attendance.checkin',           moduleId: 5, targetTypeId: 4 },
-    { action: 'attendance.checkout',          moduleId: 5, targetTypeId: 4 },
-    { action: 'regularisation.approved',      moduleId: 5, targetTypeId: 5 },
-    { action: 'payroll.run.initiated',        moduleId: 4, targetTypeId: 6 },
-    { action: 'payroll.run.finalised',        moduleId: 4, targetTypeId: 6 },
-    { action: 'performance.cycle.created',    moduleId: 6, targetTypeId: 8 },
-    { action: 'performance.review.submitted', moduleId: 6, targetTypeId: 9 },
-    { action: 'configuration.updated',        moduleId: 9, targetTypeId: 11 },
-    { action: 'holiday.created',              moduleId: 9, targetTypeId: 13 },
-    { action: 'notification.delivered',       moduleId: 7, targetTypeId: 14 },
-  ];
-  await prisma.auditLog.createMany({
-    data: auditActions.map((a, i) => ({
-      actorId: empIds[i % 4]!,
-      actorRoleId: ((i % 4) + 1), // 1..4
-      actorIp: fakeIp(i + 200),
-      action: a.action,
-      moduleId: a.moduleId,
-      targetTypeId: a.targetTypeId,
-      targetId: (i % 20) + 1,
-      // Prisma needs the explicit JsonNull sentinel for nullable Json columns
-      // (bare `null` is rejected — could mean either SQL NULL or JSON `null`).
-      before: Prisma.JsonNull,
-      after: { sample: true, n: i },
-      createdAt: new Date(now.getTime() - (20 - i) * 600_000),
-    })),
-  });
-
-  // ── idempotency_keys (20) ─────────────────────────────────────────────────
-  await prisma.idempotencyKey.createMany({
-    data: Array.from({ length: 20 }, (_, i) => ({
-      key: `idem-${DUMMY_YEAR}-${randomHex(8)}`,
-      employeeId: empIds[i % 4]!,
-      endpoint: ['/leave/requests', '/attendance/check-in', '/payroll/runs', '/leave-encashments'][i % 4]!,
-      responseSnapshot: { ok: true, n: i },
-      createdAt: new Date(now.getTime() - (20 - i) * 300_000),
-    })),
-  });
-
-  console.log('  [dummy] seeded: sessions(20) login_attempts(+17) reset_tokens(20)');
-  console.log('  [dummy]         leave_requests(20) ledger(20) attendance(20) late_ledger(20)');
-  console.log('  [dummy]         regularisations(20) encashments(20) payroll_runs(5) payslips(20)');
-  console.log('  [dummy]         cycles(2) reviews(8) goals(20) notifications(20) audit(20) idem(20)');
+interface RealisticEmpSeed {
+  code: string;
+  email: string;
+  name: string;
+  designationName: string;
+  departmentName: string;
+  employmentTypeId: 1 | 2 | 3 | 4;
+  roleId: 1 | 2 | 3 | 4;
+  status: 1 | 2 | 5;
+  genderId: 1 | 2 | 3 | 4;
+  joinDate: string;
+  exitDate?: string;
+  phone: string;
+  dateOfBirth: string;
+  reportsToCode: string | null;
+  monthlySalaryPaise: number;
 }
 
-// ── Expanded attendance — fills a wide date range so the admin grid has data ─
-//
-// Independent of the 20-row dummy block; runs idempotently even after that
-// block has fired. Looks for the marker date 2026-04-01: if any row exists
-// for that date, the expansion is already in place and the function returns
-// early. Otherwise it generates one row per (active demo employee × every
-// weekday between EXPANDED_FROM and EXPANDED_TO), skipping public holidays.
-//
-// Status distribution is deterministic (not Math.random) so re-running on a
-// fresh DB produces byte-for-byte identical rows. Mix: ~70% Present (with
-// ~20% of those late after 10:30), ~10% Absent, ~10% OnLeave.
-//
-// Uses createMany({ skipDuplicates: true }) so any rows that already exist
-// (e.g., the 20-row dummy block's May 5–9 entries) are silently skipped.
+const REALISTIC_ROSTER: RealisticEmpSeed[] = [
+  // Engineering under Arjun
+  { code: 'EMP-2024-0005', email: 'aditya.kumar@triline.co.in',  name: 'Aditya Kumar',   designationName: 'Software Engineer',        departmentName: 'Engineering', employmentTypeId: 1, roleId: 1, status: 1, genderId: 1, joinDate: '2024-01-15', phone: '+91-98201-43251', dateOfBirth: '1996-04-12', reportsToCode: 'EMP-2024-0002', monthlySalaryPaise: 10_00_000 },
+  { code: 'EMP-2024-0006', email: 'sneha.patel@triline.co.in',   name: 'Sneha Patel',    designationName: 'Senior Software Engineer', departmentName: 'Engineering', employmentTypeId: 1, roleId: 1, status: 1, genderId: 2, joinDate: '2024-02-10', phone: '+91-98452-71839', dateOfBirth: '1993-08-22', reportsToCode: 'EMP-2024-0002', monthlySalaryPaise: 15_00_000 },
+  { code: 'EMP-2024-0007', email: 'karthik.raja@triline.co.in',  name: 'Karthik Raja',   designationName: 'Software Engineer',        departmentName: 'Engineering', employmentTypeId: 1, roleId: 1, status: 1, genderId: 1, joinDate: '2024-04-05', phone: '+91-97401-92847', dateOfBirth: '1997-11-30', reportsToCode: 'EMP-2024-0002', monthlySalaryPaise: 9_50_000 },
+  { code: 'EMP-2024-0008', email: 'pooja.bansal@triline.co.in',  name: 'Pooja Bansal',   designationName: 'Software Engineer',        departmentName: 'Engineering', employmentTypeId: 3, roleId: 1, status: 1, genderId: 2, joinDate: '2026-01-15', phone: '+91-99201-44732', dateOfBirth: '1999-06-15', reportsToCode: 'EMP-2024-0002', monthlySalaryPaise: 6_50_000 },
+  { code: 'EMP-2024-0009', email: 'vikrant.jain@triline.co.in',  name: 'Vikrant Jain',   designationName: 'Software Engineer',        departmentName: 'Engineering', employmentTypeId: 4, roleId: 1, status: 1, genderId: 1, joinDate: '2026-03-15', phone: '+91-98712-39482', dateOfBirth: '2002-01-20', reportsToCode: 'EMP-2024-0002', monthlySalaryPaise: 2_50_000 },
+  // Design under Rohit
+  { code: 'EMP-2024-0010', email: 'rohit.khanna@triline.co.in',  name: 'Rohit Khanna',   designationName: 'Senior Designer',          departmentName: 'Design',      employmentTypeId: 1, roleId: 2, status: 1, genderId: 1, joinDate: '2023-04-10', phone: '+91-99720-58194', dateOfBirth: '1989-09-18', reportsToCode: 'EMP-2024-0001', monthlySalaryPaise: 18_00_000 },
+  { code: 'EMP-2024-0011', email: 'aanya.iyer@triline.co.in',    name: 'Aanya Iyer',     designationName: 'Designer',                 departmentName: 'Design',      employmentTypeId: 1, roleId: 1, status: 1, genderId: 2, joinDate: '2024-10-01', phone: '+91-99873-21940', dateOfBirth: '1995-02-08', reportsToCode: 'EMP-2024-0010', monthlySalaryPaise: 8_50_000 },
+  { code: 'EMP-2024-0012', email: 'diya.nair@triline.co.in',     name: 'Diya Nair',      designationName: 'Designer',                 departmentName: 'Design',      employmentTypeId: 2, roleId: 1, status: 1, genderId: 2, joinDate: '2024-11-05', phone: '+91-94462-71035', dateOfBirth: '1994-12-03', reportsToCode: 'EMP-2024-0010', monthlySalaryPaise: 11_00_000 },
+  // Product under Ananya
+  { code: 'EMP-2024-0013', email: 'ananya.singh@triline.co.in',  name: 'Ananya Singh',   designationName: 'Product Manager',          departmentName: 'Product',     employmentTypeId: 1, roleId: 2, status: 1, genderId: 2, joinDate: '2023-08-15', phone: '+91-99809-47231', dateOfBirth: '1991-05-25', reportsToCode: 'EMP-2024-0001', monthlySalaryPaise: 18_00_000 },
+  // Sales under Vikram
+  { code: 'EMP-2024-0014', email: 'vikram.joshi@triline.co.in',  name: 'Vikram Joshi',   designationName: 'Sales Manager',            departmentName: 'Sales',       employmentTypeId: 1, roleId: 2, status: 1, genderId: 1, joinDate: '2023-11-01', phone: '+91-98870-21405', dateOfBirth: '1988-07-14', reportsToCode: 'EMP-2024-0001', monthlySalaryPaise: 16_50_000 },
+  { code: 'EMP-2024-0015', email: 'tanvi.shah@triline.co.in',    name: 'Tanvi Shah',     designationName: 'Account Executive',        departmentName: 'Sales',       employmentTypeId: 1, roleId: 1, status: 1, genderId: 2, joinDate: '2024-05-20', phone: '+91-98330-58194', dateOfBirth: '1996-03-19', reportsToCode: 'EMP-2024-0014', monthlySalaryPaise: 7_50_000 },
+  { code: 'EMP-2024-0016', email: 'aryan.gupta@triline.co.in',   name: 'Aryan Gupta',    designationName: 'Account Executive',        departmentName: 'Sales',       employmentTypeId: 1, roleId: 1, status: 1, genderId: 1, joinDate: '2024-06-15', phone: '+91-99762-30418', dateOfBirth: '1995-10-08', reportsToCode: 'EMP-2024-0014', monthlySalaryPaise: 7_50_000 },
+  { code: 'EMP-2024-0017', email: 'riya.malhotra@triline.co.in', name: 'Riya Malhotra',  designationName: 'Account Executive',        departmentName: 'Sales',       employmentTypeId: 1, roleId: 1, status: 5, genderId: 2, joinDate: '2023-12-01', exitDate: '2026-04-30', phone: '+91-98765-43210', dateOfBirth: '1994-08-11', reportsToCode: 'EMP-2024-0014', monthlySalaryPaise: 7_50_000 },
+  // Support functions
+  { code: 'EMP-2024-0018', email: 'saanvi.joshi@triline.co.in',  name: 'Saanvi Joshi',   designationName: 'HR Executive',             departmentName: 'HR',          employmentTypeId: 1, roleId: 1, status: 1, genderId: 2, joinDate: '2024-07-01', phone: '+91-99820-47301', dateOfBirth: '1993-04-29', reportsToCode: 'EMP-2024-0001', monthlySalaryPaise: 6_00_000 },
+  { code: 'EMP-2024-0019', email: 'tara.gupta@triline.co.in',    name: 'Tara Gupta',     designationName: 'Recruiter',                departmentName: 'HR',          employmentTypeId: 1, roleId: 1, status: 1, genderId: 2, joinDate: '2024-09-15', phone: '+91-99432-71059', dateOfBirth: '1994-11-12', reportsToCode: 'EMP-2024-0001', monthlySalaryPaise: 6_50_000 },
+  { code: 'EMP-2024-0020', email: 'manav.pillai@triline.co.in',  name: 'Manav Pillai',   designationName: 'Accountant',               departmentName: 'Finance',     employmentTypeId: 1, roleId: 1, status: 1, genderId: 1, joinDate: '2024-08-10', phone: '+91-99201-83472', dateOfBirth: '1992-01-23', reportsToCode: 'EMP-2024-0001', monthlySalaryPaise: 7_00_000 },
+  { code: 'EMP-2024-0021', email: 'neha.kapoor@triline.co.in',   name: 'Neha Kapoor',    designationName: 'Operations Lead',          departmentName: 'Operations',  employmentTypeId: 1, roleId: 1, status: 2, genderId: 2, joinDate: '2023-05-15', phone: '+91-98301-58294', dateOfBirth: '1990-09-08', reportsToCode: 'EMP-2024-0001', monthlySalaryPaise: 9_00_000 },
+  { code: 'EMP-2024-0022', email: 'krishna.patel@triline.co.in', name: 'Krishna Patel',  designationName: 'Operations Lead',          departmentName: 'Operations',  employmentTypeId: 1, roleId: 1, status: 1, genderId: 1, joinDate: '2025-04-10', phone: '+91-99431-20581', dateOfBirth: '1991-12-15', reportsToCode: 'EMP-2024-0001', monthlySalaryPaise: 9_00_000 },
+  { code: 'EMP-2024-0023', email: 'suresh.bhatia@triline.co.in', name: 'Suresh Bhatia',  designationName: 'HR Executive',             departmentName: 'HR',          employmentTypeId: 3, roleId: 1, status: 1, genderId: 1, joinDate: '2026-02-20', phone: '+91-98270-31049', dateOfBirth: '1996-06-04', reportsToCode: 'EMP-2024-0001', monthlySalaryPaise: 5_00_000 },
+  { code: 'EMP-2024-0024', email: 'mira.desai@triline.co.in',    name: 'Mira Desai',     designationName: 'Designer',                 departmentName: 'Product',     employmentTypeId: 2, roleId: 1, status: 1, genderId: 2, joinDate: '2024-12-10', phone: '+91-99752-13049', dateOfBirth: '1995-07-21', reportsToCode: 'EMP-2024-0013', monthlySalaryPaise: 10_50_000 },
+];
 
-const EXPANDED_FROM = new Date(Date.UTC(2026, 3, 1));  // 2026-04-01
-const EXPANDED_TO   = new Date(Date.UTC(2026, 4, 31)); // 2026-05-31
+const DEMO_MONTHLY_SALARY_PAISE: Record<string, number> = {
+  'EMP-2024-0001': 21_00_000, // Priya
+  'EMP-2024-0002': 20_00_000, // Arjun
+  'EMP-2024-0003': 10_00_000, // Kavya
+  'EMP-2024-0004': 10_00_000, // Ravi
+};
 
-async function seedExpandedAttendance(): Promise<void> {
-  const marker = await prisma.attendanceRecord.findFirst({
-    where: { date: EXPANDED_FROM },
+const LEAVE_REASONS = [
+  "Sister's wedding in Jaipur",
+  'Annual medical checkup at Apollo Hospital',
+  "Diwali holidays at parents' place",
+  'Family function in Mumbai',
+  'Visiting elderly grandparents in Lucknow',
+  'Trekking trip to Manali',
+  "Brother's engagement ceremony",
+  'Personal health break — recovering from migraine',
+  'Sick — viral fever, doctor advised rest',
+  'Pongal celebrations with family',
+  'Holi celebrations at home',
+  "Cousin's wedding in Hyderabad",
+  "Friend's destination wedding in Goa",
+  'New Year vacation in Kerala',
+  'Knee surgery follow-up appointment',
+  'Family emergency — father admitted to hospital',
+  'Onam celebrations with parents in Kochi',
+  "Daughter's school annual day",
+  "Brother's wedding in Bengaluru",
+  'Personal time off — moving to a new apartment',
+];
+
+const REJECTION_NOTES = [
+  'Resource conflict — please reapply for adjacent weeks.',
+  'Critical project deliverable that week; please discuss with manager.',
+  'Multiple team members already on leave that period.',
+  'Insufficient notice — minimum 7 working days required for this duration.',
+];
+
+const APPROVAL_NOTES = [
+  'Approved — enjoy the time off!',
+  'Approved. Please ensure handover notes are in place before leaving.',
+  'Approved. Hope you feel better soon.',
+  'Approved. Let me know if you need any team coverage.',
+  'Approved.',
+];
+
+// ── Helpers ────────────────────────────────────────────────────────────────
+
+function dt(s: string): Date {
+  return s.length === 10 ? new Date(`${s}T00:00:00Z`) : new Date(s);
+}
+
+function daysBetween(from: Date, to: Date): number {
+  return Math.round((to.getTime() - from.getTime()) / 86_400_000) + 1;
+}
+
+function addDays(d: Date, n: number): Date {
+  const out = new Date(d.getTime());
+  out.setUTCDate(out.getUTCDate() + n);
+  return out;
+}
+
+function splitSalary(monthly: number): {
+  basicPaise: number;
+  allowancesPaise: number;
+  hraPaise: number;
+  transportPaise: number;
+  otherPaise: number;
+} {
+  const basic = Math.round(monthly * 0.6);
+  const allowances = monthly - basic;
+  const hra = Math.round(monthly * 0.25);
+  const transport = Math.round(monthly * 0.05);
+  const other = allowances - hra - transport;
+  return { basicPaise: basic, allowancesPaise: allowances, hraPaise: hra, transportPaise: transport, otherPaise: other };
+}
+
+// ── Wipe (FK-safe order) ──────────────────────────────────────────────────
+
+async function wipeDummyOwnedTables(): Promise<void> {
+  await prisma.goal.deleteMany({});
+  await prisma.performanceReview.deleteMany({});
+  await prisma.performanceCycle.deleteMany({});
+  await prisma.payslip.deleteMany({});
+  await prisma.payrollRun.deleteMany({});
+  await prisma.leaveEncashment.deleteMany({});
+  await prisma.attendanceRecord.deleteMany({});
+  await prisma.regularisationRequest.deleteMany({});
+  await prisma.attendanceLateLedger.deleteMany({});
+  await prisma.leaveBalanceLedger.deleteMany({});
+  await prisma.leaveRequest.deleteMany({});
+  await prisma.leaveBalance.deleteMany({});
+  await prisma.notification.deleteMany({});
+  await prisma.auditLog.deleteMany({});
+  await prisma.idempotencyKey.deleteMany({});
+  await prisma.passwordResetToken.deleteMany({});
+  await prisma.session.deleteMany({});
+  await prisma.loginAttempt.deleteMany({});
+  await prisma.reportingManagerHistory.deleteMany({});
+  await prisma.salaryStructure.deleteMany({});
+  await prisma.employee.deleteMany({ where: { id: { gt: 4 } } });
+  await prisma.leaveCodeCounter.deleteMany({});
+  await prisma.regCodeCounter.deleteMany({});
+  await prisma.encashmentCodeCounter.deleteMany({});
+  await prisma.payrollCodeCounter.deleteMany({});
+}
+
+// ── Realistic seed entry point ───────────────────────────────────────────
+
+async function seedRealisticData(): Promise<void> {
+  const marker = await prisma.employee.findUnique({
+    where: { code: REALISTIC_MARKER_CODE },
     select: { id: true },
   });
   if (marker) {
-    console.log('  [att-expanded] already seeded, skipping');
+    console.log('  [realistic] already seeded, skipping');
     return;
   }
 
-  const [adminEmp, mgrEmp, empEmp, payEmp] = await Promise.all([
-    prisma.employee.findUniqueOrThrow({ where: { email: ADMIN_EMAIL } }),
-    prisma.employee.findUniqueOrThrow({ where: { email: 'manager@triline.co.in' } }),
-    prisma.employee.findUniqueOrThrow({ where: { email: 'employee@triline.co.in' } }),
-    prisma.employee.findUniqueOrThrow({ where: { email: 'payroll@triline.co.in' } }),
-  ]);
-  const employees = [adminEmp, mgrEmp, empEmp, payEmp];
+  console.log('  [realistic] wiping dummy-owned tables…');
+  await wipeDummyOwnedTables();
 
+  // ── Resolve demo accounts (preserved by the wipe) ────────────────────────
+  const demos = await prisma.employee.findMany({
+    where: { id: { lte: 4 } },
+    select: { id: true, code: true, email: true, joinDate: true, employmentTypeId: true, reportingManagerId: true },
+  });
+  const byCode = new Map(demos.map((e) => [e.code, e]));
+  const adminEmp = byCode.get('EMP-2024-0001')!;
+  const mgrEmp = byCode.get('EMP-2024-0002')!;
+  const empEmp = byCode.get('EMP-2024-0003')!;
+  const payEmp = byCode.get('EMP-2024-0004')!;
+
+  // Master lookups
+  const depts = await prisma.department.findMany({ select: { id: true, name: true } });
+  const desigs = await prisma.designation.findMany({ select: { id: true, name: true } });
+  const deptId = new Map(depts.map((d) => [d.name, d.id]));
+  const desigId = new Map(desigs.map((d) => [d.name, d.id]));
+
+  // ── Create 20 new employees ──────────────────────────────────────────────
+  console.log('  [realistic] creating 20 employees…');
+  const sharedHash = await argon2.hash('admin@123', { type: argon2.argon2id });
+
+  type NewEmpRow = RealisticEmpSeed & { id: number; reportingManagerId: number | null };
+  const newEmps: NewEmpRow[] = [];
+  for (const r of REALISTIC_ROSTER) {
+    const emp = await prisma.employee.create({
+      data: {
+        code: r.code,
+        email: r.email,
+        name: r.name,
+        passwordHash: sharedHash,
+        roleId: r.roleId,
+        employmentTypeId: r.employmentTypeId,
+        departmentId: deptId.get(r.departmentName) ?? null,
+        designationId: desigId.get(r.designationName) ?? null,
+        genderId: r.genderId,
+        status: r.status,
+        phone: r.phone,
+        dateOfBirth: dt(r.dateOfBirth),
+        joinDate: dt(r.joinDate),
+        exitDate: r.exitDate ? dt(r.exitDate) : null,
+        mustResetPassword: false,
+        version: 0,
+      },
+    });
+    newEmps.push({ ...r, id: emp.id, reportingManagerId: null });
+  }
+
+  // Resolve reporting hierarchy
+  const codeToId = new Map<string, number>([
+    ...demos.map((d) => [d.code, d.id] as const),
+    ...newEmps.map((e) => [e.code, e.id] as const),
+  ]);
+  for (const r of newEmps) {
+    if (!r.reportsToCode) continue;
+    const managerId = codeToId.get(r.reportsToCode);
+    if (!managerId) continue;
+    if (r.status === 5) {
+      await prisma.employee.update({
+        where: { id: r.id },
+        data: { reportingManagerId: null, previousReportingManagerId: managerId },
+      });
+    } else {
+      await prisma.employee.update({
+        where: { id: r.id },
+        data: { reportingManagerId: managerId },
+      });
+      r.reportingManagerId = managerId;
+    }
+  }
+
+  // Re-fetch all employees with resolved hierarchy
+  const allEmps = await prisma.employee.findMany({
+    orderBy: { id: 'asc' },
+    select: {
+      id: true, code: true, email: true, name: true,
+      roleId: true, employmentTypeId: true, departmentId: true, designationId: true,
+      reportingManagerId: true, status: true, joinDate: true, exitDate: true,
+    },
+  });
+
+  // ── Salary structures ────────────────────────────────────────────────────
+  console.log('  [realistic] writing salary structures…');
+  const salaryRows: Prisma.SalaryStructureCreateManyInput[] = allEmps.map((e) => {
+    const r = REALISTIC_ROSTER.find((x) => x.code === e.code);
+    const monthly = r?.monthlySalaryPaise ?? DEMO_MONTHLY_SALARY_PAISE[e.code] ?? 10_00_000;
+    const split = splitSalary(monthly);
+    return {
+      employeeId: e.id,
+      basicPaise: split.basicPaise,
+      allowancesPaise: split.allowancesPaise,
+      hraPaise: split.hraPaise,
+      transportPaise: split.transportPaise,
+      otherPaise: split.otherPaise,
+      daPaise: null,
+      effectiveFrom: dt('2024-01-01'),
+      version: 0,
+    };
+  });
+  await prisma.salaryStructure.createMany({ data: salaryRows });
+
+  // ── Reporting manager history ────────────────────────────────────────────
+  console.log('  [realistic] writing reporting-manager history…');
+  const rmHistoryRows: Prisma.ReportingManagerHistoryCreateManyInput[] = [];
+  for (const e of allEmps) {
+    rmHistoryRows.push({
+      employeeId: e.id,
+      managerId: e.reportingManagerId,
+      fromDate: e.joinDate,
+      toDate: e.exitDate ?? null,
+      reasonId: 1, // Initial
+    });
+    if (e.status === 5 && e.exitDate) {
+      rmHistoryRows.push({
+        employeeId: e.id,
+        managerId: null,
+        fromDate: e.exitDate,
+        toDate: null,
+        reasonId: 3, // Exited
+      });
+    }
+  }
+  await prisma.reportingManagerHistory.createMany({ data: rmHistoryRows });
+
+  // ── Leave balances (4 accrual types × every employee) ────────────────────
+  console.log('  [realistic] writing leave balances…');
+  const ACCRUAL_TYPES = [1, 2, 3, 4]; // Annual, Sick, Casual, Unpaid
+  const balanceRows: Prisma.LeaveBalanceCreateManyInput[] = [];
+  for (const e of allEmps) {
+    for (const lt of ACCRUAL_TYPES) {
+      const quota = await prisma.leaveQuota.findUnique({
+        where: { leaveTypeId_employmentTypeId: { leaveTypeId: lt, employmentTypeId: e.employmentTypeId } },
+      });
+      const total = quota?.daysPerYear ?? 0;
+      balanceRows.push({
+        employeeId: e.id,
+        leaveTypeId: lt,
+        year: REALISTIC_YEAR,
+        daysRemaining: total,
+        daysUsed: 0,
+        daysEncashed: 0,
+        version: 0,
+      });
+    }
+  }
+  await prisma.leaveBalance.createMany({ data: balanceRows });
+
+  // ── Leave requests (30) + ledger + balance deductions ────────────────────
+  console.log('  [realistic] writing leave requests + ledger…');
+  type LR = [string, number, string, string, 1 | 2 | 3 | 4 | 5, number];
+  const leaveSeeds: LR[] = [
+    ['EMP-2024-0003', 1, '2025-11-10', '2025-11-12', 2, 0],
+    ['EMP-2024-0005', 1, '2025-11-17', '2025-11-19', 2, 2],
+    ['EMP-2024-0006', 2, '2025-12-04', '2025-12-04', 2, 8],
+    ['EMP-2024-0007', 1, '2025-12-22', '2025-12-26', 2, 13],
+    ['EMP-2024-0011', 1, '2025-12-29', '2026-01-02', 2, 13],
+    ['EMP-2024-0015', 1, '2026-01-13', '2026-01-15', 2, 9],
+    ['EMP-2024-0017', 2, '2026-01-20', '2026-01-21', 2, 8],
+    ['EMP-2024-0019', 3, '2026-01-29', '2026-01-30', 2, 17],
+    ['EMP-2024-0020', 1, '2026-02-09', '2026-02-13', 2, 11],
+    ['EMP-2024-0008', 2, '2026-02-16', '2026-02-17', 2, 8],
+    ['EMP-2024-0010', 1, '2026-03-02', '2026-03-04', 2, 10],
+    ['EMP-2024-0016', 1, '2026-03-09', '2026-03-13', 3, 12],
+    ['EMP-2024-0013', 1, '2026-03-23', '2026-03-25', 2, 3],
+    ['EMP-2024-0005', 3, '2026-04-06', '2026-04-07', 2, 17],
+    ['EMP-2024-0012', 1, '2026-04-13', '2026-04-17', 2, 19],
+    ['EMP-2024-0006', 1, '2026-04-20', '2026-04-22', 4, 5],
+    ['EMP-2024-0014', 1, '2026-04-27', '2026-04-30', 2, 4],
+    ['EMP-2024-0003', 2, '2026-05-04', '2026-05-05', 2, 8],
+    ['EMP-2024-0007', 1, '2026-05-08', '2026-05-08', 2, 17],
+    ['EMP-2024-0020', 3, '2026-05-11', '2026-05-11', 2, 17],
+    ['EMP-2024-0018', 1, '2026-05-14', '2026-05-15', 1, 18],
+    ['EMP-2024-0011', 2, '2026-05-15', '2026-05-15', 1, 7],
+    ['EMP-2024-0015', 1, '2026-05-18', '2026-05-22', 1, 3],
+    ['EMP-2024-0022', 1, '2026-05-25', '2026-05-29', 1, 6],
+    ['EMP-2024-0010', 1, '2026-05-26', '2026-05-27', 1, 0],
+    ['EMP-2024-0007', 1, '2026-04-20', '2026-04-24', 5, 4],
+    ['EMP-2024-0014', 1, '2026-04-13', '2026-04-15', 5, 15],
+    ['EMP-2024-0016', 3, '2026-05-04', '2026-05-04', 3, 7],
+    ['EMP-2024-0009', 3, '2026-04-27', '2026-04-27', 4, 17],
+    ['EMP-2024-0024', 1, '2026-05-04', '2026-05-08', 3, 12],
+  ];
+
+  let lCounter = 0;
+  for (const [empCode, leaveTypeId, fromStr, toStr, status, reasonIdx] of leaveSeeds) {
+    lCounter++;
+    const emp = allEmps.find((e) => e.code === empCode);
+    if (!emp) continue;
+    const managerId = emp.reportingManagerId ?? adminEmp.id;
+    const fromDate = dt(fromStr);
+    const toDate = dt(toStr);
+    const days = daysBetween(fromDate, toDate);
+
+    const eventBased = leaveTypeId === 5 || leaveTypeId === 6;
+    const routedToId: 1 | 2 = eventBased || managerId === adminEmp.id ? 2 : 1;
+    const approverId = routedToId === 1 ? managerId : adminEmp.id;
+    const decided = status === 2 || status === 3 || status === 4;
+    const submittedAt = addDays(fromDate, -7);
+    const decidedAt = decided ? addDays(submittedAt, 2) : null;
+
+    const decisionNote =
+      status === 2 ? APPROVAL_NOTES[lCounter % APPROVAL_NOTES.length]!
+      : status === 3 ? REJECTION_NOTES[lCounter % REJECTION_NOTES.length]!
+      : null;
+
+    const deductedDays = status === 2 ? days : 0;
+    const restoredDays = status === 4 ? days : 0;
+
+    const code = `L-${REALISTIC_YEAR}-${String(lCounter).padStart(4, '0')}`;
+
+    const created = await prisma.leaveRequest.create({
+      data: {
+        code,
+        employeeId: emp.id,
+        leaveTypeId,
+        fromDate,
+        toDate,
+        days,
+        reason: LEAVE_REASONS[reasonIdx] ?? LEAVE_REASONS[0]!,
+        status,
+        routedToId,
+        approverId: status === 4 && !decidedAt ? null : approverId,
+        decidedAt,
+        decidedBy: decided ? approverId : null,
+        decisionNote,
+        escalatedAt: status === 5 ? addDays(submittedAt, 5) : null,
+        cancelledAt: status === 4 ? addDays(submittedAt, 3) : null,
+        cancelledBy: status === 4 ? emp.id : null,
+        cancelledAfterStart: false,
+        deductedDays,
+        restoredDays,
+        createdAt: submittedAt,
+        updatedAt: decidedAt ?? submittedAt,
+        version: 0,
+      },
+    });
+
+    if (status === 2) {
+      await prisma.leaveBalanceLedger.create({
+        data: {
+          employeeId: emp.id,
+          leaveTypeId,
+          year: REALISTIC_YEAR,
+          delta: -days,
+          reasonId: 2, // Approval
+          relatedRequestId: created.id,
+          createdBy: approverId,
+          createdAt: decidedAt!,
+        },
+      });
+      await prisma.leaveBalance.updateMany({
+        where: { employeeId: emp.id, leaveTypeId, year: REALISTIC_YEAR },
+        data: {
+          daysRemaining: { decrement: days },
+          daysUsed: { increment: days },
+        },
+      });
+    }
+  }
+
+  // Initial allocation ledger entries (post-deductions snapshot)
+  const initialLedgerRows: Prisma.LeaveBalanceLedgerCreateManyInput[] = [];
+  for (const e of allEmps) {
+    for (const lt of ACCRUAL_TYPES) {
+      const bal = await prisma.leaveBalance.findUnique({
+        where: { employeeId_leaveTypeId_year: { employeeId: e.id, leaveTypeId: lt, year: REALISTIC_YEAR } },
+      });
+      if (!bal) continue;
+      initialLedgerRows.push({
+        employeeId: e.id,
+        leaveTypeId: lt,
+        year: REALISTIC_YEAR,
+        delta: bal.daysRemaining + bal.daysUsed,
+        reasonId: 1, // Initial
+        relatedRequestId: null,
+        createdBy: null,
+        createdAt: dt('2026-01-01'),
+      });
+    }
+  }
+  await prisma.leaveBalanceLedger.createMany({ data: initialLedgerRows });
+
+  // ── Attendance — Apr 1 to May 13, skip approved-leave dates ─────────────
+  console.log('  [realistic] writing attendance records…');
+  const FROM = dt('2026-04-01');
+  const TO = dt('2026-05-13');
   const holidays = await prisma.holiday.findMany({ select: { date: true } });
   const holidayKeys = new Set(holidays.map((h) => h.date.toISOString().slice(0, 10)));
 
-  type Row = {
-    employeeId: number;
-    date: Date;
-    status: number;
-    checkInTime: Date | null;
-    checkOutTime: Date | null;
-    hoursWorkedMinutes: number | null;
-    late: boolean;
-    lateMonthCount: number;
-    lopApplied: boolean;
-    sourceId: number;
-  };
-  const rows: Row[] = [];
+  const approvedLeaves = await prisma.leaveRequest.findMany({
+    where: { status: 2 },
+    select: { employeeId: true, fromDate: true, toDate: true },
+  });
+  const onLeaveKeys = new Set<string>();
+  for (const l of approvedLeaves) {
+    for (let d = new Date(l.fromDate); d <= l.toDate; d = addDays(d, 1)) {
+      onLeaveKeys.add(`${l.employeeId}|${d.toISOString().slice(0, 10)}`);
+    }
+  }
 
+  const attRows: Prisma.AttendanceRecordCreateManyInput[] = [];
   let cellIdx = 0;
-  for (
-    let d = new Date(EXPANDED_FROM);
-    d <= EXPANDED_TO;
-    d.setUTCDate(d.getUTCDate() + 1)
-  ) {
+  for (let d = new Date(FROM); d <= TO; d = addDays(d, 1)) {
     const dow = d.getUTCDay();
-    if (dow === 0 || dow === 6) continue; // skip Sat/Sun
+    if (dow === 0 || dow === 6) continue;
     const key = d.toISOString().slice(0, 10);
     if (holidayKeys.has(key)) continue;
+    for (const e of allEmps) {
+      if (d < e.joinDate) continue;
+      if (e.exitDate && d > e.exitDate) continue;
+      if (e.status === 5) continue;
 
-    for (const emp of employees) {
       cellIdx++;
-      // 10-cell rotation: 0=Absent, 1=OnLeave, 2..9=Present (8 = late present)
-      const slot = cellIdx % 10;
+      const empLeaveKey = `${e.id}|${key}`;
       let status: number;
       let late = false;
       let checkIn: Date | null = null;
       let checkOut: Date | null = null;
       let hours: number | null = null;
 
-      if (slot === 0) {
-        status = 2; // Absent
-      } else if (slot === 1) {
+      if (onLeaveKeys.has(empLeaveKey)) {
         status = 3; // OnLeave
       } else {
-        status = 1; // Present
-        const isLate = slot === 8 || slot === 9; // 20% of present
-        const lateMin = isLate ? 45 : 0; // 11:15 IST when late
-        late = isLate;
-        // Check-in at 09:00 IST (03:30 UTC), check-out at 18:00 IST (12:30 UTC)
-        const dayBase = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
-        checkIn  = new Date(dayBase.getTime() + (3 * 60 + 30 + lateMin) * 60_000);
-        checkOut = new Date(dayBase.getTime() + (12 * 60 + 30) * 60_000);
-        hours = 540 - lateMin; // 9h minus the late minutes
+        const slot = cellIdx % 100;
+        if (slot < 3) {
+          status = 2; // Absent
+        } else {
+          status = 1; // Present
+          late = slot >= 95; // ~5% late
+          const lateMin = late ? 45 : 0;
+          const dayBase = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
+          checkIn = new Date(dayBase.getTime() + (3 * 60 + 30 + lateMin) * 60_000);
+          checkOut = new Date(dayBase.getTime() + (12 * 60 + 30) * 60_000);
+          hours = 540 - lateMin;
+        }
       }
 
-      rows.push({
-        employeeId: emp.id,
-        date: new Date(d.getTime()), // clone, loop mutates `d`
+      attRows.push({
+        employeeId: e.id,
+        date: new Date(d.getTime()),
         status,
         checkInTime: checkIn,
         checkOutTime: checkOut,
         hoursWorkedMinutes: hours,
         late,
-        lateMonthCount: 0, // denorm cache; left at 0 for seed data
-        lopApplied: false,
-        sourceId: 1, // system
+        lateMonthCount: 0,
+        lopApplied: status === 2,
+        sourceId: 1,
+      });
+    }
+  }
+  await prisma.attendanceRecord.createMany({ data: attRows });
+
+  // Attendance late ledger (derived from attendance rows)
+  console.log('  [realistic] writing attendance late ledger…');
+  const lateByEmpMonth = new Map<string, number>();
+  for (const a of attRows) {
+    if (!a.late) continue;
+    const adate = a.date as Date;
+    const m = adate.getUTCMonth() + 1;
+    const y = adate.getUTCFullYear();
+    const key = `${a.employeeId}|${y}|${m}`;
+    lateByEmpMonth.set(key, (lateByEmpMonth.get(key) ?? 0) + 1);
+  }
+  const lateLedgerRows: Prisma.AttendanceLateLedgerCreateManyInput[] = [];
+  for (const [key, count] of lateByEmpMonth.entries()) {
+    const [empIdStr, yStr, mStr] = key.split('|');
+    lateLedgerRows.push({
+      employeeId: Number(empIdStr),
+      year: Number(yStr),
+      month: Number(mStr),
+      count,
+    });
+  }
+  if (lateLedgerRows.length) {
+    await prisma.attendanceLateLedger.createMany({ data: lateLedgerRows });
+  }
+
+  // ── Regularisations (12) ─────────────────────────────────────────────────
+  console.log('  [realistic] writing regularisations…');
+  type RR = [string, string, 1 | 2 | 3, number];
+  const REG_REASONS = [
+    'VPN was down on our segment — submitted by 9:30 over LTE but punch failed.',
+    'Client call ran past 6 PM, forgot to punch out before leaving for the day.',
+    'Came in via the side entrance — biometric reader was offline.',
+    'Was on a customer site visit; missed the in-office check-in.',
+    'Internet outage at home affected the WFH check-in.',
+    'Punched in early at 8:45 but the system shows no record — see CCTV if needed.',
+    'Power outage in the office at 9 AM, punched in once UPS kicked in.',
+    'Forgot phone at home; punched out manually from my desktop later.',
+  ];
+  const regSeeds: RR[] = [
+    ['EMP-2024-0003', '2026-04-21', 2, 0],
+    ['EMP-2024-0005', '2026-04-23', 2, 1],
+    ['EMP-2024-0006', '2026-04-28', 2, 2],
+    ['EMP-2024-0007', '2026-05-04', 2, 3],
+    ['EMP-2024-0011', '2026-05-06', 2, 4],
+    ['EMP-2024-0015', '2026-05-07', 2, 5],
+    ['EMP-2024-0010', '2026-04-08', 2, 6],
+    ['EMP-2024-0013', '2026-05-08', 1, 7],
+    ['EMP-2024-0019', '2026-05-11', 1, 0],
+    ['EMP-2024-0020', '2026-05-12', 1, 1],
+    ['EMP-2024-0008', '2026-05-05', 3, 6],
+    ['EMP-2024-0016', '2026-04-30', 3, 2],
+  ];
+
+  for (let i = 0; i < regSeeds.length; i++) {
+    const [empCode, dateStr, status, reasonIdx] = regSeeds[i]!;
+    const emp = allEmps.find((e) => e.code === empCode)!;
+    const managerId = emp.reportingManagerId ?? adminEmp.id;
+    const regDate = dt(dateStr);
+    const submitAt = addDays(regDate, 1);
+    const ageDays = Math.max(1, Math.round((submitAt.getTime() - regDate.getTime()) / 86_400_000));
+    const routedToId: 1 | 2 = ageDays > 7 ? 2 : 1;
+    const approverId = routedToId === 1 ? managerId : adminEmp.id;
+    const decided = status === 2 || status === 3;
+    const decidedAt = decided ? addDays(submitAt, 2) : null;
+
+    await prisma.regularisationRequest.create({
+      data: {
+        code: `R-${REALISTIC_YEAR}-${String(i + 1).padStart(4, '0')}`,
+        employeeId: emp.id,
+        date: regDate,
+        proposedCheckIn: new Date(regDate.getTime() + (3 * 60 + 30) * 60_000),
+        proposedCheckOut: new Date(regDate.getTime() + (12 * 60 + 30) * 60_000),
+        reason: REG_REASONS[reasonIdx] ?? REG_REASONS[0]!,
+        status,
+        routedToId,
+        ageDaysAtSubmit: ageDays,
+        approverId: status === 1 ? approverId : (decided ? approverId : null),
+        decidedAt,
+        decidedBy: decided ? approverId : null,
+        decisionNote: status === 3 ? 'Insufficient evidence — please raise within 7 days next time.' : null,
+        correctedRecordId: null,
+        version: 0,
+        createdAt: submitAt,
+        updatedAt: decidedAt ?? submitAt,
+      },
+    });
+  }
+
+  // ── Leave encashments (6, Dec 2025 window) ───────────────────────────────
+  console.log('  [realistic] writing leave encashments…');
+  type LE = [string, number, 1 | 2 | 3 | 4 | 5 | 6];
+  const encSeeds: LE[] = [
+    ['EMP-2024-0003', 4, 4],
+    ['EMP-2024-0005', 3, 4],
+    ['EMP-2024-0006', 5, 4],
+    ['EMP-2024-0010', 6, 3],
+    ['EMP-2024-0015', 4, 5],
+    ['EMP-2024-0011', 3, 6],
+  ];
+  for (let i = 0; i < encSeeds.length; i++) {
+    const [empCode, daysReq, status] = encSeeds[i]!;
+    const emp = allEmps.find((e) => e.code === empCode)!;
+    const managerId = emp.reportingManagerId ?? adminEmp.id;
+    const routedToId: 1 | 2 = status === 1 ? 1 : 2;
+    const approverId = status === 1 ? managerId : adminEmp.id;
+    const decided = status !== 1;
+    const submitAt = dt('2025-12-10');
+    const decidedAt = decided ? dt('2025-12-15') : null;
+    const daysApp = status >= 3 && status <= 4 ? daysReq : null;
+    const rate = daysApp ? 200_000 : null;
+    await prisma.leaveEncashment.create({
+      data: {
+        code: `LE-2025-${String(i + 1).padStart(4, '0')}`,
+        employeeId: emp.id,
+        year: 2025,
+        daysRequested: daysReq,
+        daysApproved: daysApp,
+        ratePerDayPaise: rate,
+        amountPaise: daysApp && rate ? daysApp * rate : null,
+        status,
+        routedToId,
+        approverId: decided ? approverId : managerId,
+        decidedAt,
+        decidedBy: decided ? approverId : null,
+        decisionNote: status === 5 ? 'Insufficient remaining balance after Dec payroll deductions.' : null,
+        escalatedAt: null,
+        paidAt: status === 4 ? dt('2025-12-31') : null,
+        cancelledAt: status === 6 ? dt('2025-12-20') : null,
+        cancelledBy: status === 6 ? emp.id : null,
+        version: 0,
+        createdAt: submitAt,
+        updatedAt: decidedAt ?? submitAt,
+      },
+    });
+  }
+
+  // ── Payroll runs + payslips (Jan–May 2026) ───────────────────────────────
+  console.log('  [realistic] writing payroll runs + payslips…');
+  const runMonths = [1, 2, 3, 4, 5];
+  for (const m of runMonths) {
+    const finalised = m <= 4;
+    const periodStart = new Date(Date.UTC(REALISTIC_YEAR, m - 1, 1));
+    const periodEnd = new Date(Date.UTC(REALISTIC_YEAR, m, 0));
+    const run = await prisma.payrollRun.create({
+      data: {
+        code: `RUN-${REALISTIC_YEAR}-${String(m).padStart(2, '0')}`,
+        month: m,
+        year: REALISTIC_YEAR,
+        status: finalised ? 3 : 2,
+        workingDays: 22,
+        periodStart,
+        periodEnd,
+        initiatedBy: payEmp.id,
+        initiatedAt: new Date(periodEnd.getTime() - 86_400_000),
+        finalisedBy: finalised ? adminEmp.id : null,
+        finalisedAt: finalised ? new Date(periodEnd.getTime() + 86_400_000) : null,
+      },
+    });
+
+    let payslipSeq = 0;
+    for (const e of allEmps) {
+      if (e.joinDate > periodEnd) continue;
+      if (e.exitDate && e.exitDate < periodStart) continue;
+
+      const salary = await prisma.salaryStructure.findFirst({
+        where: { employeeId: e.id },
+        orderBy: { effectiveFrom: 'desc' },
+      });
+      if (!salary) continue;
+
+      const lopCount = await prisma.attendanceRecord.count({
+        where: {
+          employeeId: e.id,
+          date: { gte: periodStart, lte: periodEnd },
+          status: 2,
+          lopApplied: true,
+        },
+      });
+      const workingDays = 22;
+      const basic = salary.basicPaise;
+      const allow = salary.allowancesPaise;
+      const monthlyTotal = basic + allow;
+      const lopDeduction = lopCount > 0 ? Math.round((monthlyTotal / workingDays) * lopCount) : 0;
+      const daysWorked = workingDays - lopCount;
+      const gross = monthlyTotal - lopDeduction;
+      const tax = Math.round(gross * 0.095);
+      const otherDeductions = Math.round(monthlyTotal * 0.02);
+      const net = gross - tax - otherDeductions;
+
+      payslipSeq++;
+      await prisma.payslip.create({
+        data: {
+          code: `P-${REALISTIC_YEAR}-${String(m).padStart(2, '0')}-${String(payslipSeq).padStart(4, '0')}`,
+          runId: run.id,
+          employeeId: e.id,
+          month: m,
+          year: REALISTIC_YEAR,
+          status: finalised ? 3 : 2,
+          periodStart,
+          periodEnd,
+          workingDays,
+          daysWorked,
+          lopDays: lopCount,
+          basicPaise: basic,
+          allowancesPaise: allow,
+          grossPaise: gross,
+          lopDeductionPaise: lopDeduction,
+          referenceTaxPaise: tax,
+          finalTaxPaise: tax,
+          otherDeductionsPaise: otherDeductions,
+          netPayPaise: net,
+          finalisedAt: finalised ? run.finalisedAt : null,
+        },
       });
     }
   }
 
-  const result = await prisma.attendanceRecord.createMany({
-    data: rows,
-    skipDuplicates: true,
+  // ── Performance cycles + reviews + goals ─────────────────────────────────
+  console.log('  [realistic] writing performance cycles, reviews, goals…');
+  const closedCycle = await prisma.performanceCycle.create({
+    data: {
+      code: 'C-2025-H2',
+      fyStart: dt('2025-10-01'),
+      fyEnd: dt('2026-03-31'),
+      status: 4,
+      selfReviewDeadline: dt('2026-02-15'),
+      managerReviewDeadline: dt('2026-03-01'),
+      closedAt: dt('2026-03-05T00:00:00Z'),
+      closedBy: adminEmp.id,
+      createdBy: adminEmp.id,
+      createdAt: dt('2025-10-01'),
+    },
+  });
+  const openCycle = await prisma.performanceCycle.create({
+    data: {
+      code: 'C-2026-H1',
+      fyStart: dt('2026-04-01'),
+      fyEnd: dt('2026-09-30'),
+      status: 1,
+      selfReviewDeadline: dt('2026-08-15'),
+      managerReviewDeadline: dt('2026-09-01'),
+      createdBy: adminEmp.id,
+      createdAt: dt('2026-04-01'),
+    },
   });
 
-  console.log(
-    `  [att-expanded] inserted ${result.count} rows (attempted ${rows.length}; ` +
-      `${rows.length - result.count} skipped as duplicates)`,
-  );
+  const GOAL_TEMPLATES = [
+    'Ship the v2 frontend rewrite for the assigned module.',
+    'Reduce p95 API latency on the relevant endpoint by 30%.',
+    'Mentor at least one junior engineer through a complete feature delivery.',
+    'Close all P1 bugs reported in the previous cycle.',
+    'Publish a design system component pattern adopted by the team.',
+    'Lead the discovery for one major customer-facing initiative.',
+    'Close 8 enterprise deals worth ₹2 Cr+ ARR each.',
+    'Run two onsite client workshops in the assigned region.',
+    'Onboard 3 new hires through a structured 30-day plan.',
+    'Reduce monthly payroll-run reconciliation time from 4 hrs to 30 min.',
+    'Drive the SOC 2 Type I audit prep to completion.',
+    'Establish a quarterly hiring cadence with the recruiting team.',
+    'Achieve <5% missed deliverables across goals set this cycle.',
+    'Increase self-served onboarding completion rate to 80%.',
+    'Reduce average ticket resolution time by 25%.',
+  ];
+
+  const closedEligible = allEmps.filter((e) => e.joinDate <= dt('2025-10-01'));
+  for (let i = 0; i < closedEligible.length; i++) {
+    const e = closedEligible[i]!;
+    const managerId = e.reportingManagerId ?? adminEmp.id;
+    const selfR = 3 + (i % 3);
+    const mgrR = Math.min(5, Math.max(2, selfR + ((i % 3) - 1)));
+    const review = await prisma.performanceReview.create({
+      data: {
+        cycleId: closedCycle.id,
+        employeeId: e.id,
+        managerId,
+        selfRating: selfR,
+        selfNote: 'Met all major objectives this cycle; some scope creep on Q2 deliverables.',
+        managerRating: mgrR,
+        managerNote: 'Solid contribution overall. Continue building on the leadership behaviours.',
+        managerOverrodeSelf: mgrR !== selfR,
+        finalRating: mgrR,
+        lockedAt: closedCycle.closedAt,
+      },
+    });
+    for (let g = 0; g < 3; g++) {
+      await prisma.goal.create({
+        data: {
+          reviewId: review.id,
+          text: GOAL_TEMPLATES[(i * 3 + g) % GOAL_TEMPLATES.length]!,
+          outcomeId: ((g + i) % 3) + 2,
+          proposedByEmployee: g === 2,
+        },
+      });
+    }
+  }
+
+  const openEligible = allEmps.filter((e) => e.joinDate <= dt('2026-04-01') && e.status !== 5);
+  for (let i = 0; i < openEligible.length; i++) {
+    const e = openEligible[i]!;
+    const managerId = e.reportingManagerId ?? adminEmp.id;
+    const hasSelf = i % 2 === 0;
+    const review = await prisma.performanceReview.create({
+      data: {
+        cycleId: openCycle.id,
+        employeeId: e.id,
+        managerId,
+        selfRating: hasSelf ? 4 - (i % 2) : null,
+        selfNote: hasSelf ? 'On track for cycle goals; will deepen the platform work in Q3.' : null,
+        managerRating: null,
+        managerNote: null,
+        managerOverrodeSelf: false,
+        finalRating: null,
+        lockedAt: null,
+      },
+    });
+    for (let g = 0; g < 3; g++) {
+      await prisma.goal.create({
+        data: {
+          reviewId: review.id,
+          text: GOAL_TEMPLATES[(i * 3 + g + 7) % GOAL_TEMPLATES.length]!,
+          outcomeId: 1,
+          proposedByEmployee: false,
+        },
+      });
+    }
+  }
+
+  // ── Notifications ────────────────────────────────────────────────────────
+  console.log('  [realistic] writing notifications…');
+  const decidedLeaves = await prisma.leaveRequest.findMany({
+    where: { status: { in: [2, 3, 5] } },
+    orderBy: { id: 'asc' },
+  });
+  const notifRows: Prisma.NotificationCreateManyInput[] = [];
+  for (const l of decidedLeaves) {
+    notifRows.push({
+      recipientId: l.employeeId,
+      categoryId: 1,
+      title:
+        l.status === 2 ? `Leave ${l.code} approved`
+        : l.status === 3 ? `Leave ${l.code} rejected`
+        : `Leave ${l.code} escalated to Admin`,
+      body:
+        l.status === 2 ? `Your leave from ${l.fromDate.toISOString().slice(0, 10)} to ${l.toDate.toISOString().slice(0, 10)} has been approved.`
+        : l.status === 3 ? `Your leave was rejected. Note: ${l.decisionNote ?? 'no comment'}.`
+        : `Pending for >5 working days; routed to Admin queue.`,
+      link: `/employee/leave/${l.code}`,
+      unread: false,
+      createdAt: l.decidedAt ?? l.escalatedAt ?? l.createdAt,
+    });
+  }
+  const aprilRun = await prisma.payrollRun.findFirst({ where: { month: 4, year: REALISTIC_YEAR } });
+  if (aprilRun) {
+    const payslips = await prisma.payslip.findMany({
+      where: { runId: aprilRun.id },
+      select: { id: true, employeeId: true, netPayPaise: true },
+      take: 24,
+    });
+    for (const p of payslips) {
+      notifRows.push({
+        recipientId: p.employeeId,
+        categoryId: 3,
+        title: 'April 2026 payslip ready',
+        body: `Your payslip for April 2026 is ready. Net pay: ₹${(p.netPayPaise / 100).toLocaleString('en-IN')}.`,
+        link: `/employee/payslips/${p.id}`,
+        unread: true,
+        createdAt: aprilRun.finalisedAt ?? aprilRun.initiatedAt,
+      });
+    }
+  }
+  await prisma.notification.createMany({ data: notifRows });
+
+  // ── Audit log — coherent actors + roles + IPs ────────────────────────────
+  console.log('  [realistic] writing audit log…');
+  const OFFICE_IP = '192.168.1.';
+  const REMOTE_IP = '49.205.';
+  const roleIdByEmp = new Map<number, number>(allEmps.map((e) => [e.id, e.roleId]));
+  const auditRows: Prisma.AuditLogCreateManyInput[] = [];
+
+  let ipCounter = 1;
+  for (let day = 13; day >= 0; day--) {
+    for (const e of allEmps.slice(0, 12)) {
+      const at = new Date(Date.now() - day * 86_400_000 - (ipCounter * 13) * 60_000);
+      auditRows.push({
+        actorId: e.id,
+        actorRoleId: roleIdByEmp.get(e.id) ?? 1,
+        actorIp: ipCounter % 5 === 0 ? `${REMOTE_IP}${100 + ipCounter}.${ipCounter % 254}` : `${OFFICE_IP}${50 + (ipCounter % 50)}`,
+        action: 'auth.login.success',
+        targetTypeId: 1,
+        targetId: e.id,
+        moduleId: 1,
+        before: Prisma.JsonNull,
+        after: { sessionId: ipCounter },
+        createdAt: at,
+      });
+      ipCounter++;
+    }
+  }
+  const allLeaves = await prisma.leaveRequest.findMany({ orderBy: { id: 'asc' } });
+  for (const l of allLeaves) {
+    auditRows.push({
+      actorId: l.employeeId,
+      actorRoleId: roleIdByEmp.get(l.employeeId) ?? 1,
+      actorIp: `${OFFICE_IP}${50 + (l.id % 50)}`,
+      action: 'leave.create',
+      targetTypeId: 2,
+      targetId: l.id,
+      moduleId: 3,
+      before: Prisma.JsonNull,
+      after: { code: l.code, leaveTypeId: l.leaveTypeId, days: l.days, status: 1 },
+      createdAt: l.createdAt,
+    });
+    if (l.status === 2 || l.status === 3) {
+      const decider = l.decidedBy ?? l.approverId ?? adminEmp.id;
+      auditRows.push({
+        actorId: decider,
+        actorRoleId: roleIdByEmp.get(decider) ?? 2,
+        actorIp: `${OFFICE_IP}${50 + (l.id % 50)}`,
+        action: l.status === 2 ? 'leave.approve' : 'leave.reject',
+        targetTypeId: 2,
+        targetId: l.id,
+        moduleId: 3,
+        before: { status: 1 },
+        after: { status: l.status, decidedBy: l.decidedBy, decisionNote: l.decisionNote },
+        createdAt: l.decidedAt ?? l.updatedAt,
+      });
+    }
+  }
+  const allRuns = await prisma.payrollRun.findMany({ orderBy: { id: 'asc' } });
+  for (const r of allRuns) {
+    auditRows.push({
+      actorId: r.initiatedBy,
+      actorRoleId: 3,
+      actorIp: `${OFFICE_IP}80`,
+      action: 'payroll.run.create',
+      targetTypeId: 6,
+      targetId: r.id,
+      moduleId: 4,
+      before: Prisma.JsonNull,
+      after: { code: r.code, month: r.month, year: r.year, status: r.status },
+      createdAt: r.initiatedAt,
+    });
+    if (r.status === 3 && r.finalisedBy) {
+      auditRows.push({
+        actorId: r.finalisedBy,
+        actorRoleId: 4,
+        actorIp: `${OFFICE_IP}81`,
+        action: 'payroll.run.finalise',
+        targetTypeId: 6,
+        targetId: r.id,
+        moduleId: 4,
+        before: { status: 2 },
+        after: { status: 3, finalisedAt: r.finalisedAt?.toISOString() },
+        createdAt: r.finalisedAt!,
+      });
+    }
+  }
+  await prisma.auditLog.createMany({ data: auditRows });
+
+  // ── Sessions / login attempts / reset tokens ─────────────────────────────
+  console.log('  [realistic] writing sessions, login attempts, reset tokens…');
+  const sessionUserAgents = [
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605 Version/17.5 Safari/605',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Gecko/20100101 Firefox/127',
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605 Version/17.5 Safari/605',
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127 Safari/537.36',
+  ];
+  const sessionTargets = [
+    adminEmp.id, mgrEmp.id, empEmp.id, payEmp.id,
+    allEmps.find((e) => e.code === 'EMP-2024-0010')!.id,
+    allEmps.find((e) => e.code === 'EMP-2024-0015')!.id,
+  ];
+  await prisma.session.createMany({
+    data: sessionTargets.map((eid, i) => ({
+      token: crypto.randomBytes(32).toString('hex'),
+      employeeId: eid,
+      ip: `${OFFICE_IP}${60 + i}`,
+      userAgent: sessionUserAgents[i] ?? sessionUserAgents[0]!,
+      expiresAt: new Date(Date.now() + 7 * 86_400_000),
+      createdAt: new Date(Date.now() - i * 3600_000),
+    })),
+  });
+
+  const loginEmps = allEmps.slice(0, 12);
+  const attempts: Prisma.LoginAttemptCreateManyInput[] = [];
+  for (let i = 0; i < 30; i++) {
+    const e = loginEmps[i % loginEmps.length]!;
+    const isFailure = i === 7 || i === 19 || i === 25;
+    attempts.push({
+      email: isFailure ? `${e.email.split('@')[0]}.x@triline.co.in` : e.email,
+      ip: `${OFFICE_IP}${50 + (i % 50)}`,
+      success: !isFailure,
+      employeeId: isFailure ? null : e.id,
+      createdAt: new Date(Date.now() - i * 6 * 3600_000),
+    });
+  }
+  await prisma.loginAttempt.createMany({ data: attempts });
+
+  const pooja = allEmps.find((e) => e.code === 'EMP-2024-0008')!;
+  const suresh = allEmps.find((e) => e.code === 'EMP-2024-0023')!;
+  const aditya = allEmps.find((e) => e.code === 'EMP-2024-0005')!;
+  await prisma.passwordResetToken.createMany({
+    data: [
+      { tokenHash: crypto.createHash('sha256').update('reset-pooja-first-login').digest('hex'), employeeId: pooja.id, purposeId: 1, expiresAt: new Date(Date.now() + 5 * 86_400_000), usedAt: null, createdAt: new Date(Date.now() - 2 * 86_400_000) },
+      { tokenHash: crypto.createHash('sha256').update('reset-suresh-first-login').digest('hex'), employeeId: suresh.id, purposeId: 1, expiresAt: new Date(Date.now() + 2 * 86_400_000), usedAt: null, createdAt: new Date(Date.now() - 5 * 86_400_000) },
+      { tokenHash: crypto.createHash('sha256').update('reset-aditya-self').digest('hex'), employeeId: aditya.id, purposeId: 2, expiresAt: new Date(Date.now() + 1 * 3600_000), usedAt: null, createdAt: new Date(Date.now() - 6 * 3600_000) },
+    ],
+  });
+
+  // ── Update code counters to match the highest codes used ─────────────────
+  await prisma.leaveCodeCounter.create({ data: { year: REALISTIC_YEAR, number: leaveSeeds.length } });
+  await prisma.regCodeCounter.create({ data: { year: REALISTIC_YEAR, number: regSeeds.length } });
+  await prisma.encashmentCodeCounter.create({ data: { year: 2025, number: encSeeds.length } });
+  for (const m of runMonths) {
+    const c = await prisma.payslip.count({ where: { year: REALISTIC_YEAR, month: m } });
+    await prisma.payrollCodeCounter.create({ data: { year: REALISTIC_YEAR, month: m, number: c } });
+  }
+
+  const payslipCount = await prisma.payslip.count();
+  console.log('  [realistic] seed complete:');
+  console.log(`              employees: ${allEmps.length}  leave_requests: ${leaveSeeds.length}  regularisations: ${regSeeds.length}`);
+  console.log(`              encashments: ${encSeeds.length}  payroll_runs: ${runMonths.length}  payslips: ${payslipCount}`);
+  console.log(`              attendance: ${attRows.length}  notifications: ${notifRows.length}  audit_log: ${auditRows.length}`);
 }
 
 // ── Entry point ──────────────────────────────────────────────────────────────
@@ -984,11 +1465,8 @@ async function main() {
   console.log('• Demo accounts');
   await seedDemoAccounts();
 
-  console.log('• Dummy data');
-  await seedDummyData();
-
-  console.log('• Expanded attendance');
-  await seedExpandedAttendance();
+  console.log('• Realistic data');
+  await seedRealisticData();
 
   console.log('Seed complete.');
 }
