@@ -15,7 +15,7 @@
  *   7. LeaveBalance rows for each demo employee × leave type × current year
  */
 
-import { PrismaClient } from '@prisma/client';
+import { Prisma, PrismaClient } from '@prisma/client';
 import argon2 from 'argon2';
 import dotenv from 'dotenv';
 import path from 'path';
@@ -820,7 +820,9 @@ async function seedDummyData(): Promise<void> {
       moduleId: a.moduleId,
       targetTypeId: a.targetTypeId,
       targetId: (i % 20) + 1,
-      before: null,
+      // Prisma needs the explicit JsonNull sentinel for nullable Json columns
+      // (bare `null` is rejected — could mean either SQL NULL or JSON `null`).
+      before: Prisma.JsonNull,
       after: { sample: true, n: i },
       createdAt: new Date(now.getTime() - (20 - i) * 600_000),
     })),
