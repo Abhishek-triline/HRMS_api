@@ -649,7 +649,7 @@ async function seedDummyData(): Promise<void> {
   });
 
   // Payslips: 5 runs × 4 employees = 20
-  const payslips: Array<Parameters<typeof prisma.payslip.createMany>[0]['data']> = [];
+  const payslips: Prisma.PayslipCreateManyInput[] = [];
   let psIdx = 0;
   for (const run of runs) {
     for (const emp of employees) {
@@ -681,12 +681,10 @@ async function seedDummyData(): Promise<void> {
         otherDeductionsPaise: other,
         netPayPaise: net,
         finalisedAt: run.finalisedAt,
-      } as never);
+      });
     }
   }
-  for (const p of payslips) {
-    await prisma.payslip.create({ data: p as never });
-  }
+  await prisma.payslip.createMany({ data: payslips });
 
   // ── performance_cycles (2) + reviews (8) + goals (20) ─────────────────────
   await prisma.performanceCycle.createMany({
