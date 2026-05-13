@@ -405,7 +405,10 @@ model LeaveRequest {
   createdAt           DateTime  @default(now()) @map("created_at")
   updatedAt           DateTime  @updatedAt @map("updated_at")
 
-  @@index([employeeId, status])
+  // Composite covering the BL-026 leave-overlap query (per-employee +
+  // status + date range). The earlier 2-column [employeeId, status] index
+  // is a left-prefix of this one, so it's been dropped.
+  @@index([employeeId, status, fromDate, toDate])
   @@index([approverId, status])
   @@index([status, escalatedAt])
   @@map("leave_requests")
