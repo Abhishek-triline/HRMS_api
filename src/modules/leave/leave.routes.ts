@@ -74,7 +74,8 @@ function formatRequest(
     code: string;
     employeeId: number;
     employee: { name: string; code: string };
-    leaveType: { id?: number; name: string };
+    leaveTypeId: number;
+    leaveType: { name: string };
     fromDate: Date;
     toDate: Date;
     days: number;
@@ -105,7 +106,7 @@ function formatRequest(
     employeeId: req.employeeId,
     employeeName: req.employee.name,
     employeeCode: req.employee.code,
-    leaveTypeId: req.leaveType.id ?? 0,
+    leaveTypeId: req.leaveTypeId,
     leaveTypeName: req.leaveType.name,
     fromDate: req.fromDate.toISOString().split('T')[0]!,
     toDate: req.toDate.toISOString().split('T')[0]!,

@@ -154,7 +154,8 @@ describe('GET /api/v1/audit-logs', () => {
     expect(res.body.data[0]).toMatchObject({
       id: 1,
       action: 'leave.approve',
-      module: 'leave',
+      moduleId: 3,
+      moduleName: 'leave',
     });
   });
 
@@ -187,13 +188,11 @@ describe('GET /api/v1/audit-logs', () => {
     expect(res.status).toBe(404);
   });
 
-  it('TC-AUD-009: module filter narrows results', async () => {
-    // Route calls auditModule.findUnique to resolve name→id, then filters by moduleId
-    (prisma.auditModule.findUnique as Mock).mockResolvedValue({ id: 3 });
+  it('TC-AUD-009: moduleId filter passes the INT to the Prisma where clause', async () => {
+    // v2: clients send INT codes directly (no name→id lookup on the server).
     const app = makeApp('Admin');
-    const res = await request(app).get('/api/v1/audit-logs?module=leave');
+    const res = await request(app).get('/api/v1/audit-logs?moduleId=3');
     expect(res.status).toBe(200);
-    // Verify the id-based filter was applied
     expect(prisma.auditLog.findMany).toHaveBeenCalledWith(
       expect.objectContaining({
         where: expect.objectContaining({ moduleId: 3 }),
@@ -201,9 +200,9 @@ describe('GET /api/v1/audit-logs', () => {
     );
   });
 
-  it('TC-AUD-009: actorRole filter passed to DB as INT roleId', async () => {
+  it('TC-AUD-009: actorRoleId filter passed to DB as INT', async () => {
     const app = makeApp('Admin');
-    await request(app).get('/api/v1/audit-logs?actorRole=Admin');
+    await request(app).get('/api/v1/audit-logs?actorRoleId=4');
     // Admin roleId = 4 per RoleId constants
     expect(prisma.auditLog.findMany).toHaveBeenCalledWith(
       expect.objectContaining({

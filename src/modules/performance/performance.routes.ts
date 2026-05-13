@@ -73,7 +73,6 @@ import {
   shapeReviewDetail,
   cycleInclude,
   reviewInclude,
-  mapCycleStatus,
   isServiceError,
 } from './performance.service.js';
 
@@ -172,7 +171,7 @@ router.get(
         code: c.code,
         fyStart: c.fyStart.toISOString().split('T')[0]!,
         fyEnd: c.fyEnd.toISOString().split('T')[0]!,
-        status: mapCycleStatus(c.status),
+        status: c.status,
         selfReviewDeadline: c.selfReviewDeadline.toISOString().split('T')[0]!,
         managerReviewDeadline: c.managerReviewDeadline.toISOString().split('T')[0]!,
         closedAt: c.closedAt ? c.closedAt.toISOString() : null,

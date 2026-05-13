@@ -53,52 +53,6 @@ export function generateCycleCode(fyStart: Date): string {
   return `C-${year}-${half}`;
 }
 
-// ── DB → Contract status mapping ─────────────────────────────────────────────
-
-/** Map INT status → contract string. */
-export function mapCycleStatus(s: number): 'Open' | 'Self-Review' | 'Manager-Review' | 'Closed' {
-  const m: Record<number, 'Open' | 'Self-Review' | 'Manager-Review' | 'Closed'> = {
-    [CycleStatus.Open]: 'Open',
-    [CycleStatus.SelfReview]: 'Self-Review',
-    [CycleStatus.ManagerReview]: 'Manager-Review',
-    [CycleStatus.Closed]: 'Closed',
-  };
-  return m[s] ?? 'Open';
-}
-
-/** Map contract string → INT status. */
-export function mapCycleStatusToDB(s: string): number {
-  const m: Record<string, number> = {
-    'Open': CycleStatus.Open,
-    'Self-Review': CycleStatus.SelfReview,
-    'Manager-Review': CycleStatus.ManagerReview,
-    'Closed': CycleStatus.Closed,
-  };
-  return m[s] ?? CycleStatus.Open;
-}
-
-/** Map INT outcomeId → contract string. */
-export function mapGoalOutcome(id: number): 'Met' | 'Partial' | 'Missed' | 'Pending' {
-  const m: Record<number, 'Met' | 'Partial' | 'Missed' | 'Pending'> = {
-    [GoalOutcome.Pending]: 'Pending',
-    [GoalOutcome.Met]: 'Met',
-    [GoalOutcome.Partial]: 'Partial',
-    [GoalOutcome.Missed]: 'Missed',
-  };
-  return m[id] ?? 'Pending';
-}
-
-/** Map contract string → INT outcomeId. */
-export function mapGoalOutcomeToDB(s: string): number {
-  const m: Record<string, number> = {
-    Pending: GoalOutcome.Pending,
-    Met: GoalOutcome.Met,
-    Partial: GoalOutcome.Partial,
-    Missed: GoalOutcome.Missed,
-  };
-  return m[s] ?? GoalOutcome.Pending;
-}
-
 // ── Row shapes ───────────────────────────────────────────────────────────────
 
 type CycleWithRelations = Prisma.PerformanceCycleGetPayload<{
@@ -142,7 +96,7 @@ export function shapeCycle(row: CycleWithRelations) {
     code: row.code,
     fyStart: row.fyStart.toISOString().split('T')[0]!,
     fyEnd: row.fyEnd.toISOString().split('T')[0]!,
-    status: mapCycleStatus(row.status),
+    status: row.status,
     selfReviewDeadline: row.selfReviewDeadline.toISOString().split('T')[0]!,
     managerReviewDeadline: row.managerReviewDeadline.toISOString().split('T')[0]!,
     closedAt: row.closedAt ? row.closedAt.toISOString() : null,
@@ -180,7 +134,7 @@ export function shapeReviewDetail(row: ReviewWithRelations) {
     id: row.id,
     cycleId: row.cycleId,
     cycleCode: row.cycle.code,
-    cycleStatus: mapCycleStatus(row.cycle.status),
+    cycleStatus: row.cycle.status,
     employeeId: row.employeeId,
     employeeName: row.employee.name,
     employeeCode: row.employee.code,
@@ -192,7 +146,7 @@ export function shapeReviewDetail(row: ReviewWithRelations) {
       id: g.id,
       reviewId: g.reviewId,
       text: g.text,
-      outcome: mapGoalOutcome(g.outcomeId),
+      outcomeId: g.outcomeId,
       proposedByEmployee: g.proposedByEmployee,
       createdAt: g.createdAt.toISOString(),
       version: g.version,
@@ -532,8 +486,8 @@ export async function closeCycle(
     targetType: 'PerformanceCycle',
     targetId: cycleId,
     module: 'performance',
-    before: { status: mapCycleStatus(cycle.status), version: cycle.version },
-    after: { status: 'Closed', closedAt: now.toISOString(), lockedReviews },
+    before: { status: cycle.status, version: cycle.version },
+    after: { status: CycleStatus.Closed, closedAt: now.toISOString(), lockedReviews },
   });
 
   // Notify all participants that the cycle is closed
@@ -639,7 +593,7 @@ export async function createGoal(
         id: goal.id,
         reviewId: goal.reviewId,
         text: goal.text,
-        outcome: mapGoalOutcome(goal.outcomeId),
+        outcomeId: goal.outcomeId,
         proposedByEmployee: goal.proposedByEmployee,
         createdAt: goal.createdAt.toISOString(),
         version: goal.version,
@@ -750,7 +704,7 @@ export async function proposeGoal(
         id: goal.id,
         reviewId: goal.reviewId,
         text: goal.text,
-        outcome: mapGoalOutcome(goal.outcomeId),
+        outcomeId: goal.outcomeId,
         proposedByEmployee: goal.proposedByEmployee,
         createdAt: goal.createdAt.toISOString(),
         version: goal.version,

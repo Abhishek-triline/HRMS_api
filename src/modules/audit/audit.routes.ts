@@ -39,89 +39,49 @@ auditRouter.get(
   validateQuery(AuditLogListQuerySchema),
   async (req: Request, res: Response): Promise<void> => {
     try {
-      const query = req.query as unknown as {
-        cursor?: string;
-        limit: number;
-        actorId?: string;
-        actorRole?: string;
-        module?: string;
-        action?: string;
-        targetType?: string;
-        targetId?: string;
-        from?: string;
-        to?: string;
-        q?: string;
+      // After validateQuery(AuditLogListQuerySchema) zod coerces numeric params
+      // to actual numbers — but the local coercion below is a defence-in-depth
+      // belt-and-braces (also helps in unit tests that mock the validator).
+      const raw = req.query as Record<string, string | number | undefined>;
+      const toInt = (v: unknown): number | undefined => {
+        if (v === undefined || v === null || v === '') return undefined;
+        const n = typeof v === 'number' ? v : Number(v);
+        return Number.isFinite(n) ? n : undefined;
+      };
+      const query = {
+        cursor: raw['cursor'] as string | undefined,
+        limit: toInt(raw['limit']) ?? 20,
+        actorId: toInt(raw['actorId']),
+        actorRoleId: toInt(raw['actorRoleId']),
+        moduleId: toInt(raw['moduleId']),
+        targetTypeId: toInt(raw['targetTypeId']),
+        targetId: toInt(raw['targetId']),
+        action: raw['action'] as string | undefined,
+        from: raw['from'] as string | undefined,
+        to: raw['to'] as string | undefined,
+        q: raw['q'] as string | undefined,
       };
 
-      const limit = Math.min(Number(query.limit) || 20, 100);
+      const limit = Math.min(query.limit, 100);
 
-      // Build Prisma where clause from query filters
+      // Build Prisma where clause from query filters. All filter values are
+      // INT codes per HRMS_Schema_v2_Plan §3 — no name→id lookup needed.
       const where: Prisma.AuditLogWhereInput = {};
 
-      if (query.actorId) {
-        where.actorId = Number(query.actorId) || null;
+      if (query.actorId !== undefined) {
+        where.actorId = query.actorId;
       }
-
-      // actorRole filter: look up the INT role id by convention
-      // RoleId constants: Admin=1, Manager=2, Employee=3, PayrollOfficer=4
-      if (query.actorRole) {
-        const roleNameToId: Record<string, number> = {
-          Admin: RoleId.Admin,
-          Manager: RoleId.Manager,
-          Employee: RoleId.Employee,
-          PayrollOfficer: RoleId.PayrollOfficer,
-        };
-        const roleId = roleNameToId[query.actorRole];
-        if (roleId !== undefined) {
-          where.actorRoleId = roleId;
-        }
-        // 'system' role — actorRoleId is 0 by convention (or skip filter if not mapped)
+      if (query.actorRoleId !== undefined) {
+        where.actorRoleId = query.actorRoleId;
       }
-
-      // module filter: look up moduleId by name
-      if (query.module) {
-        const mod = await prisma.auditModule.findUnique({
-          where: { name: query.module },
-          select: { id: true },
-        });
-        if (mod) {
-          where.moduleId = mod.id;
-        } else {
-          // Unknown module — return empty
-          res.status(200).json({ data: [], nextCursor: null });
-          return;
-        }
+      if (query.moduleId !== undefined) {
+        where.moduleId = query.moduleId;
       }
-
-      // targetType filter: map by name to INT code (§3.9 frozen codes)
-      if (query.targetType) {
-        const targetTypeNameToId: Record<string, number> = {
-          Employee: 1,
-          LeaveRequest: 2,
-          LeaveEncashment: 3,
-          AttendanceRecord: 4,
-          RegularisationRequest: 5,
-          PayrollRun: 6,
-          Payslip: 7,
-          PerformanceCycle: 8,
-          PerformanceReview: 9,
-          Goal: 10,
-          Configuration: 11,
-          SalaryStructure: 12,
-          Holiday: 13,
-          Notification: 14,
-        };
-        const ttId = targetTypeNameToId[query.targetType];
-        if (ttId !== undefined) {
-          where.targetTypeId = ttId;
-        } else {
-          res.status(200).json({ data: [], nextCursor: null });
-          return;
-        }
+      if (query.targetTypeId !== undefined) {
+        where.targetTypeId = query.targetTypeId;
       }
-
-      if (query.targetId) {
-        where.targetId = Number(query.targetId) || null;
+      if (query.targetId !== undefined) {
+        where.targetId = query.targetId;
       }
 
       // action filter — substring match OR q free-text (both map to the same field)
@@ -185,7 +145,8 @@ auditRouter.get(
           actorRoleId: row.actorRoleId,
           actorIp: row.actorIp,
           action: row.action,
-          module: row.module.name,
+          moduleId: row.moduleId,
+          moduleName: row.module.name,
           targetTypeId: row.targetTypeId,
           targetId: row.targetId,
           before: row.before,

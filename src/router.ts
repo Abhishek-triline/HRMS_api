@@ -9,6 +9,7 @@ import swaggerUi from 'swagger-ui-express';
 import { requireSession } from './middleware/requireSession.js';
 import { authRouter } from './modules/auth/auth.routes.js';
 import { employeesRouter } from './modules/employees/employees.routes.js';
+import { mastersRouter } from './modules/employees/masters.routes.js';
 import { leaveRouter } from './modules/leave/leave.routes.js';
 import { leaveEncashmentRouter } from './modules/leave/leave-encashment.routes.js';
 import { attendanceRouter } from './modules/attendance/attendance.routes.js';
@@ -81,6 +82,7 @@ v1Router.use('/auth', authRouter);
 
 // Phase 1 — Employees & Hierarchy
 v1Router.use('/employees', employeesRouter);
+v1Router.use('/masters', mastersRouter);
 
 // Phase 2 — Leave Management
 v1Router.use('/leave', leaveRouter);
