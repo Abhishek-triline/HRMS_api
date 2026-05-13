@@ -843,6 +843,122 @@ async function seedDummyData(): Promise<void> {
   console.log('  [dummy]         cycles(2) reviews(8) goals(20) notifications(20) audit(20) idem(20)');
 }
 
+// ── Expanded attendance — fills a wide date range so the admin grid has data ─
+//
+// Independent of the 20-row dummy block; runs idempotently even after that
+// block has fired. Looks for the marker date 2026-04-01: if any row exists
+// for that date, the expansion is already in place and the function returns
+// early. Otherwise it generates one row per (active demo employee × every
+// weekday between EXPANDED_FROM and EXPANDED_TO), skipping public holidays.
+//
+// Status distribution is deterministic (not Math.random) so re-running on a
+// fresh DB produces byte-for-byte identical rows. Mix: ~70% Present (with
+// ~20% of those late after 10:30), ~10% Absent, ~10% OnLeave.
+//
+// Uses createMany({ skipDuplicates: true }) so any rows that already exist
+// (e.g., the 20-row dummy block's May 5–9 entries) are silently skipped.
+
+const EXPANDED_FROM = new Date(Date.UTC(2026, 3, 1));  // 2026-04-01
+const EXPANDED_TO   = new Date(Date.UTC(2026, 4, 31)); // 2026-05-31
+
+async function seedExpandedAttendance(): Promise<void> {
+  const marker = await prisma.attendanceRecord.findFirst({
+    where: { date: EXPANDED_FROM },
+    select: { id: true },
+  });
+  if (marker) {
+    console.log('  [att-expanded] already seeded, skipping');
+    return;
+  }
+
+  const [adminEmp, mgrEmp, empEmp, payEmp] = await Promise.all([
+    prisma.employee.findUniqueOrThrow({ where: { email: ADMIN_EMAIL } }),
+    prisma.employee.findUniqueOrThrow({ where: { email: 'manager@triline.co.in' } }),
+    prisma.employee.findUniqueOrThrow({ where: { email: 'employee@triline.co.in' } }),
+    prisma.employee.findUniqueOrThrow({ where: { email: 'payroll@triline.co.in' } }),
+  ]);
+  const employees = [adminEmp, mgrEmp, empEmp, payEmp];
+
+  const holidays = await prisma.holiday.findMany({ select: { date: true } });
+  const holidayKeys = new Set(holidays.map((h) => h.date.toISOString().slice(0, 10)));
+
+  type Row = {
+    employeeId: number;
+    date: Date;
+    status: number;
+    checkInTime: Date | null;
+    checkOutTime: Date | null;
+    hoursWorkedMinutes: number | null;
+    late: boolean;
+    lateMonthCount: number;
+    lopApplied: boolean;
+    sourceId: number;
+  };
+  const rows: Row[] = [];
+
+  let cellIdx = 0;
+  for (
+    let d = new Date(EXPANDED_FROM);
+    d <= EXPANDED_TO;
+    d.setUTCDate(d.getUTCDate() + 1)
+  ) {
+    const dow = d.getUTCDay();
+    if (dow === 0 || dow === 6) continue; // skip Sat/Sun
+    const key = d.toISOString().slice(0, 10);
+    if (holidayKeys.has(key)) continue;
+
+    for (const emp of employees) {
+      cellIdx++;
+      // 10-cell rotation: 0=Absent, 1=OnLeave, 2..9=Present (8 = late present)
+      const slot = cellIdx % 10;
+      let status: number;
+      let late = false;
+      let checkIn: Date | null = null;
+      let checkOut: Date | null = null;
+      let hours: number | null = null;
+
+      if (slot === 0) {
+        status = 2; // Absent
+      } else if (slot === 1) {
+        status = 3; // OnLeave
+      } else {
+        status = 1; // Present
+        const isLate = slot === 8 || slot === 9; // 20% of present
+        const lateMin = isLate ? 45 : 0; // 11:15 IST when late
+        late = isLate;
+        // Check-in at 09:00 IST (03:30 UTC), check-out at 18:00 IST (12:30 UTC)
+        const dayBase = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
+        checkIn  = new Date(dayBase.getTime() + (3 * 60 + 30 + lateMin) * 60_000);
+        checkOut = new Date(dayBase.getTime() + (12 * 60 + 30) * 60_000);
+        hours = 540 - lateMin; // 9h minus the late minutes
+      }
+
+      rows.push({
+        employeeId: emp.id,
+        date: new Date(d.getTime()), // clone, loop mutates `d`
+        status,
+        checkInTime: checkIn,
+        checkOutTime: checkOut,
+        hoursWorkedMinutes: hours,
+        late,
+        lateMonthCount: 0, // denorm cache; left at 0 for seed data
+        lopApplied: false,
+        sourceId: 1, // system
+      });
+    }
+  }
+
+  const result = await prisma.attendanceRecord.createMany({
+    data: rows,
+    skipDuplicates: true,
+  });
+
+  console.log(
+    `  [att-expanded] inserted ${result.count} rows (attempted ${rows.length}; ` +
+      `${rows.length - result.count} skipped as duplicates)`,
+  );
+}
+
 // ── Entry point ──────────────────────────────────────────────────────────────
 
 async function main() {
@@ -870,6 +986,9 @@ async function main() {
 
   console.log('• Dummy data');
   await seedDummyData();
+
+  console.log('• Expanded attendance');
+  await seedExpandedAttendance();
 
   console.log('Seed complete.');
 }
