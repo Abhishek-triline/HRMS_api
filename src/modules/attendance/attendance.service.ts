@@ -334,17 +334,28 @@ export async function recordCheckIn(
       update: { count: { increment: 1 } },
     });
     lateMonthCount = lateLedger.count;
+    // The upsert either created the row (previousCount = 0) or incremented
+    // by exactly 1 (previousCount = count - 1). No double-query needed.
+    const previousCount = lateMonthCount - 1;
 
-    // BL-028: fire on 3rd late mark and each subsequent
-    if (lateMonthCount >= 3) {
+    // BL-028: late-mark penalty is a one-shot per calendar month. Fire ONLY
+    // on the threshold-crossing late (previousCount below threshold, new
+    // count at-or-above). Subsequent lates in the same month don't stack
+    // additional deductions — that was the v1 bug.
+    const LATE_THRESHOLD = 3;
+    const crossingThreshold =
+      previousCount < LATE_THRESHOLD && lateMonthCount >= LATE_THRESHOLD;
+
+    if (crossingThreshold) {
       lateMarkDeductionApplied = await deductLateMarkPenalty(employeeId, year, now, tx);
-    } else if (lateMonthCount === 2) {
+    } else if (lateMonthCount === LATE_THRESHOLD - 1) {
+      // One-away warning notification.
       await notify({
         tx,
         recipientIds: employeeId,
         category: 'Attendance',
         title: 'Late check-in warning',
-        body: 'You have 2 late check-ins this month. One more late will deduct 1 day from your leave balance.',
+        body: `You have ${lateMonthCount} late check-ins this month. One more late will deduct 1 day from your leave balance.`,
         link: `/employee/attendance`,
       });
     }
