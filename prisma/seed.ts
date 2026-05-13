@@ -569,6 +569,14 @@ async function seedRealisticData(): Promise<void> {
   console.log('  [realistic] wiping dummy-owned tables…');
   await wipeDummyOwnedTables();
 
+  // Anchor "today" for the seed — every realistic event is stamped relative
+  // to this date so audit-log "X minutes ago" timers don't go negative for
+  // future-dated entries (a pending leave for May 25 mustn't carry a May 18
+  // submittedAt when the seed clock says May 13). All timestamps below are
+  // clamped to this anchor as the latest allowable value.
+  const SEED_TODAY = dt('2026-05-13');
+  const earliestOf = (a: Date, b: Date): Date => (a.getTime() < b.getTime() ? a : b);
+
   // ── Resolve demo accounts (preserved by the wipe) ────────────────────────
   const demos = await prisma.employee.findMany({
     where: { id: { lte: 4 } },
@@ -765,8 +773,11 @@ async function seedRealisticData(): Promise<void> {
     const routedToId: 1 | 2 = eventBased || managerId === adminEmp.id ? 2 : 1;
     const approverId = routedToId === 1 ? managerId : adminEmp.id;
     const decided = status === 2 || status === 3 || status === 4;
-    const submittedAt = addDays(fromDate, -7);
-    const decidedAt = decided ? addDays(submittedAt, 2) : null;
+    // Submitted ~7 days before the leave starts — but never AFTER SEED_TODAY,
+    // otherwise a pending leave for next month would show "submitted in the
+    // future" on the audit feed.
+    const submittedAt = earliestOf(addDays(fromDate, -7), SEED_TODAY);
+    const decidedAt = decided ? earliestOf(addDays(submittedAt, 2), SEED_TODAY) : null;
 
     const decisionNote =
       status === 2 ? APPROVAL_NOTES[lCounter % APPROVAL_NOTES.length]!
@@ -793,8 +804,8 @@ async function seedRealisticData(): Promise<void> {
         decidedAt,
         decidedBy: decided ? approverId : null,
         decisionNote,
-        escalatedAt: status === 5 ? addDays(submittedAt, 5) : null,
-        cancelledAt: status === 4 ? addDays(submittedAt, 3) : null,
+        escalatedAt: status === 5 ? earliestOf(addDays(submittedAt, 5), SEED_TODAY) : null,
+        cancelledAt: status === 4 ? earliestOf(addDays(submittedAt, 3), SEED_TODAY) : null,
         cancelledBy: status === 4 ? emp.id : null,
         cancelledAfterStart: false,
         deductedDays,
@@ -1098,6 +1109,11 @@ async function seedRealisticData(): Promise<void> {
     const finalised = m <= 4;
     const periodStart = new Date(Date.UTC(REALISTIC_YEAR, m - 1, 1));
     const periodEnd = new Date(Date.UTC(REALISTIC_YEAR, m, 0));
+    // Run was initiated near the end of its period, but never AFTER
+    // SEED_TODAY (an in-progress run for May 2026 can't have been
+    // initiated on May 30 when the seed clock says May 13).
+    const initiatedAtRaw = new Date(periodEnd.getTime() - 86_400_000);
+    const finalisedAtRaw = new Date(periodEnd.getTime() + 86_400_000);
     const run = await prisma.payrollRun.create({
       data: {
         code: `RUN-${REALISTIC_YEAR}-${String(m).padStart(2, '0')}`,
@@ -1108,9 +1124,9 @@ async function seedRealisticData(): Promise<void> {
         periodStart,
         periodEnd,
         initiatedBy: payEmp.id,
-        initiatedAt: new Date(periodEnd.getTime() - 86_400_000),
+        initiatedAt: earliestOf(initiatedAtRaw, SEED_TODAY),
         finalisedBy: finalised ? adminEmp.id : null,
-        finalisedAt: finalised ? new Date(periodEnd.getTime() + 86_400_000) : null,
+        finalisedAt: finalised ? earliestOf(finalisedAtRaw, SEED_TODAY) : null,
       },
     });
 
