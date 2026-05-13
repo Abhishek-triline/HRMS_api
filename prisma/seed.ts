@@ -38,6 +38,11 @@ const CONFIG_DEFAULTS: Array<{ key: string; value: unknown }> = [
   { key: 'MATERNITY_WEEKS', value: 26 },
   { key: 'PATERNITY_WORKING_DAYS', value: 10 },
   { key: 'NOTIFICATION_RETENTION_DAYS', value: 90 },
+  // Attendance — weekly-off pattern read by isWeeklyOff(). Defaulting to
+  // Sat/Sun preserves the previous hardcoded seed behaviour but now an
+  // admin can change this and re-seed to get a different pattern.
+  { key: 'ATTENDANCE_WEEKLY_OFF_DAYS', value: ['Sat', 'Sun'] },
+  { key: 'ATTENDANCE_STANDARD_DAILY_HOURS', value: 8 },
   { key: 'STANDARD_TAX_REFERENCE_RATE', value: 0.095 },
   { key: 'TAX_GROSS_TAXABLE_BASIS', value: 'GrossMinusStandardDeduction' },
   // Leave Encashment window (BL-LE-04)
@@ -842,12 +847,38 @@ async function seedRealisticData(): Promise<void> {
   }
   await prisma.leaveBalanceLedger.createMany({ data: initialLedgerRows });
 
-  // ── Attendance — Apr 1 to May 13, skip approved-leave dates ─────────────
+  // ── Attendance — Apr 1 to May 13 ──────────────────────────────────────
+  // Reads ATTENDANCE_WEEKLY_OFF_DAYS + ATTENDANCE_STANDARD_DAILY_HOURS from
+  // the configurations table that was seeded earlier. Stamps WeeklyOff +
+  // Holiday rows explicitly (instead of skipping them), so the chart and
+  // every working-day calculation match what the live runtime would do
+  // and so the seed honours whatever weekly-off pattern is configured.
   console.log('  [realistic] writing attendance records…');
   const FROM = dt('2026-04-01');
   const TO = dt('2026-05-13');
   const holidays = await prisma.holiday.findMany({ select: { date: true } });
   const holidayKeys = new Set(holidays.map((h) => h.date.toISOString().slice(0, 10)));
+
+  // Resolve weekly-off DOW set from the configurations row.
+  // JS getUTCDay(): 0=Sun, 1=Mon, …, 6=Sat.
+  const WEEKDAY_TOKEN_TO_DOW: Record<string, number> = {
+    Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6,
+  };
+  const weeklyOffCfg = await prisma.configuration.findUnique({
+    where: { key: 'ATTENDANCE_WEEKLY_OFF_DAYS' },
+  });
+  const weeklyOffTokens = Array.isArray(weeklyOffCfg?.value) ? (weeklyOffCfg!.value as unknown[]) : ['Sat', 'Sun'];
+  const weeklyOffDows = new Set<number>(
+    weeklyOffTokens
+      .filter((t): t is string => typeof t === 'string' && t in WEEKDAY_TOKEN_TO_DOW)
+      .map((t) => WEEKDAY_TOKEN_TO_DOW[t]!),
+  );
+
+  // Resolve daily-hours target.
+  const hoursCfg = await prisma.configuration.findUnique({
+    where: { key: 'ATTENDANCE_STANDARD_DAILY_HOURS' },
+  });
+  const seedTargetHours = typeof hoursCfg?.value === 'number' ? Math.round(hoursCfg.value) : 8;
 
   const approvedLeaves = await prisma.leaveRequest.findMany({
     where: { status: 2 },
@@ -864,15 +895,16 @@ async function seedRealisticData(): Promise<void> {
   let cellIdx = 0;
   for (let d = new Date(FROM); d <= TO; d = addDays(d, 1)) {
     const dow = d.getUTCDay();
-    if (dow === 0 || dow === 6) continue;
     const key = d.toISOString().slice(0, 10);
-    if (holidayKeys.has(key)) continue;
+    const isWeeklyOff = weeklyOffDows.has(dow);
+    const isHoliday = holidayKeys.has(key);
+
     for (const e of allEmps) {
       if (d < e.joinDate) continue;
       if (e.exitDate && d > e.exitDate) continue;
       if (e.status === 5) continue;
 
-      cellIdx++;
+      // BL-026 priority: OnLeave > WeeklyOff/Holiday > Present/Absent.
       const empLeaveKey = `${e.id}|${key}`;
       let status: number;
       let late = false;
@@ -882,7 +914,13 @@ async function seedRealisticData(): Promise<void> {
 
       if (onLeaveKeys.has(empLeaveKey)) {
         status = 3; // OnLeave
+      } else if (isHoliday) {
+        status = 5; // Holiday
+      } else if (isWeeklyOff) {
+        status = 4; // WeeklyOff
       } else {
+        // Working day — Present/Absent/Late distribution
+        cellIdx++;
         const slot = cellIdx % 100;
         if (slot < 3) {
           status = 2; // Absent
@@ -904,6 +942,7 @@ async function seedRealisticData(): Promise<void> {
         checkInTime: checkIn,
         checkOutTime: checkOut,
         hoursWorkedMinutes: hours,
+        targetHours: seedTargetHours,
         late,
         lateMonthCount: 0,
         lopApplied: status === 2,
