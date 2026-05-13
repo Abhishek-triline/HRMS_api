@@ -372,6 +372,29 @@ router.post(
           },
         });
 
+        // Audit the initial salary structure separately from employee.create
+        // so observability covers all salary mutations symmetrically with the
+        // employee.salary.update path further down.
+        await audit({
+          tx,
+          actorId: actor.id,
+          actorRole: actor.roleId as RoleIdValue,
+          actorIp: ip,
+          action: 'employee.salary.create',
+          targetType: 'Employee',
+          targetId: newEmp.id,
+          module: 'employees',
+          before: null,
+          after: {
+            basic_paise: body.salaryStructure.basic_paise,
+            allowances_paise: body.salaryStructure.allowances_paise,
+            effectiveFrom: body.salaryStructure.effectiveFrom,
+            hra_paise: body.salaryStructure.hra_paise ?? null,
+            transport_paise: body.salaryStructure.transport_paise ?? null,
+            other_paise: body.salaryStructure.other_paise ?? null,
+          },
+        });
+
         // Create the initial ReportingManagerHistory row (reason = Initial)
         await tx.reportingManagerHistory.create({
           data: {
