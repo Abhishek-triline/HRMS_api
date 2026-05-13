@@ -163,7 +163,15 @@ function formatRun(
   };
 }
 
-/** Format a Payslip row for the API response. */
+/**
+ * Format a Payslip row for the API response.
+ *
+ * `redactMoney` blanks out every paise field (basic / allowances / gross /
+ * lop / tax / net / encashment). Used when a Manager looks at a
+ * subordinate's payslip — per the production-hardening spec, managers can
+ * see *status* but not *pay numbers*. Always false for Admin / PO and for
+ * any caller viewing their own payslip.
+ */
 function formatPayslip(
   slip: {
     id: number;
@@ -203,6 +211,7 @@ function formatPayslip(
     updatedAt: Date;
     version: number;
   },
+  redactMoney = false,
 ) {
   return {
     id: slip.id,
@@ -222,16 +231,16 @@ function formatPayslip(
     workingDays: slip.workingDays,
     daysWorked: slip.daysWorked,
     lopDays: slip.lopDays,
-    basicPaise: slip.basicPaise,
-    allowancesPaise: slip.allowancesPaise,
-    grossPaise: slip.grossPaise,
-    lopDeductionPaise: slip.lopDeductionPaise,
-    referenceTaxPaise: slip.referenceTaxPaise,
-    finalTaxPaise: slip.finalTaxPaise,
-    otherDeductionsPaise: slip.otherDeductionsPaise,
-    netPayPaise: slip.netPayPaise,
+    basicPaise:           redactMoney ? null : slip.basicPaise,
+    allowancesPaise:      redactMoney ? null : slip.allowancesPaise,
+    grossPaise:           redactMoney ? null : slip.grossPaise,
+    lopDeductionPaise:    redactMoney ? null : slip.lopDeductionPaise,
+    referenceTaxPaise:    redactMoney ? null : slip.referenceTaxPaise,
+    finalTaxPaise:        redactMoney ? null : slip.finalTaxPaise,
+    otherDeductionsPaise: redactMoney ? null : slip.otherDeductionsPaise,
+    netPayPaise:          redactMoney ? null : slip.netPayPaise,
     encashmentDays: slip.encashmentDays ?? 0,
-    encashmentPaise: slip.encashmentPaise ?? 0,
+    encashmentPaise: redactMoney ? null : (slip.encashmentPaise ?? 0),
     encashmentId: slip.encashmentId ?? null,
     finalisedAt: slip.finalisedAt?.toISOString() ?? null,
     reversalOfPayslipId: slip.reversalOfPayslipId,
@@ -1144,24 +1153,27 @@ payslipsRouter.get(
     const page = hasMore ? slips.slice(0, Number(limit) || 20) : slips;
     const nextCursor = hasMore ? String(page[page.length - 1]?.id ?? '') : null;
 
-    const summaries = page.map((s) => ({
-      id: s.id,
-      code: s.code,
-      runId: s.runId,
-      employeeId: s.employeeId,
-      employeeName: s.employee.name,
-      employeeCode: s.employee.code,
-      month: s.month,
-      year: s.year,
-      status: s.status,
-      workingDays: s.workingDays,
-      lopDays: s.lopDays,
-      grossPaise: s.grossPaise,
-      finalTaxPaise: s.finalTaxPaise,
-      netPayPaise: s.netPayPaise,
-      finalisedAt: s.finalisedAt?.toISOString() ?? null,
-      reversalOfPayslipId: s.reversalOfPayslipId,
-    }));
+    const summaries = page.map((s) => {
+      const redact = !canSeePayslipMoney(user.id, user.roleId, s.employeeId);
+      return {
+        id: s.id,
+        code: s.code,
+        runId: s.runId,
+        employeeId: s.employeeId,
+        employeeName: s.employee.name,
+        employeeCode: s.employee.code,
+        month: s.month,
+        year: s.year,
+        status: s.status,
+        workingDays: s.workingDays,
+        lopDays: s.lopDays,
+        grossPaise:    redact ? null : s.grossPaise,
+        finalTaxPaise: redact ? null : s.finalTaxPaise,
+        netPayPaise:   redact ? null : s.netPayPaise,
+        finalisedAt: s.finalisedAt?.toISOString() ?? null,
+        reversalOfPayslipId: s.reversalOfPayslipId,
+      };
+    });
 
     res.status(200).json({ data: summaries, nextCursor });
   },
@@ -1197,7 +1209,8 @@ payslipsRouter.get(
       return;
     }
 
-    res.status(200).json({ data: formatPayslip(slip) });
+    const redact = !canSeePayslipMoney(user.id, user.roleId, slip.employeeId);
+    res.status(200).json({ data: formatPayslip(slip, redact) });
   },
 );
 
@@ -1331,6 +1344,16 @@ payslipsRouter.get(
     const canSee = await canViewPayslip(user.id, user.roleId, slip.employeeId);
     if (!canSee) {
       res.status(404).json(errorEnvelope(ErrorCode.NOT_FOUND, 'Payslip not found.'));
+      return;
+    }
+
+    // Hardening: PDFs always include money figures. Managers can see a
+    // subordinate's *status* in the JSON detail but must not be able to
+    // download the PDF (which would leak gross / net / tax).
+    if (!canSeePayslipMoney(user.id, user.roleId, slip.employeeId)) {
+      res
+        .status(403)
+        .json(errorEnvelope(ErrorCode.FORBIDDEN, 'Payslip PDF is not available for this role.'));
       return;
     }
 
@@ -1553,5 +1576,29 @@ async function canViewPayslip(
     return subs.includes(ownerId);
   }
 
+  return false;
+}
+
+/**
+ * Returns true if the calling user is allowed to see the *money fields*
+ * on a payslip (gross/net/tax/etc.). Per the production-hardening spec:
+ *
+ *   Admin             → yes (org-wide visibility)
+ *   PayrollOfficer    → yes (payroll responsibility)
+ *   Employee viewing own → yes
+ *   Manager viewing subordinate → NO (sees status but not amounts)
+ *
+ * A manager viewing their own payslip falls through to the self-view
+ * branch. Used by GET /payslips and GET /payslips/:id to decide whether
+ * to redact the money fields; the PDF endpoint blocks managers outright
+ * since a PDF can't cleanly omit the figures.
+ */
+function canSeePayslipMoney(
+  userId: number,
+  userRoleId: number,
+  ownerId: number,
+): boolean {
+  if (userRoleId === RoleId.Admin || userRoleId === RoleId.PayrollOfficer) return true;
+  if (userId === ownerId) return true;
   return false;
 }
