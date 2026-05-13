@@ -892,16 +892,23 @@ leaveRouter.get(
   requireSession(),
   async (req: Request, res: Response): Promise<void> => {
     const user = req.user!;
-    const id = Number(req.params['id']);
+    // Accept either numeric id ("42") or the human-readable code
+    // ("L-2026-0018") in the same path slot. Notifications use the code
+    // because it survives in shareable URLs; the FE list pages link by
+    // id. Both must resolve to the same row.
+    const raw = req.params['id'] ?? '';
+    const asNum = Number(raw);
+    const isNumericId = Number.isInteger(asNum) && asNum > 0;
+    const isCodeLike = /^L-\d{4}-\d{4}$/i.test(raw);
 
-    if (isNaN(id)) {
+    if (!isNumericId && !isCodeLike) {
       res.status(404).json(errorEnvelope(ErrorCode.NOT_FOUND, 'Leave request not found.'));
       return;
     }
 
     try {
       const request = await prisma.leaveRequest.findUnique({
-        where: { id },
+        where: isNumericId ? { id: asNum } : { code: raw.toUpperCase() },
         include: requestInclude,
       });
 
