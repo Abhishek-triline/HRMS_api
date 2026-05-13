@@ -441,6 +441,8 @@ model AttendanceRecord {
   checkInTime        DateTime?              @map("check_in_time")
   checkOutTime       DateTime?              @map("check_out_time")
   hoursWorkedMinutes Int?                   @map("hours_worked_minutes")
+  /// Standard daily hours target snapshotted from `configurations.ATTENDANCE_STANDARD_DAILY_HOURS` at row creation. Frozen for historical correctness — when admin changes the global config, past rows keep the target that applied on the day they were recorded.
+  targetHours        Int                    @default(8) @map("target_hours")
   late               Boolean                @default(false)
   lateMonthCount     Int                    @default(0) @map("late_month_count")
   lopApplied         Boolean                @default(false) @map("lop_applied")

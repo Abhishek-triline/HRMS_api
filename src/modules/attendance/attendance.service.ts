@@ -169,6 +169,11 @@ export async function runMidnightGenerate(
   const dateOnly = new Date(date);
   dateOnly.setUTCHours(0, 0, 0, 0);
 
+  // Snapshot the current daily-hours target so historical rows keep the
+  // target that applied on the day they were generated, even when admin
+  // later changes ATTENDANCE_STANDARD_DAILY_HOURS.
+  const { standardDailyHours: targetHoursAtMidnight } = await getAttendanceConfig();
+
   // All Active + OnNotice employees
   const employees = await tx.employee.findMany({
     where: { status: { in: [EmployeeStatus.Active, EmployeeStatus.OnNotice] } },
@@ -204,6 +209,7 @@ export async function runMidnightGenerate(
         checkInTime: null,
         checkOutTime: null,
         hoursWorkedMinutes: null,
+        targetHours: targetHoursAtMidnight,
         late: false,
         lateMonthCount: 0,
         lopApplied: false,
@@ -252,6 +258,7 @@ export interface RawAttendanceRecord {
   checkInTime: Date | null;
   checkOutTime: Date | null;
   hoursWorkedMinutes: number | null;
+  targetHours: number;
   late: boolean;
   lateMonthCount: number;
   lopApplied: boolean;
@@ -307,8 +314,11 @@ export async function recordCheckIn(
     };
   }
 
-  // Read the late threshold from the shared config cache (30 s TTL, BL-027).
-  const { lateThresholdTime } = await getAttendanceConfig();
+  // Read the late threshold + daily-hours target from the shared config
+  // cache (30 s TTL, BL-027). The target snapshot only matters for the
+  // CREATE branch — when a record already exists from midnight generation
+  // the target captured then takes precedence and we don't overwrite it.
+  const { lateThresholdTime, standardDailyHours } = await getAttendanceConfig();
   const late = isLate(now, lateThresholdTime);
 
   const year = now.getUTCFullYear();
@@ -364,6 +374,7 @@ export async function recordCheckIn(
       checkInTime: now,
       checkOutTime: null,
       hoursWorkedMinutes: null,
+      targetHours: standardDailyHours,
       late,
       lateMonthCount,
       lopApplied: false,
@@ -857,6 +868,22 @@ export async function approveRegularisation(
   });
   const lateMonthCount = lateLedger?.count ?? 0;
 
+  // Inherit the daily-hours target from the system row of the same date so
+  // a regularised day stays measured against the policy that applied on that
+  // date. Fall back to the current config if no system row exists.
+  const systemRow = await tx.attendanceRecord.findUnique({
+    where: {
+      employeeId_date_sourceId: {
+        employeeId: reg.employeeId,
+        date: dateOnly,
+        sourceId: AttendanceSource.system,
+      },
+    },
+    select: { targetHours: true },
+  });
+  const targetHours = systemRow?.targetHours
+    ?? (await getAttendanceConfig()).standardDailyHours;
+
   const correctedRecord = await tx.attendanceRecord.create({
     data: {
       employeeId: reg.employeeId,
@@ -865,6 +892,7 @@ export async function approveRegularisation(
       checkInTime: reg.proposedCheckIn,
       checkOutTime: reg.proposedCheckOut,
       hoursWorkedMinutes,
+      targetHours,
       late,
       lateMonthCount,
       lopApplied: false,
@@ -1029,6 +1057,7 @@ export function formatAttendanceRecord(row: {
   checkInTime: Date | null;
   checkOutTime: Date | null;
   hoursWorkedMinutes: number | null;
+  targetHours: number;
   late: boolean;
   lateMonthCount: number;
   lopApplied: boolean;
@@ -1045,6 +1074,7 @@ export function formatAttendanceRecord(row: {
     checkInTime: row.checkInTime?.toISOString() ?? null,
     checkOutTime: row.checkOutTime?.toISOString() ?? null,
     hoursWorkedMinutes: row.hoursWorkedMinutes ?? null,
+    targetHours: row.targetHours,
     late: row.late,
     lateMonthCount: row.lateMonthCount,
     lopApplied: row.lopApplied,

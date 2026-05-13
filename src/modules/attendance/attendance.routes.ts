@@ -539,6 +539,7 @@ function formatAttendanceCalendarItem(row: {
   checkOutTime: Date | null;
   hoursWorkedMinutes: number | null;
   late: boolean;
+  targetHours: number;
 }) {
   return {
     date: row.date.toISOString().split('T')[0]!,
@@ -547,5 +548,6 @@ function formatAttendanceCalendarItem(row: {
     checkOutTime: row.checkOutTime?.toISOString() ?? null,
     hoursWorkedMinutes: row.hoursWorkedMinutes ?? null,
     late: row.late,
+    targetHours: row.targetHours,
   };
 }
