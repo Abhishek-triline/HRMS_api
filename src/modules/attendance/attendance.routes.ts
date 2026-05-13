@@ -20,11 +20,11 @@ import { requireSession } from '../../middleware/requireSession.js';
 import { requireRole } from '../../middleware/requireRole.js';
 import { validateQuery } from '../../middleware/validateQuery.js';
 import { errorEnvelope, ErrorCode } from '@nexora/contracts/errors';
-import { AttendanceListQuerySchema } from '@nexora/contracts/attendance';
+import { AttendanceListQuerySchema, AttendanceStatsQuerySchema } from '@nexora/contracts/attendance';
 import { getSubordinateIds } from '../employees/hierarchy.js';
 import { logger } from '../../lib/logger.js';
 import { getAttendanceConfig } from '../../lib/config.js';
-import { RoleId, AttendanceSource } from '../../lib/statusInt.js';
+import { RoleId, AttendanceSource, AttendanceStatus } from '../../lib/statusInt.js';
 import {
   recordCheckIn,
   recordCheckOut,
@@ -370,6 +370,10 @@ attendanceRouter.get(
         where['employeeId'] = q.employeeId;
       }
 
+      if (q.departmentId) {
+        where['employee'] = { departmentId: q.departmentId };
+      }
+
       if (dateFilter) {
         where['date'] = dateFilter;
       } else {
@@ -386,7 +390,13 @@ attendanceRouter.get(
         take: limit + 1,
         ...(q.cursor ? { cursor: { id: Number(q.cursor) }, skip: 1 } : {}),
         include: {
-          employee: { select: { name: true, code: true } },
+          employee: {
+            select: {
+              name: true,
+              code: true,
+              department: { select: { name: true } },
+            },
+          },
         },
       });
 
@@ -400,6 +410,8 @@ attendanceRouter.get(
           employeeId: r.employeeId,
           employeeName: r.employee?.name,
           employeeCode: r.employee?.code,
+          department: (r.employee as { department?: { name: string } | null } | undefined)
+            ?.department?.name ?? null,
         })),
         nextCursor,
       });
@@ -408,6 +420,75 @@ attendanceRouter.get(
       res
         .status(500)
         .json(errorEnvelope(ErrorCode.INTERNAL_ERROR, 'Failed to load attendance.'));
+    }
+  },
+);
+
+// ── GET /attendance/stats ────────────────────────────────────────────────────
+// Aggregate KPI counts for a single date (or date range). Admin-only org-wide.
+// Used by the org dashboard so KPI tiles don't have to fetch all rows.
+
+attendanceRouter.get(
+  '/stats',
+  requireSession(),
+  requireRole(RoleId.Admin),
+  validateQuery(AttendanceStatsQuerySchema),
+  async (req: Request, res: Response): Promise<void> => {
+    const q = req.query as unknown as {
+      date?: string;
+      from?: string;
+      to?: string;
+      departmentId?: number;
+    };
+
+    try {
+      const where: Record<string, unknown> = { sourceId: AttendanceSource.system };
+      if (q.date) {
+        const d = new Date(q.date + 'T00:00:00.000Z');
+        where['date'] = d;
+      } else if (q.from || q.to) {
+        where['date'] = {
+          ...(q.from ? { gte: new Date(q.from + 'T00:00:00.000Z') } : {}),
+          ...(q.to ? { lte: new Date(q.to + 'T00:00:00.000Z') } : {}),
+        };
+      }
+      if (q.departmentId) {
+        where['employee'] = { departmentId: q.departmentId };
+      }
+
+      const [byStatus, lateCount, yetToCheckIn, total] = await Promise.all([
+        prisma.attendanceRecord.groupBy({
+          by: ['status'],
+          where,
+          _count: { _all: true },
+        }),
+        prisma.attendanceRecord.count({ where: { ...where, late: true } }),
+        prisma.attendanceRecord.count({
+          where: { ...where, status: AttendanceStatus.Absent, checkInTime: null },
+        }),
+        prisma.attendanceRecord.count({ where }),
+      ]);
+
+      const counts: Record<number, number> = {};
+      for (const row of byStatus) counts[row.status] = row._count._all;
+
+      res.status(200).json({
+        data: {
+          total,
+          present:   counts[AttendanceStatus.Present]   ?? 0,
+          absent:    counts[AttendanceStatus.Absent]    ?? 0,
+          onLeave:   counts[AttendanceStatus.OnLeave]   ?? 0,
+          weeklyOff: counts[AttendanceStatus.WeeklyOff] ?? 0,
+          holiday:   counts[AttendanceStatus.Holiday]   ?? 0,
+          late: lateCount,
+          yetToCheckIn,
+        },
+      });
+    } catch (err: unknown) {
+      logger.error({ err }, 'attendance.stats: error');
+      res
+        .status(500)
+        .json(errorEnvelope(ErrorCode.INTERNAL_ERROR, 'Failed to load attendance stats.'));
     }
   },
 );

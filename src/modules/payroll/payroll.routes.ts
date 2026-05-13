@@ -116,6 +116,8 @@ function formatRun(
       lopDeductionPaise: number;
       finalTaxPaise: number;
       netPayPaise: number;
+      lopDays: number;
+      workingDays: number;
     }>;
   },
 ) {
@@ -129,6 +131,8 @@ function formatRun(
     }),
     { totalGrossPaise: 0, totalLopPaise: 0, totalTaxPaise: 0, totalNetPaise: 0 },
   );
+  const lopCount = slips.filter((s) => s.lopDays > 0).length;
+  const proRatedCount = slips.filter((s) => s.workingDays < run.workingDays).length;
 
   return {
     id: run.id,
@@ -152,6 +156,8 @@ function formatRun(
     reversalOfRunId: run.reversalOfRunId,
     employeeCount: slips.length,
     ...totals,
+    lopCount,
+    proRatedCount,
     updatedAt: run.updatedAt?.toISOString() ?? run.initiatedAt.toISOString(),
     version: run.version,
   };
@@ -248,6 +254,8 @@ const runInclude = {
       lopDeductionPaise: true,
       finalTaxPaise: true,
       netPayPaise: true,
+      lopDays: true,
+      workingDays: true,
     },
   },
 } as const satisfies Prisma.PayrollRunInclude;
@@ -579,27 +587,8 @@ payrollRouter.get(
       return;
     }
 
-    // Build payslip summaries
-    const payslipSummaries = run.payslips.map((s) => ({
-      id: s.id,
-      code: s.code,
-      runId: s.runId,
-      employeeId: s.employeeId,
-      employeeName: s.employee.name,
-      employeeCode: s.employee.code,
-      month: s.month,
-      year: s.year,
-      status: s.status,
-      workingDays: s.workingDays,
-      lopDays: s.lopDays,
-      grossPaise: s.grossPaise,
-      finalTaxPaise: s.finalTaxPaise,
-      netPayPaise: s.netPayPaise,
-      finalisedAt: s.finalisedAt?.toISOString() ?? null,
-      reversalOfPayslipId: s.reversalOfPayslipId,
-    }));
-
-    // Re-format run using payslip aggregates
+    // Re-format run using payslip aggregates. Payslips themselves are
+    // fetched via the paginated GET /payslips?runId=… endpoint.
     const runFormatted = formatRun({
       ...run,
       payslips: run.payslips.map((s) => ({
@@ -607,10 +596,12 @@ payrollRouter.get(
         lopDeductionPaise: s.lopDeductionPaise,
         finalTaxPaise: s.finalTaxPaise,
         netPayPaise: s.netPayPaise,
+        lopDays: s.lopDays,
+        workingDays: s.workingDays,
       })),
     });
 
-    res.status(200).json({ data: { run: runFormatted, payslips: payslipSummaries } });
+    res.status(200).json({ data: { run: runFormatted } });
   },
 );
 

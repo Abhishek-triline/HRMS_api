@@ -166,16 +166,69 @@ router.get(
       const items = hasNext ? cycles.slice(0, limit) : cycles;
       const nextCursor = hasNext ? String(items[items.length - 1]!.id) : null;
 
-      const data = items.map((c) => ({
-        id: c.id,
-        code: c.code,
-        fyStart: c.fyStart.toISOString().split('T')[0]!,
-        fyEnd: c.fyEnd.toISOString().split('T')[0]!,
-        status: c.status,
-        selfReviewDeadline: c.selfReviewDeadline.toISOString().split('T')[0]!,
-        managerReviewDeadline: c.managerReviewDeadline.toISOString().split('T')[0]!,
-        closedAt: c.closedAt ? c.closedAt.toISOString() : null,
-      }));
+      // Per-page review stats: groupBy + counts in one query each.
+      // Limited to the visible page, so cost stays O(pageSize × few aggregates).
+      const cycleIds = items.map((c) => c.id);
+      const reviewsForPage = cycleIds.length
+        ? await prisma.performanceReview.findMany({
+            where: { cycleId: { in: cycleIds } },
+            select: {
+              cycleId: true,
+              selfRating: true,
+              managerRating: true,
+              finalRating: true,
+            },
+          })
+        : [];
+
+      const byCycle = new Map<number, {
+        participants: number;
+        selfSubmitted: number;
+        managerSubmitted: number;
+        finalised: number;
+        finalRatingSum: number;
+      }>();
+      for (const r of reviewsForPage) {
+        const acc = byCycle.get(r.cycleId) ?? {
+          participants: 0,
+          selfSubmitted: 0,
+          managerSubmitted: 0,
+          finalised: 0,
+          finalRatingSum: 0,
+        };
+        acc.participants += 1;
+        if (r.selfRating !== null) acc.selfSubmitted += 1;
+        if (r.managerRating !== null) acc.managerSubmitted += 1;
+        if (r.finalRating !== null) {
+          acc.finalised += 1;
+          acc.finalRatingSum += r.finalRating;
+        }
+        byCycle.set(r.cycleId, acc);
+      }
+
+      const data = items.map((c) => {
+        const stats = byCycle.get(c.id);
+        const participants = stats?.participants ?? 0;
+        const finalised = stats?.finalised ?? 0;
+        const avgFinalRating = finalised > 0
+          ? Number((stats!.finalRatingSum / finalised).toFixed(2))
+          : null;
+        return {
+          id: c.id,
+          code: c.code,
+          fyStart: c.fyStart.toISOString().split('T')[0]!,
+          fyEnd: c.fyEnd.toISOString().split('T')[0]!,
+          status: c.status,
+          selfReviewDeadline: c.selfReviewDeadline.toISOString().split('T')[0]!,
+          managerReviewDeadline: c.managerReviewDeadline.toISOString().split('T')[0]!,
+          closedAt: c.closedAt ? c.closedAt.toISOString() : null,
+          participants,
+          selfSubmitted: stats?.selfSubmitted ?? 0,
+          managerSubmitted: stats?.managerSubmitted ?? 0,
+          finalised,
+          avgFinalRating,
+        };
+      });
 
       res.status(200).json({ data, nextCursor });
     } catch (err: unknown) {
