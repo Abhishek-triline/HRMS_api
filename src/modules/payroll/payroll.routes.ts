@@ -1106,11 +1106,36 @@ payslipsRouter.get(
     if (isReversal !== undefined) {
       where['reversalOfPayslipId'] = isReversal === 'true' ? { not: null } : null;
     }
-    if (cursor) where['id'] = { gt: Number(cursor) };
+
+    // Two ordering strategies:
+    //   1. Run-scoped list (runId filter set): every employee has one payslip,
+    //      so we sort alphabetically by employee name. The cursor is still
+    //      the last-seen payslip id; we look up that row's employee name and
+    //      use it as a `name > X` filter so cursor pagination stays correct
+    //      under name-asc ordering. Same pattern as employees list.
+    //   2. Otherwise (My Payslips list across runs): keep the existing
+    //      year/month/createdAt DESC order with the id-cursor.
+    const isRunScoped = Boolean(runId);
+
+    if (cursor) {
+      if (isRunScoped) {
+        const cursorSlip = await prisma.payslip.findUnique({
+          where: { id: Number(cursor) },
+          select: { employee: { select: { name: true } } },
+        });
+        if (cursorSlip) {
+          where['employee'] = { name: { gt: cursorSlip.employee.name } };
+        }
+      } else {
+        where['id'] = { gt: Number(cursor) };
+      }
+    }
 
     const slips = await prisma.payslip.findMany({
       where,
-      orderBy: [{ year: 'desc' }, { month: 'desc' }, { createdAt: 'desc' }],
+      orderBy: isRunScoped
+        ? { employee: { name: 'asc' } }
+        : [{ year: 'desc' }, { month: 'desc' }, { createdAt: 'desc' }],
       take: (Number(limit) || 20) + 1,
       include: slipInclude,
     });
