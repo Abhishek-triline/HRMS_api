@@ -61,20 +61,21 @@ export async function generatePayslipCode(
   const prefix = `P-${year}-${String(month).padStart(2, '0')}-`;
 
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
-    // Upsert the counter row so it exists before we lock it.
+    // Upsert the counter row so it exists before we lock it. v2 schema: composite
+    // PK (year, month), single `number` column — no id, no kind discriminator.
     await tx.$executeRaw`
-      INSERT INTO payroll_code_counters (id, year, month, kind, lastSeq)
-      VALUES (${`psc-${year}-${month}`}, ${year}, ${month}, ${'payslip'}, 0)
+      INSERT INTO payroll_code_counters (year, month, number)
+      VALUES (${year}, ${month}, 0)
       ON DUPLICATE KEY UPDATE year = year
     `;
 
-    const rows = await tx.$queryRaw<Array<{ lastSeq: number }>>`
-      SELECT lastSeq FROM payroll_code_counters
-      WHERE year = ${year} AND month = ${month} AND kind = ${'payslip'}
+    const rows = await tx.$queryRaw<Array<{ number: number }>>`
+      SELECT number FROM payroll_code_counters
+      WHERE year = ${year} AND month = ${month}
       FOR UPDATE
     `;
 
-    const current = rows[0]?.lastSeq ?? 0;
+    const current = rows[0]?.number ?? 0;
     const next = current + 1 + attempt;
 
     if (next > 9999) {
@@ -83,8 +84,8 @@ export async function generatePayslipCode(
 
     await tx.$executeRaw`
       UPDATE payroll_code_counters
-      SET lastSeq = ${next}
-      WHERE year = ${year} AND month = ${month} AND kind = ${'payslip'}
+      SET number = ${next}
+      WHERE year = ${year} AND month = ${month}
     `;
 
     const code = `${prefix}${String(next).padStart(4, '0')}`;

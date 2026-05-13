@@ -23,18 +23,18 @@ export async function generateEncashmentCode(
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
     // Ensure counter row exists
     await tx.$executeRaw`
-      INSERT INTO encashment_code_counters (year, lastSeq)
+      INSERT INTO encashment_code_counters (year, number)
       VALUES (${year}, 0)
       ON DUPLICATE KEY UPDATE year = year
     `;
 
-    const rows = await tx.$queryRaw<Array<{ lastSeq: number }>>`
-      SELECT lastSeq FROM encashment_code_counters
+    const rows = await tx.$queryRaw<Array<{ number: number }>>`
+      SELECT number FROM encashment_code_counters
       WHERE year = ${year}
       FOR UPDATE
     `;
 
-    const current = rows[0]?.lastSeq ?? 0;
+    const current = rows[0]?.number ?? 0;
     const next = current + 1 + attempt;
 
     if (next > 9999) {
@@ -42,7 +42,7 @@ export async function generateEncashmentCode(
     }
 
     await tx.$executeRaw`
-      UPDATE encashment_code_counters SET lastSeq = ${next} WHERE year = ${year}
+      UPDATE encashment_code_counters SET number = ${next} WHERE year = ${year}
     `;
 
     const code = `${prefix}${String(next).padStart(4, '0')}`;

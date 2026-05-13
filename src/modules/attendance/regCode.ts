@@ -29,19 +29,19 @@ export async function generateRegCode(
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
     // Lock the counter row for this year; create at 0 if it does not exist yet.
     await tx.$executeRaw`
-      INSERT INTO reg_code_counters (year, lastSeq)
+      INSERT INTO reg_code_counters (year, number)
       VALUES (${year}, 0)
       ON DUPLICATE KEY UPDATE year = year
     `;
 
     // SELECT … FOR UPDATE serialises concurrent code generation for the same year.
-    const rows = await tx.$queryRaw<Array<{ lastSeq: number }>>`
-      SELECT lastSeq FROM reg_code_counters
+    const rows = await tx.$queryRaw<Array<{ number: number }>>`
+      SELECT number FROM reg_code_counters
       WHERE year = ${year}
       FOR UPDATE
     `;
 
-    const current = rows[0]?.lastSeq ?? 0;
+    const current = rows[0]?.number ?? 0;
     const next = current + 1 + attempt; // bump by attempt on retry
 
     if (next > 9999) {
@@ -49,7 +49,7 @@ export async function generateRegCode(
     }
 
     await tx.$executeRaw`
-      UPDATE reg_code_counters SET lastSeq = ${next} WHERE year = ${year}
+      UPDATE reg_code_counters SET number = ${next} WHERE year = ${year}
     `;
 
     const code = `${prefix}${String(next).padStart(4, '0')}`;
