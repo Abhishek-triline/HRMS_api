@@ -43,6 +43,9 @@ const CONFIG_DEFAULTS: Array<{ key: string; value: unknown }> = [
   // admin can change this and re-seed to get a different pattern.
   { key: 'ATTENDANCE_WEEKLY_OFF_DAYS', value: ['Sat', 'Sun'] },
   { key: 'ATTENDANCE_STANDARD_DAILY_HOURS', value: 8 },
+  // Undo check-out grace window (minutes). 0 disables undo entirely;
+  // anything > 0 lets an employee revert a check-out within that window.
+  { key: 'ATTENDANCE_UNDO_WINDOW_MINUTES', value: 5 },
   { key: 'STANDARD_TAX_REFERENCE_RATE', value: 0.095 },
   { key: 'TAX_GROSS_TAXABLE_BASIS', value: 'GrossMinusStandardDeduction' },
   // Leave Encashment window (BL-LE-04)

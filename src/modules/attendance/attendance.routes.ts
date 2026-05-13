@@ -180,6 +180,7 @@ attendanceRouter.get(
           lateThreshold,
           standardDailyHours,
           lateMonthCount: lateLedger?.count ?? 0,
+          undoWindowMinutes: attendanceCfg.undoWindowMinutes,
         },
       });
     } catch (err: unknown) {

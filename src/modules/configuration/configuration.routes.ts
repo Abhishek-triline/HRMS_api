@@ -207,6 +207,29 @@ configurationRouter.put(
           });
         }
 
+        if (body.undoWindowMinutes !== undefined) {
+          const { before, after } = await upsertConfigKey(
+            tx,
+            'ATTENDANCE_UNDO_WINDOW_MINUTES',
+            body.undoWindowMinutes,
+            actorIdStr,
+          );
+          changedKeys.push({ key: 'ATTENDANCE_UNDO_WINDOW_MINUTES', before, after });
+
+          await audit({
+            tx,
+            actorId,
+            actorRole,
+            actorIp,
+            action: 'config.attendance.update',
+            module: 'configuration',
+            targetType: 'Configuration',
+            targetId: null,
+            before: { key: 'ATTENDANCE_UNDO_WINDOW_MINUTES', value: beforeResolved.undoWindowMinutes },
+            after: { key: 'ATTENDANCE_UNDO_WINDOW_MINUTES', value: after },
+          });
+        }
+
         // Notify all active Admins (BL-044 — Configuration category)
         if (changedKeys.length > 0) {
           const admins = await tx.employee.findMany({

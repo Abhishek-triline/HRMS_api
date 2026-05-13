@@ -79,6 +79,7 @@ const ATTENDANCE_DEFAULTS: AttendanceConfig = {
   lateThresholdTime: '10:30',
   standardDailyHours: 8,
   weeklyOffDays: ['Sat', 'Sun'],
+  undoWindowMinutes: 5,
 };
 
 /**
@@ -111,11 +112,12 @@ export async function getAttendanceConfig(): Promise<AttendanceConfig> {
   if (cached) return cached;
 
   // Read all keys in parallel
-  const [thresholdVal, hoursVal, legacyThresholdVal, weeklyOffVal] = await Promise.all([
+  const [thresholdVal, hoursVal, legacyThresholdVal, weeklyOffVal, undoWindowVal] = await Promise.all([
     readConfigKey('ATTENDANCE_LATE_THRESHOLD_TIME'),
     readConfigKey('ATTENDANCE_STANDARD_DAILY_HOURS'),
     readConfigKey('LATE_THRESHOLD'), // legacy Phase-3 alias
     readConfigKey('ATTENDANCE_WEEKLY_OFF_DAYS'),
+    readConfigKey('ATTENDANCE_UNDO_WINDOW_MINUTES'),
   ]);
 
   // Resolve lateThresholdTime: prefer new key, fall back to legacy, then default
@@ -138,7 +140,13 @@ export async function getAttendanceConfig(): Promise<AttendanceConfig> {
   const parsedWeeklyOff = parseWeeklyOffDays(weeklyOffVal);
   const weeklyOffDays: Weekday[] = parsedWeeklyOff ?? [...ATTENDANCE_DEFAULTS.weeklyOffDays];
 
-  const result: AttendanceConfig = { lateThresholdTime, standardDailyHours, weeklyOffDays };
+  // Resolve undoWindowMinutes — integer in [0, 60]. 0 disables undo.
+  let undoWindowMinutes = ATTENDANCE_DEFAULTS.undoWindowMinutes;
+  if (typeof undoWindowVal === 'number' && Number.isFinite(undoWindowVal) && undoWindowVal >= 0 && undoWindowVal <= 60) {
+    undoWindowMinutes = Math.round(undoWindowVal);
+  }
+
+  const result: AttendanceConfig = { lateThresholdTime, standardDailyHours, weeklyOffDays, undoWindowMinutes };
   cacheSet(CACHE_KEY, result);
   return result;
 }

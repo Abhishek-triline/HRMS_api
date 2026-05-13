@@ -620,8 +620,19 @@ export async function undoCheckOutForEmployee(
     throw err;
   }
 
+  // Undo window is admin-configurable (default 5 min). 0 disables undo
+  // entirely — every check-out is final; correction must go through a
+  // regularisation request.
+  const { undoWindowMinutes } = await getAttendanceConfig();
+  if (undoWindowMinutes === 0) {
+    const err = Object.assign(
+      new Error('Undo is disabled — contact your manager for a regularisation.'),
+      { httpStatus: 409, code: 'UNDO_DISABLED' },
+    );
+    throw err;
+  }
   const minutesSinceCheckOut = (now.getTime() - existing.checkOutTime.getTime()) / 60_000;
-  if (minutesSinceCheckOut > 5) {
+  if (minutesSinceCheckOut > undoWindowMinutes) {
     const err = Object.assign(
       new Error('Undo window expired — contact your manager for a regularisation.'),
       { httpStatus: 409, code: 'UNDO_WINDOW_EXPIRED' },
