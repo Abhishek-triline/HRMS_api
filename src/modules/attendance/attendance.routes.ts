@@ -561,6 +561,7 @@ function formatAttendanceCalendarItem(row: {
   hoursWorkedMinutes: number | null;
   late: boolean;
   targetHours: number;
+  lateMonthCount: number;
 }) {
   return {
     date: row.date.toISOString().split('T')[0]!,
@@ -570,5 +571,6 @@ function formatAttendanceCalendarItem(row: {
     hoursWorkedMinutes: row.hoursWorkedMinutes ?? null,
     late: row.late,
     targetHours: row.targetHours,
+    lateMonthCount: row.lateMonthCount,
   };
 }
