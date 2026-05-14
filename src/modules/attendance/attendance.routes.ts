@@ -24,7 +24,7 @@ import { AttendanceListQuerySchema, AttendanceStatsQuerySchema } from '@nexora/c
 import { getSubordinateIds } from '../employees/hierarchy.js';
 import { logger } from '../../lib/logger.js';
 import { getAttendanceConfig } from '../../lib/config.js';
-import { RoleId, AttendanceSource, AttendanceStatus } from '../../lib/statusInt.js';
+import { RoleId, AttendanceSource, AttendanceStatus, EmployeeStatus } from '../../lib/statusInt.js';
 import {
   recordCheckIn,
   recordCheckOut,
@@ -457,25 +457,45 @@ attendanceRouter.get(
         where['employee'] = { departmentId: q.departmentId };
       }
 
-      const [byStatus, lateCount, yetToCheckIn, total] = await Promise.all([
-        prisma.attendanceRecord.groupBy({
-          by: ['status'],
-          where,
-          _count: { _all: true },
-        }),
-        prisma.attendanceRecord.count({ where: { ...where, late: true } }),
-        prisma.attendanceRecord.count({
-          where: { ...where, status: AttendanceStatus.Absent, checkInTime: null },
-        }),
-        prisma.attendanceRecord.count({ where }),
-      ]);
+      // Denominator for percentages and the "Yet to Check-in" tile must be
+      // the active-employee count, not the attendance-record count. Otherwise,
+      // any employee without a row for the date (midnight job hasn't fired
+      // yet, brand-new hire, seed gap, etc.) is invisible to every KPI bucket
+      // and Present/Total falsely reads 100%.
+      const activeEmployeeWhere: Record<string, unknown> = {
+        status: {
+          in: [EmployeeStatus.Active, EmployeeStatus.OnNotice, EmployeeStatus.OnLeave],
+        },
+        ...(q.departmentId ? { departmentId: q.departmentId } : {}),
+      };
+
+      const [byStatus, lateCount, absentNoCheckIn, recordedTotal, activeEmployeeCount] =
+        await Promise.all([
+          prisma.attendanceRecord.groupBy({
+            by: ['status'],
+            where,
+            _count: { _all: true },
+          }),
+          prisma.attendanceRecord.count({ where: { ...where, late: true } }),
+          prisma.attendanceRecord.count({
+            where: { ...where, status: AttendanceStatus.Absent, checkInTime: null },
+          }),
+          prisma.attendanceRecord.count({ where }),
+          prisma.employee.count({ where: activeEmployeeWhere }),
+        ]);
 
       const counts: Record<number, number> = {};
       for (const row of byStatus) counts[row.status] = row._count._all;
 
+      // Employees with no attendance row at all for the date fall into
+      // "yet to check-in" alongside the rows already marked Absent with
+      // null checkInTime.
+      const noRowYet = Math.max(0, activeEmployeeCount - recordedTotal);
+      const yetToCheckIn = absentNoCheckIn + noRowYet;
+
       res.status(200).json({
         data: {
-          total,
+          total: activeEmployeeCount,
           present:   counts[AttendanceStatus.Present]   ?? 0,
           absent:    counts[AttendanceStatus.Absent]    ?? 0,
           onLeave:   counts[AttendanceStatus.OnLeave]   ?? 0,
