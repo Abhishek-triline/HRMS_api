@@ -8,10 +8,10 @@
   "scripts": {
     "postinstall": "prisma generate",
     "dev": "tsx watch src/index.ts",
-    "prebuild": "pnpm -F @nexora/contracts run build",
+    "prebuild": "tsc -p ../../packages/contracts",
     "build": "prisma generate && tsc",
     "start": "node dist/index.js",
-    "pretypecheck": "pnpm -F @nexora/contracts run build",
+    "pretypecheck": "tsc -p ../../packages/contracts",
     "typecheck": "prisma generate && tsc --noEmit",
     "lint": "eslint src --ext .ts",
     "test": "vitest",
