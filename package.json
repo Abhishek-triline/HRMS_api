@@ -6,10 +6,11 @@
   "type": "module",
   "main": "./dist/index.js",
   "scripts": {
+    "postinstall": "prisma generate",
     "dev": "tsx watch src/index.ts",
-    "build": "tsc",
+    "build": "prisma generate && tsc",
     "start": "node dist/index.js",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "prisma generate && tsc --noEmit",
     "lint": "eslint src --ext .ts",
     "test": "vitest",
     "db:migrate": "prisma migrate dev",
