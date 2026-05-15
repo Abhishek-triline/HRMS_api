@@ -239,8 +239,9 @@ attendanceRouter.get(
       });
 
       const hasMore = rows.length > limit;
-      const items = hasMore ? rows.slice(0, limit) : rows;
-      const nextCursor = hasMore ? String(items[items.length - 1]!.id) : null;
+      const systemItems = hasMore ? rows.slice(0, limit) : rows;
+      const items = await mergeRegularisationOverlays(systemItems, false);
+      const nextCursor = hasMore ? String(systemItems[systemItems.length - 1]!.id) : null;
 
       res.status(200).json({
         data: items.map((r) => ({
@@ -318,8 +319,9 @@ attendanceRouter.get(
       });
 
       const hasMore = rows.length > limit;
-      const items = hasMore ? rows.slice(0, limit) : rows;
-      const nextCursor = hasMore ? String(items[items.length - 1]!.id) : null;
+      const systemItems = hasMore ? rows.slice(0, limit) : rows;
+      const items = await mergeRegularisationOverlays(systemItems, false);
+      const nextCursor = hasMore ? String(systemItems[systemItems.length - 1]!.id) : null;
 
       res.status(200).json({
         data: items.map((r) => ({
@@ -402,8 +404,9 @@ attendanceRouter.get(
       });
 
       const hasMore = rows.length > limit;
-      const items = hasMore ? rows.slice(0, limit) : rows;
-      const nextCursor = hasMore ? String(items[items.length - 1]!.id) : null;
+      const systemItems = hasMore ? rows.slice(0, limit) : rows;
+      const items = await mergeRegularisationOverlays(systemItems, true);
+      const nextCursor = hasMore ? String(systemItems[systemItems.length - 1]!.id) : null;
 
       res.status(200).json({
         data: items.map((r) => ({
@@ -573,4 +576,63 @@ function formatAttendanceCalendarItem(row: {
     targetHours: row.targetHours,
     lateMonthCount: row.lateMonthCount,
   };
+}
+
+/**
+ * Substitute approved regularisation overlay rows in place of the original
+ * system rows on user-visible attendance lists.
+ *
+ * The midnight job and check-in/check-out flows write a row with
+ * sourceId=system. When a regularisation is approved, the service writes a
+ * second row with sourceId=regularisation for the same (employeeId, date)
+ * pair — the original is preserved for audit (BL: "Original record is
+ * preserved"). Without merging, the user keeps seeing the uncorrected
+ * system row even after their request was approved.
+ *
+ * We do this as a second query (rather than a UNION in the list WHERE) so
+ * cursor pagination — keyed on system-row id — stays clean.
+ */
+async function mergeRegularisationOverlays<
+  R extends { id: number; employeeId: number; date: Date },
+>(rows: R[], includeEmployeeDepartment: boolean): Promise<R[]> {
+  if (rows.length === 0) return rows;
+  // Deduplicate the OR list so we don't ship a giant where to MySQL when
+  // multiple rows on a single page share employeeId/date (e.g. team views).
+  const keySet = new Set<string>();
+  const filters: { employeeId: number; date: Date }[] = [];
+  for (const r of rows) {
+    const key = `${r.employeeId}|${r.date.toISOString()}`;
+    if (!keySet.has(key)) {
+      keySet.add(key);
+      filters.push({ employeeId: r.employeeId, date: r.date });
+    }
+  }
+
+  const overlays = await prisma.attendanceRecord.findMany({
+    where: {
+      sourceId: AttendanceSource.regularisation,
+      OR: filters,
+    },
+    include: {
+      employee: {
+        select: {
+          name: true,
+          code: true,
+          ...(includeEmployeeDepartment
+            ? { department: { select: { name: true } } }
+            : {}),
+        },
+      },
+    },
+  });
+
+  const overlayByKey = new Map<string, R>();
+  for (const o of overlays) {
+    overlayByKey.set(`${o.employeeId}|${o.date.toISOString()}`, o as unknown as R);
+  }
+
+  return rows.map((r) => {
+    const overlay = overlayByKey.get(`${r.employeeId}|${r.date.toISOString()}`);
+    return overlay ?? r;
+  });
 }
