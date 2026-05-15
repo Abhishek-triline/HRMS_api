@@ -57,6 +57,7 @@ import {
   RoutedTo,
   LedgerReason,
   CancelledByRole,
+  AttendanceSource,
   type RoleIdValue,
   type AuditActorRoleValue,
 } from '../../lib/statusInt.js';
@@ -617,6 +618,52 @@ leaveRouter.post(
       return;
     }
 
+    // ── Self-apply guardrails ──────────────────────────────────────────
+    // Compute "today" in the server's local TZ (Asia/Kolkata per the
+    // .env contract). Server uses local-date arithmetic for BL rules
+    // anchored to the calendar day; the leave dates are stored as UTC
+    // midnight, but the YYYY-MM-DD string comparison below is timezone-
+    // safe because both sides are extracted as local calendar strings.
+    const now = new Date();
+    const todayYmd = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+    const currentYear = now.getFullYear();
+
+    // Guard 1 — past dates are not allowed via the leave form. The
+    // proper path for "I was absent yesterday for a reason" is the
+    // Regularisation flow (BL-029), which has its own age-based
+    // routing. Allowing past leave here would bypass that.
+    if (fromDateStr < todayYmd) {
+      res.status(409).json(
+        errorEnvelope(
+          ErrorCode.LEAVE_FROM_DATE_IN_PAST,
+          "Past dates can't be applied as leave. Use the Regularisation form to correct a past attendance record.",
+          { ruleId: 'BL-LEAVE-PAST' },
+        ),
+      );
+      return;
+    }
+
+    // Guard 2 — both dates must fall within the current calendar year
+    // for non-event-based leaves. Quotas reset on Jan 1 and the
+    // carry-forward / new-accrual job hasn't run for future years yet,
+    // so the server can't reliably debit balances across the boundary.
+    // Maternity (5) / Paternity (6) are event-based and can span any
+    // year — they have separate entitlement rules and don't deduct
+    // from yearly quotas, so we exempt them here.
+    const isEventBased = leaveTypeId === 5 || leaveTypeId === 6;
+    const fromYear = Number(fromDateStr.slice(0, 4));
+    const toYear = Number(toDateStr.slice(0, 4));
+    if (!isEventBased && (fromYear !== currentYear || toYear !== currentYear)) {
+      res.status(409).json(
+        errorEnvelope(
+          ErrorCode.LEAVE_CROSSES_YEAR_BOUNDARY,
+          `Leave dates must fall within the current calendar year (${currentYear}). For year-end breaks, file separate requests for each year.`,
+          { ruleId: 'BL-LEAVE-YEAR', details: { currentYear } },
+        ),
+      );
+      return;
+    }
+
     const days = computeLeaveDays(fromDate, toDate);
     const year = fromDate.getFullYear();
 
@@ -632,6 +679,38 @@ leaveRouter.post(
           e.statusCode = 404;
           e.code = ErrorCode.NOT_FOUND;
           throw e;
+        }
+
+        // Guard 3 — if the leave starts TODAY and the employee has
+        // already checked in, block. Today's attendance row already
+        // reads status=Present with a real checkInTime; approving a
+        // same-day leave would leave the system holding two
+        // contradictory truths about today (Present + OnLeave). The
+        // intended path for "I came in then had to leave" is a
+        // Regularisation request, which overlays the attendance row
+        // cleanly. fromDate is parsed as UTC midnight; the row key is
+        // also stored as a date-only column at UTC midnight, so the
+        // findUnique below is exact.
+        if (fromDateStr === todayYmd) {
+          const todaysRow = await tx.attendanceRecord.findUnique({
+            where: {
+              employeeId_date_sourceId: {
+                employeeId: user.id,
+                date: fromDate,
+                sourceId: AttendanceSource.system,
+              },
+            },
+            select: { checkInTime: true },
+          });
+          if (todaysRow?.checkInTime) {
+            const e: TxError = new Error(
+              "You've already checked in today. Submit a Regularisation request to convert today into a leave day.",
+            );
+            e.statusCode = 409;
+            e.code = ErrorCode.LEAVE_SAME_DAY_ALREADY_CHECKED_IN;
+            e.ruleId = 'BL-LEAVE-SAME-DAY';
+            throw e;
+          }
         }
 
         // BL-009: check overlap with existing leave
