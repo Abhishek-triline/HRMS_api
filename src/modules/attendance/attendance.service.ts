@@ -74,6 +74,24 @@ export interface RegularisationConflictError {
 }
 
 /**
+ * Thrown when a regularisation can't be created or approved because another
+ * regularisation already owns the (employee, date) slot:
+ *   - Submit-time: a Pending or Approved reg already exists for this date.
+ *   - Approve-time: an attendance overlay row (sourceId=regularisation) is
+ *     already in place for this date from a different reg — approving would
+ *     hit the DB unique constraint on (employeeId, date, sourceId).
+ */
+export interface RegularisationDuplicateError {
+  code: typeof ErrorCode.REGULARISATION_DUPLICATE;
+  details: {
+    conflictRegId: number;
+    conflictRegCode: string;
+    conflictStatus: number;
+    conflictDate: string;
+  };
+}
+
+/**
  * Parse "HH:MM" into { hours, minutes }.
  */
 function parseHHMM(hhmm: string): { hours: number; minutes: number } {
@@ -755,6 +773,31 @@ export async function submitRegularisation(
     throw err;
   }
 
+  // Reject submissions that duplicate an existing reg (Pending or Approved)
+  // for the same (employee, date). Without this guard, two regs can land on
+  // the same date and the second approval hits the DB unique constraint on
+  // (employeeId, date, sourceId=regularisation) and 500s.
+  const duplicateReg = await tx.regularisationRequest.findFirst({
+    where: {
+      employeeId,
+      date: dateOnly,
+      status: { in: [RegStatus.Pending, RegStatus.Approved] },
+    },
+    select: { id: true, code: true, status: true },
+  });
+  if (duplicateReg) {
+    const err: RegularisationDuplicateError = {
+      code: ErrorCode.REGULARISATION_DUPLICATE,
+      details: {
+        conflictRegId: duplicateReg.id,
+        conflictRegCode: duplicateReg.code,
+        conflictStatus: duplicateReg.status,
+        conflictDate: dateOnly.toISOString().split('T')[0]!,
+      },
+    };
+    throw err;
+  }
+
   const msPerDay = 1000 * 60 * 60 * 24;
   const ageDaysAtSubmit = Math.round((today.getTime() - dateOnly.getTime()) / msPerDay);
 
@@ -863,6 +906,40 @@ export async function approveRegularisation(
 ) {
   const dateOnly = new Date(reg.date);
   dateOnly.setUTCHours(0, 0, 0, 0);
+
+  // Pre-flight: if another reg already produced an overlay attendance row
+  // for this (employee, date), refuse the approval up-front with a 409
+  // rather than letting the DB unique constraint throw a 500. This typically
+  // happens when two pending regs were queued for the same date and one was
+  // approved first — the second one needs to be Rejected, not Approved.
+  const existingOverlay = await tx.attendanceRecord.findUnique({
+    where: {
+      employeeId_date_sourceId: {
+        employeeId: reg.employeeId,
+        date: dateOnly,
+        sourceId: AttendanceSource.regularisation,
+      },
+    },
+    select: { regularisationId: true },
+  });
+  if (existingOverlay && existingOverlay.regularisationId !== reg.id) {
+    const owner = existingOverlay.regularisationId
+      ? await tx.regularisationRequest.findUnique({
+          where: { id: existingOverlay.regularisationId },
+          select: { id: true, code: true, status: true },
+        })
+      : null;
+    const err: RegularisationDuplicateError = {
+      code: ErrorCode.REGULARISATION_DUPLICATE,
+      details: {
+        conflictRegId: owner?.id ?? existingOverlay.regularisationId ?? 0,
+        conflictRegCode: owner?.code ?? '',
+        conflictStatus: owner?.status ?? RegStatus.Approved,
+        conflictDate: dateOnly.toISOString().split('T')[0]!,
+      },
+    };
+    throw err;
+  }
 
   const derivedStatus = await deriveStatusForDay(reg.employeeId, dateOnly, tx);
   const status = derivedStatus ?? (reg.proposedCheckIn ? AttendanceStatus.Present : AttendanceStatus.Absent);
@@ -1133,6 +1210,12 @@ export function formatRegularisation(row: {
   createdAt: Date;
   updatedAt: Date;
   version: number;
+  originalRecord?: {
+    status: number;
+    checkInTime: Date | null;
+    checkOutTime: Date | null;
+    late: boolean;
+  } | null;
 }) {
   return {
     id: row.id,
@@ -1153,6 +1236,14 @@ export function formatRegularisation(row: {
     decidedBy: row.decidedBy ?? null,
     decisionNote: row.decisionNote ?? null,
     correctedRecordId: row.correctedRecordId ?? null,
+    originalRecord: row.originalRecord
+      ? {
+          status: row.originalRecord.status,
+          checkInTime: row.originalRecord.checkInTime?.toISOString() ?? null,
+          checkOutTime: row.originalRecord.checkOutTime?.toISOString() ?? null,
+          late: row.originalRecord.late,
+        }
+      : null,
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),
     version: row.version,

@@ -26,7 +26,7 @@ import {
 } from '@nexora/contracts/attendance';
 import { getSubordinateIds } from '../employees/hierarchy.js';
 import { logger } from '../../lib/logger.js';
-import type { RegularisationConflictError } from './attendance.service.js';
+import type { RegularisationConflictError, RegularisationDuplicateError } from './attendance.service.js';
 import {
   submitRegularisation,
   approveRegularisation,
@@ -37,6 +37,7 @@ import {
 import {
   RoleId,
   RegStatus,
+  AttendanceSource,
 } from '../../lib/statusInt.js';
 
 export const regularisationsRouter = Router();
@@ -50,6 +51,16 @@ function isRegConflict(err: unknown): err is RegularisationConflictError {
     err !== null &&
     'code' in err &&
     (err as Record<string, unknown>)['code'] === ErrorCode.LEAVE_REG_CONFLICT
+  );
+}
+
+/** Type guard for RegularisationDuplicateError thrown by the service. */
+function isRegDuplicate(err: unknown): err is RegularisationDuplicateError {
+  return (
+    typeof err === 'object' &&
+    err !== null &&
+    'code' in err &&
+    (err as Record<string, unknown>)['code'] === ErrorCode.REGULARISATION_DUPLICATE
   );
 }
 
@@ -134,6 +145,16 @@ regularisationsRouter.post(
             ErrorCode.LEAVE_REG_CONFLICT,
             'An approved leave covers this date — regularisation cannot be submitted.',
             { details: err.details, ruleId: 'BL-010' },
+          ),
+        );
+        return;
+      }
+      if (isRegDuplicate(err)) {
+        res.status(409).json(
+          errorEnvelope(
+            ErrorCode.REGULARISATION_DUPLICATE,
+            `A regularisation (${err.details.conflictRegCode}) already exists for ${err.details.conflictDate}. Wait for the existing request to be decided before submitting another for this date.`,
+            { details: err.details },
           ),
         );
         return;
@@ -280,7 +301,29 @@ regularisationsRouter.get(
         return;
       }
 
-      res.status(200).json({ data: formatRegularisation(reg) });
+      // Pull the original system attendance row for this (employeeId, date)
+      // so the detail response can show Original vs Proposed side-by-side
+      // without a second client round-trip. The midnight job seeds one row
+      // per active employee, so this lookup is normally cheap and present.
+      const originalRecord = await prisma.attendanceRecord.findUnique({
+        where: {
+          employeeId_date_sourceId: {
+            employeeId: reg.employeeId,
+            date: reg.date,
+            sourceId: AttendanceSource.system,
+          },
+        },
+        select: {
+          status: true,
+          checkInTime: true,
+          checkOutTime: true,
+          late: true,
+        },
+      });
+
+      res.status(200).json({
+        data: formatRegularisation({ ...reg, originalRecord }),
+      });
     } catch (err: unknown) {
       logger.error({ err, regId: id, userId: user.id }, 'regularisations.get: error');
       res.status(500).json(errorEnvelope(ErrorCode.INTERNAL_ERROR, 'Failed to load regularisation.'));
@@ -369,6 +412,16 @@ regularisationsRouter.post(
 
       res.status(200).json({ data: formatRegularisation(updated) });
     } catch (err: unknown) {
+      if (isRegDuplicate(err)) {
+        res.status(409).json(
+          errorEnvelope(
+            ErrorCode.REGULARISATION_DUPLICATE,
+            `Another regularisation (${err.details.conflictRegCode}) has already corrected ${err.details.conflictDate}. This request should be rejected as a duplicate instead.`,
+            { details: err.details },
+          ),
+        );
+        return;
+      }
       logger.error({ err, regId: id, userId: user.id }, 'regularisations.approve: error');
       res.status(500).json(errorEnvelope(ErrorCode.INTERNAL_ERROR, 'Failed to approve regularisation.'));
     }
