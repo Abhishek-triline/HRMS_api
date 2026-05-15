@@ -1198,9 +1198,11 @@ payslipsRouter.get(
         lopDays: s.lopDays,
         grossPaise:    redact ? null : s.grossPaise,
         finalTaxPaise: redact ? null : s.finalTaxPaise,
+        referenceTaxPaise: redact ? null : s.referenceTaxPaise,
         netPayPaise:   redact ? null : s.netPayPaise,
         finalisedAt: s.finalisedAt?.toISOString() ?? null,
         reversalOfPayslipId: s.reversalOfPayslipId,
+        version: s.version,
       };
     });
 
