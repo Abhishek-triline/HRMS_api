@@ -179,6 +179,7 @@ regularisationsRouter.get(
       employeeId?: number;
       fromDate?: string;
       toDate?: string;
+      q?: string;
       cursor?: string;
       limit?: number;
     };
@@ -203,7 +204,7 @@ regularisationsRouter.get(
               { approverId: user.id },
             ];
           } else {
-            res.status(200).json({ data: [], nextCursor: null });
+            res.status(200).json({ data: [], nextCursor: null, total: 0 });
             return;
           }
         } else {
@@ -224,18 +225,41 @@ regularisationsRouter.get(
         if (q.toDate) where['date']['lte'] = new Date(q.toDate);
       }
 
+      // Free-text employee search — matches either employee.name (contains,
+      // case-insensitive) or employee.code (exact prefix). The two clauses
+      // OR together so a search for "EMP-2024" or "Kavya" both land hits.
+      if (q.q) {
+        const term = q.q.trim();
+        const employeeOr = [
+          { employee: { name: { contains: term } } },
+          { employee: { code: { startsWith: term } } },
+        ];
+        // Compose with the existing OR (manager scope already added one);
+        // wrap both in AND so we don't accidentally widen the scope.
+        if (where['OR']) {
+          const existing = where['OR'];
+          delete where['OR'];
+          where['AND'] = [...(where['AND'] ?? []), { OR: existing }, { OR: employeeOr }];
+        } else {
+          where['OR'] = employeeOr;
+        }
+      }
+
       const cursorId = q.cursor && !isNaN(Number(q.cursor)) ? Number(q.cursor) : undefined;
 
-      const rows = await prisma.regularisationRequest.findMany({
-        where,
-        orderBy: { createdAt: 'desc' },
-        take: limit + 1,
-        ...(cursorId !== undefined ? { cursor: { id: cursorId }, skip: 1 } : {}),
-        include: {
-          employee: { select: { name: true, code: true } },
-          approver: { select: { name: true } },
-        },
-      });
+      const [rows, total] = await Promise.all([
+        prisma.regularisationRequest.findMany({
+          where,
+          orderBy: { createdAt: 'desc' },
+          take: limit + 1,
+          ...(cursorId !== undefined ? { cursor: { id: cursorId }, skip: 1 } : {}),
+          include: {
+            employee: { select: { name: true, code: true } },
+            approver: { select: { name: true } },
+          },
+        }),
+        prisma.regularisationRequest.count({ where }),
+      ]);
 
       const hasMore = rows.length > limit;
       const items = hasMore ? rows.slice(0, limit) : rows;
@@ -256,6 +280,7 @@ regularisationsRouter.get(
           createdAt: r.createdAt.toISOString(),
         })),
         nextCursor,
+        total,
       });
     } catch (err: unknown) {
       logger.error({ err, userId: user.id }, 'regularisations.list: error');
