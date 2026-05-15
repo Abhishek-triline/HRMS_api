@@ -497,7 +497,7 @@ async function deductLateMarkPenalty(
     recipientIds: employeeId,
     category: 'Attendance',
     title: 'Late-mark deduction applied',
-    body: '1 day has been deducted from your Annual leave balance due to repeated late check-ins this month (BL-028).',
+    body: '1 day has been deducted from your Annual leave balance due to repeated late check-ins this month.',
     link: '/employee/attendance',
   });
 
