@@ -430,7 +430,20 @@ export async function adminFinaliseEncashment(
     );
   }
 
-  if (enc.status !== LeaveEncashmentStatus.ManagerApproved) {
+  // Two valid pre-finalise states:
+  //   - ManagerApproved: normal two-step flow, manager already signed off.
+  //   - Pending + routedToId=Admin: one-step flow used when the employee
+  //     had no reporting manager (admins themselves, top-of-tree employees,
+  //     or employees whose manager has exited). Without this branch the
+  //     request would stay stuck in Pending — no manager exists to do the
+  //     intermediate step, and the admin can't run /manager-approve either.
+  const oneStepAdmin =
+    enc.status === LeaveEncashmentStatus.Pending &&
+    enc.routedToId === RoutedTo.Admin;
+  if (
+    enc.status !== LeaveEncashmentStatus.ManagerApproved &&
+    !oneStepAdmin
+  ) {
     throw makeError(409, 'VALIDATION_FAILED', `Cannot finalise encashment with this status.`);
   }
 

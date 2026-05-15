@@ -47,6 +47,48 @@ import {
   type AuditActorRoleValue,
 } from '../../lib/statusInt.js';
 
+// ── Estimate helper ─────────────────────────────────────────────────────────
+// Computes a preview amount for any encashment row whose locked amount is
+// null, using the same formula as adminFinaliseEncashment:
+//   ratePerDay = (basicPaise + daPaise) / 26
+//   amount     = ratePerDay × daysRequested
+// Batches one salary lookup per page rather than per row.
+const APPROX_WORKING_DAYS = 26;
+
+type EncashmentRow = ReturnType<typeof formatEncashment>;
+
+async function attachAmountEstimates(rows: EncashmentRow[]): Promise<Array<EncashmentRow & { amountPaiseEstimate: number | null }>> {
+  // Only rows still without a locked amount need an estimate.
+  const targetIds = Array.from(
+    new Set(rows.filter((r) => r.amountPaise == null).map((r) => r.employeeId)),
+  );
+  if (targetIds.length === 0) {
+    return rows.map((r) => ({ ...r, amountPaiseEstimate: null }));
+  }
+
+  const today = new Date();
+  const salaries = await prisma.salaryStructure.findMany({
+    where: { employeeId: { in: targetIds }, effectiveFrom: { lte: today } },
+    orderBy: [{ employeeId: 'asc' }, { effectiveFrom: 'desc' }],
+    select: { employeeId: true, basicPaise: true, daPaise: true, effectiveFrom: true },
+  });
+  // Keep only the most-recent effective-on-or-before-today row per employee.
+  const latest = new Map<number, { basicPaise: number; daPaise: number | null }>();
+  for (const s of salaries) {
+    if (!latest.has(s.employeeId)) {
+      latest.set(s.employeeId, { basicPaise: s.basicPaise, daPaise: s.daPaise });
+    }
+  }
+
+  return rows.map((r) => {
+    if (r.amountPaise != null) return { ...r, amountPaiseEstimate: null };
+    const sal = latest.get(r.employeeId);
+    if (!sal) return { ...r, amountPaiseEstimate: null };
+    const rate = Math.floor((sal.basicPaise + (sal.daPaise ?? 0)) / APPROX_WORKING_DAYS);
+    return { ...r, amountPaiseEstimate: rate * r.daysRequested };
+  });
+}
+
 // ── Router ────────────────────────────────────────────────────────────────────
 
 export const leaveEncashmentRouter = Router();
@@ -130,12 +172,15 @@ leaveEncashmentRouter.get(
   validateQuery(LeaveEncashmentListQuerySchema),
   async (req: Request, res: Response): Promise<void> => {
     const user = req.user!;
-    const { year, status, employeeId, cursor, limit } = req.query as {
+    const { year, status, employeeId, cursor, limit, fromDate, toDate, q } = req.query as {
       year?: string;
       status?: string;
       employeeId?: string;
       cursor?: string;
       limit?: string;
+      fromDate?: string;
+      toDate?: string;
+      q?: string;
     };
 
     const take = (Number(limit) || 20) + 1;
@@ -150,7 +195,7 @@ leaveEncashmentRouter.get(
       if (employeeId) {
         const empIdNum = Number(employeeId);
         if (!allowed.includes(empIdNum)) {
-          res.status(200).json({ data: [], nextCursor: null });
+          res.status(200).json({ data: [], nextCursor: null, total: 0 });
           return;
         }
         where['employeeId'] = empIdNum;
@@ -164,21 +209,50 @@ leaveEncashmentRouter.get(
 
     if (year) where['year'] = Number(year);
     if (status) where['status'] = Number(status);
+
+    // Submission window — matches createdAt. Both bounds are inclusive,
+    // toDate snaps to end-of-day so a single-day filter (from === to)
+    // captures the full calendar day.
+    if (fromDate || toDate) {
+      where['createdAt'] = {};
+      if (fromDate) where['createdAt']['gte'] = new Date(`${fromDate}T00:00:00.000Z`);
+      if (toDate) where['createdAt']['lte'] = new Date(`${toDate}T23:59:59.999Z`);
+    }
+
+    // Free-text employee search — name contains OR code startsWith.
+    if (q) {
+      const term = q.trim();
+      where['employee'] = {
+        ...(where['employee'] ?? {}),
+        OR: [
+          { name: { contains: term } },
+          { code: { startsWith: term } },
+        ],
+      };
+    }
+
+    // Snapshot the filter WHERE before adding the cursor clause so the
+    // total count reflects the full filter (not the current page slice).
+    const totalWhere = { ...where };
     if (cursor) where['id'] = { gt: Number(cursor) };
 
-    const items = await prisma.leaveEncashment.findMany({
-      where,
-      orderBy: { createdAt: 'desc' },
-      take,
-      include: encashmentInclude,
-    });
+    const [items, total] = await Promise.all([
+      prisma.leaveEncashment.findMany({
+        where,
+        orderBy: { createdAt: 'desc' },
+        take,
+        include: encashmentInclude,
+      }),
+      prisma.leaveEncashment.count({ where: totalWhere }),
+    ]);
 
     const hasMore = items.length > (Number(limit) || 20);
     const page = hasMore ? items.slice(0, Number(limit) || 20) : items;
     const lastId = page[page.length - 1]?.id ?? null;
     const nextCursor = hasMore && lastId !== null ? String(lastId) : null;
 
-    res.status(200).json({ data: page.map(formatEncashment), nextCursor });
+    const data = await attachAmountEstimates(page.map(formatEncashment));
+    res.status(200).json({ data, nextCursor, total });
   },
 );
 
@@ -204,21 +278,26 @@ leaveEncashmentRouter.get(
     }
     // Admin sees all pending/manager-approved
 
+    const totalWhere = { ...where };
     if (cursor) where['id'] = { gt: Number(cursor) };
 
-    const items = await prisma.leaveEncashment.findMany({
-      where,
-      orderBy: { createdAt: 'asc' },
-      take,
-      include: encashmentInclude,
-    });
+    const [items, total] = await Promise.all([
+      prisma.leaveEncashment.findMany({
+        where,
+        orderBy: { createdAt: 'asc' },
+        take,
+        include: encashmentInclude,
+      }),
+      prisma.leaveEncashment.count({ where: totalWhere }),
+    ]);
 
     const hasMore = items.length > (Number(limit) || 20);
     const page = hasMore ? items.slice(0, Number(limit) || 20) : items;
     const lastId = page[page.length - 1]?.id ?? null;
     const nextCursor = hasMore && lastId !== null ? String(lastId) : null;
 
-    res.status(200).json({ data: page.map(formatEncashment), nextCursor });
+    const data = await attachAmountEstimates(page.map(formatEncashment));
+    res.status(200).json({ data, nextCursor, total });
   },
 );
 
@@ -252,7 +331,31 @@ leaveEncashmentRouter.get(
       return;
     }
 
-    res.status(200).json({ data: formatEncashment(enc) });
+    // Preview rate + amount based on the employee's current salary, using
+    // the same formula as adminFinaliseEncashment ((basic + DA) / 26 days
+    // × daysRequested). Only surfaced before AdminFinalised — once locked,
+    // ratePerDayPaise is the source of truth and the estimate stays null.
+    let ratePerDayPaiseEstimate: number | null = null;
+    let amountPaiseEstimate: number | null = null;
+    if (enc.ratePerDayPaise === null) {
+      const today = new Date();
+      const salary = await prisma.salaryStructure.findFirst({
+        where: { employeeId: enc.employeeId, effectiveFrom: { lte: today } },
+        orderBy: { effectiveFrom: 'desc' },
+        select: { basicPaise: true, daPaise: true },
+      });
+      if (salary) {
+        const APPROX_WORKING_DAYS = 26;
+        ratePerDayPaiseEstimate = Math.floor(
+          (salary.basicPaise + (salary.daPaise ?? 0)) / APPROX_WORKING_DAYS,
+        );
+        amountPaiseEstimate = ratePerDayPaiseEstimate * enc.daysRequested;
+      }
+    }
+
+    res.status(200).json({
+      data: { ...formatEncashment(enc), ratePerDayPaiseEstimate, amountPaiseEstimate },
+    });
   },
 );
 
