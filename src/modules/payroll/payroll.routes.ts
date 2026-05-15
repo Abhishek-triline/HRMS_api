@@ -303,23 +303,45 @@ payrollRouter.post(
     let result;
     try {
       result = await prisma.$transaction(async (tx) => {
-        // Check for an existing non-Reversed run for this month+year.
-        const existing = await tx.payrollRun.findFirst({
+        // Look for any source-run rows (not themselves reversal records,
+        // not marked Reversed) for this (month, year). Any candidate that
+        // has NOT been reversed still owns the slot and blocks re-create.
+        //
+        // BL-032: a reversed source run keeps status=Finalised forever —
+        // the only "this slot is free again" signal is the existence of a
+        // child PayrollRun pointing at it via reversalOfRunId. We do that
+        // check explicitly here instead of relying on the source row's
+        // own fields, otherwise the user gets locked out of the month for
+        // life after the first reversal.
+        const candidates = await tx.payrollRun.findMany({
           where: {
             month,
             year,
             reversalOfRunId: null,
             status: { not: PayrollRunStatus.Reversed },
           },
+          select: { id: true, code: true, status: true },
         });
 
-        if (existing) {
-          const e: TxErr = new Error(
-            `A payroll run already exists for ${year}-${String(month).padStart(2, '0')} (code: ${existing.code}, status: ${existing.status}).`,
+        if (candidates.length > 0) {
+          const reversedSet = new Set(
+            (
+              await tx.payrollRun.findMany({
+                where: { reversalOfRunId: { in: candidates.map((c) => c.id) } },
+                select: { reversalOfRunId: true },
+              })
+            ).map((r) => r.reversalOfRunId!),
           );
-          e.statusCode = 409;
-          e.code = ErrorCode.RUN_ALREADY_EXISTS;
-          throw e;
+          const blocking = candidates.find((c) => !reversedSet.has(c.id));
+
+          if (blocking) {
+            const e: TxErr = new Error(
+              `A payroll run already exists for ${year}-${String(month).padStart(2, '0')} (code: ${blocking.code}, status: ${blocking.status}).`,
+            );
+            e.statusCode = 409;
+            e.code = ErrorCode.RUN_ALREADY_EXISTS;
+            throw e;
+          }
         }
 
         // Compute working days

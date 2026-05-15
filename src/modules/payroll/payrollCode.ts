@@ -1,8 +1,13 @@
 /**
  * Payroll code generators — Phase 4.
  *
- * Run codes:    RUN-YYYY-MM       (originals)
- *               RUN-YYYY-MM-R<n>  (reversal records, n = 1-based count)
+ * Run codes:    RUN-YYYY-MM        (first original for this month+year)
+ *               RUN-YYYY-MM-V<n>   (subsequent originals after a previous one
+ *                                   has been reversed — n is 2-based, so the
+ *                                   second-ever source run for the month is
+ *                                   …-V2, the third …-V3, etc.)
+ *               RUN-YYYY-MM-R<n>   (reversal records, n = 1-based count of
+ *                                   reversals for a given source code)
  *
  * Payslip codes: P-YYYY-MM-NNNN   (4-digit zero-padded sequence per month+year)
  *
@@ -31,9 +36,14 @@ export async function generateRunCode(
   tx: Prisma.TransactionClient,
 ): Promise<string> {
   const base = `RUN-${year}-${String(month).padStart(2, '0')}`;
-  // Original runs always carry a single code per month+year — no sequence needed.
-  // The UNIQUE (month, year, reversalOfRunId) constraint enforces uniqueness.
-  return base;
+  // First-ever source run for this (month, year) gets the bare base code.
+  // After a reversal, the same slot becomes available again — the next
+  // source run gets a -V<n> suffix so the `code` UNIQUE constraint doesn't
+  // collide with the prior, immutable Finalised run row.
+  const priorSourceCount = await tx.payrollRun.count({
+    where: { month, year, reversalOfRunId: null },
+  });
+  return priorSourceCount === 0 ? base : `${base}-V${priorSourceCount + 1}`;
 }
 
 /**
