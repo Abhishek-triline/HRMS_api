@@ -1096,7 +1096,7 @@ payslipsRouter.get(
       if (employeeId) {
         const empId = Number(employeeId);
         if (!allowed.includes(empId)) {
-          res.status(200).json({ data: [], nextCursor: null });
+          res.status(200).json({ data: [], nextCursor: null, total: 0 });
           return;
         }
         where['employeeId'] = empId;
@@ -1126,6 +1126,10 @@ payslipsRouter.get(
     //      year/month/createdAt DESC order with the id-cursor.
     const isRunScoped = Boolean(runId);
 
+    // Snapshot the filter WHERE before adding the cursor clause so the
+    // total count reflects the full filter (not the current page slice).
+    const totalWhere = { ...where };
+
     if (cursor) {
       if (isRunScoped) {
         const cursorSlip = await prisma.payslip.findUnique({
@@ -1140,14 +1144,17 @@ payslipsRouter.get(
       }
     }
 
-    const slips = await prisma.payslip.findMany({
-      where,
-      orderBy: isRunScoped
-        ? { employee: { name: 'asc' } }
-        : [{ year: 'desc' }, { month: 'desc' }, { createdAt: 'desc' }],
-      take: (Number(limit) || 20) + 1,
-      include: slipInclude,
-    });
+    const [slips, total] = await Promise.all([
+      prisma.payslip.findMany({
+        where,
+        orderBy: isRunScoped
+          ? { employee: { name: 'asc' } }
+          : [{ year: 'desc' }, { month: 'desc' }, { createdAt: 'desc' }],
+        take: (Number(limit) || 20) + 1,
+        include: slipInclude,
+      }),
+      prisma.payslip.count({ where: totalWhere }),
+    ]);
 
     const hasMore = slips.length > (Number(limit) || 20);
     const page = hasMore ? slips.slice(0, Number(limit) || 20) : slips;
@@ -1175,7 +1182,7 @@ payslipsRouter.get(
       };
     });
 
-    res.status(200).json({ data: summaries, nextCursor });
+    res.status(200).json({ data: summaries, nextCursor, total });
   },
 );
 
