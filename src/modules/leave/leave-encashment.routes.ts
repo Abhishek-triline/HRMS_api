@@ -353,8 +353,30 @@ leaveEncashmentRouter.get(
       }
     }
 
+    // Resolve names for decidedBy / cancelledBy so the timeline reads
+    // "By: Priya Sharma" instead of "By: 1". Single batched lookup; the
+    // schema doesn't define explicit relations for these FK columns so we
+    // can't include them via Prisma's relation loader.
+    const actorIds = Array.from(
+      new Set([enc.decidedBy, enc.cancelledBy].filter((v): v is number => v != null)),
+    );
+    const actorMap = new Map<number, string>();
+    if (actorIds.length > 0) {
+      const actors = await prisma.employee.findMany({
+        where: { id: { in: actorIds } },
+        select: { id: true, name: true },
+      });
+      for (const a of actors) actorMap.set(a.id, a.name);
+    }
+
     res.status(200).json({
-      data: { ...formatEncashment(enc), ratePerDayPaiseEstimate, amountPaiseEstimate },
+      data: {
+        ...formatEncashment(enc),
+        ratePerDayPaiseEstimate,
+        amountPaiseEstimate,
+        decidedByName: enc.decidedBy != null ? actorMap.get(enc.decidedBy) ?? null : null,
+        cancelledByName: enc.cancelledBy != null ? actorMap.get(enc.cancelledBy) ?? null : null,
+      },
     });
   },
 );
