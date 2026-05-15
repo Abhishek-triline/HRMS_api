@@ -837,7 +837,7 @@ export async function submitRegularisation(
       category: 'Attendance',
       title: `Regularisation request from ${reg.employee.name}`,
       body: `Regularisation request ${code} for ${dateOnly.toISOString().split('T')[0]} is pending your approval.`,
-      link: `/${routedToId === RoutedTo.Manager ? 'manager' : 'admin'}/regularisations/${reg.id}`,
+      link: `/${routedToId === RoutedTo.Manager ? 'manager' : 'admin'}/regularisation-queue/${reg.id}`,
     });
   }
 
@@ -964,7 +964,9 @@ export async function approveRegularisation(
     category: 'Attendance',
     title: 'Your regularisation request was approved',
     body: `Regularisation for ${dateOnly.toISOString().split('T')[0]} has been approved. Your attendance record has been corrected.`,
-    link: `/employee/regularisations/${reg.id}`,
+    // Employee side has no per-request detail page — the regularisation
+    // page itself shows the history table where this row will appear.
+    link: `/employee/regularisation`,
   });
 
   return updated;
@@ -1022,7 +1024,9 @@ export async function rejectRegularisation(
     category: 'Attendance',
     title: 'Your regularisation request was rejected',
     body: `Regularisation for ${updated.date.toISOString().split('T')[0]} was rejected${note ? ` — ${note}` : ''}.`,
-    link: `/employee/regularisations/${reg.id}`,
+    // Employee side has no per-request detail page — the regularisation
+    // page itself shows the history table where this row will appear.
+    link: `/employee/regularisation`,
   });
 
   return updated;

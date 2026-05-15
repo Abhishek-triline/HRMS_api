@@ -587,7 +587,7 @@ export async function adminFinaliseEncashment(
       category: 'Payroll',
       title: `Encashment queued for payroll — ${enc.code}`,
       body: `${enc.employee.name}'s leave encashment (${daysApproved} day(s), ≈₹${Math.round(lockedAmount / 100)}) is queued for the next payroll run.`,
-      link: `/payroll/leave-encashments/${enc.id}`,
+      link: `/payroll/leave-encashment/${enc.id}`,
     });
   }
 
