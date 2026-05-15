@@ -428,6 +428,88 @@ attendanceRouter.get(
   },
 );
 
+// ── GET /attendance/export (org-wide, Admin) ─────────────────────────────────
+// Returns every attendance row that matches the filter in a single JSON
+// response (no cursor, no per-page limit). Frontend uses this for CSV export
+// so the admin doesn't have to walk the cursor at 100/page.
+//
+// Hard-capped at 20,000 rows server-side as DoS / runaway guard. The query
+// schema is shared with the list endpoint; `cursor` and `limit` are silently
+// ignored here.
+
+const EXPORT_HARD_CAP = 20000;
+
+attendanceRouter.get(
+  '/export',
+  requireSession(),
+  requireRole(RoleId.Admin),
+  validateQuery(AttendanceListQuerySchema),
+  async (req: Request, res: Response): Promise<void> => {
+    const user = req.user!;
+    const q = req.query as unknown as {
+      from?: string;
+      to?: string;
+      status?: number;
+      employeeId?: number;
+      departmentId?: number;
+      date?: string;
+    };
+
+    try {
+      const { from, to, statusFilter, dateFilter } = resolveListDateRange(q);
+
+      const where: Record<string, unknown> = {
+        sourceId: AttendanceSource.system,
+      };
+      if (q.employeeId) where['employeeId'] = q.employeeId;
+      if (q.departmentId) where['employee'] = { departmentId: q.departmentId };
+      if (dateFilter) {
+        where['date'] = dateFilter;
+      } else {
+        where['date'] = { gte: from, lte: to };
+      }
+      if (statusFilter !== undefined) where['status'] = statusFilter;
+
+      const rows = await prisma.attendanceRecord.findMany({
+        where,
+        orderBy: [{ date: 'asc' }, { employeeId: 'asc' }],
+        take: EXPORT_HARD_CAP + 1, // +1 so we can tell if the cap was hit
+        include: {
+          employee: {
+            select: {
+              name: true,
+              code: true,
+              department: { select: { name: true } },
+            },
+          },
+        },
+      });
+
+      const truncated = rows.length > EXPORT_HARD_CAP;
+      const systemItems = truncated ? rows.slice(0, EXPORT_HARD_CAP) : rows;
+      const items = await mergeRegularisationOverlays(systemItems, true);
+
+      res.status(200).json({
+        data: items.map((r) => ({
+          ...formatAttendanceCalendarItem(r),
+          employeeId: r.employeeId,
+          employeeName: r.employee?.name,
+          employeeCode: r.employee?.code,
+          department: (r.employee as { department?: { name: string } | null } | undefined)
+            ?.department?.name ?? null,
+        })),
+        total: systemItems.length,
+        truncated,
+      });
+    } catch (err: unknown) {
+      logger.error({ err, employeeId: user.id }, 'attendance.export: error');
+      res
+        .status(500)
+        .json(errorEnvelope(ErrorCode.INTERNAL_ERROR, 'Failed to export attendance.'));
+    }
+  },
+);
+
 // ── GET /attendance/stats ────────────────────────────────────────────────────
 // Aggregate KPI counts for a single date (or date range). Admin-only org-wide.
 // Used by the org dashboard so KPI tiles don't have to fetch all rows.

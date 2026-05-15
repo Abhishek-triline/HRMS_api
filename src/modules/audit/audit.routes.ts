@@ -163,3 +163,89 @@ auditRouter.get(
     }
   },
 );
+
+// ── GET /audit-logs/export ────────────────────────────────────────────────────
+// Returns every audit row that matches the same filter set as /audit-logs in
+// a single JSON response. Used by the admin Audit Log page to drive a "real"
+// CSV export instead of dumping only the rows that happened to be loaded into
+// the infinite-scroll buffer. Hard-capped at 20,000 rows server-side as a
+// DoS / runaway guard; the client surfaces a "narrow your filter" hint when
+// `truncated` is true.
+
+const AUDIT_EXPORT_CAP = 20000;
+
+auditRouter.get(
+  '/export',
+  requireSession(),
+  requireRole(RoleId.Admin),
+  validateQuery(AuditLogListQuerySchema),
+  async (req: Request, res: Response): Promise<void> => {
+    try {
+      const raw = req.query as Record<string, string | number | undefined>;
+      const toInt = (v: unknown): number | undefined => {
+        if (v === undefined || v === null || v === '') return undefined;
+        const n = typeof v === 'number' ? v : Number(v);
+        return Number.isFinite(n) ? n : undefined;
+      };
+      const query = {
+        actorId: toInt(raw['actorId']),
+        actorRoleId: toInt(raw['actorRoleId']),
+        moduleId: toInt(raw['moduleId']),
+        targetTypeId: toInt(raw['targetTypeId']),
+        targetId: toInt(raw['targetId']),
+        action: raw['action'] as string | undefined,
+        from: raw['from'] as string | undefined,
+        to: raw['to'] as string | undefined,
+        q: raw['q'] as string | undefined,
+      };
+
+      const where: Prisma.AuditLogWhereInput = {};
+      if (query.actorId !== undefined) where.actorId = query.actorId;
+      if (query.actorRoleId !== undefined) where.actorRoleId = query.actorRoleId;
+      if (query.moduleId !== undefined) where.moduleId = query.moduleId;
+      if (query.targetTypeId !== undefined) where.targetTypeId = query.targetTypeId;
+      if (query.targetId !== undefined) where.targetId = query.targetId;
+      const actionSearch = query.action ?? query.q;
+      if (actionSearch) where.action = { contains: actionSearch };
+      if (query.from || query.to) {
+        where.createdAt = {};
+        if (query.from) (where.createdAt as Prisma.DateTimeFilter).gte = new Date(query.from);
+        if (query.to) (where.createdAt as Prisma.DateTimeFilter).lte = new Date(query.to);
+      }
+
+      const rows = await prisma.auditLog.findMany({
+        where,
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+        take: AUDIT_EXPORT_CAP + 1,
+        include: { module: { select: { name: true } } },
+      });
+
+      const truncated = rows.length > AUDIT_EXPORT_CAP;
+      const items = truncated ? rows.slice(0, AUDIT_EXPORT_CAP) : rows;
+
+      res.status(200).json({
+        data: items.map((row) => ({
+          id: row.id,
+          actorId: row.actorId,
+          actorRoleId: row.actorRoleId,
+          actorIp: row.actorIp,
+          action: row.action,
+          moduleId: row.moduleId,
+          moduleName: row.module.name,
+          targetTypeId: row.targetTypeId,
+          targetId: row.targetId,
+          before: row.before,
+          after: row.after,
+          createdAt: row.createdAt.toISOString(),
+        })),
+        total: items.length,
+        truncated,
+      });
+    } catch (err: unknown) {
+      logger.error({ err }, 'audit-logs.export: unexpected error');
+      res
+        .status(500)
+        .json(errorEnvelope(ErrorCode.INTERNAL_ERROR, 'Failed to export audit log.'));
+    }
+  },
+);

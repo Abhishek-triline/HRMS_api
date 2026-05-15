@@ -507,11 +507,13 @@ configurationRouter.put(
 );
 
 // ── GET /config/encashment ────────────────────────────────────────────────────
+// Read access is open to any authenticated user so the employee-facing
+// "My Encashment" view can compute the actual window open/closed state
+// instead of hard-coding Dec 1 – Jan 15. Write access (PUT) stays Admin-only.
 
 configurationRouter.get(
   '/encashment',
   requireSession(),
-  requireRole(RoleId.Admin),
   async (_req: Request, res: Response): Promise<void> => {
     try {
       const config = await getEncashmentConfig();
