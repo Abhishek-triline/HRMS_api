@@ -913,7 +913,7 @@ leaveRouter.get(
           if (subs.includes(empId) || empId === user.id) {
             where['employeeId'] = empId;
           } else {
-            res.status(200).json({ data: [], nextCursor: null });
+            res.status(200).json({ data: [], nextCursor: null, total: 0 });
             return;
           }
         } else {
@@ -935,19 +935,28 @@ leaveRouter.get(
       if (query.fromDate) where['fromDate'] = { gte: new Date(query.fromDate) };
       if (query.toDate) where['toDate'] = { lte: new Date(query.toDate) };
 
-      if (cursor) {
-        const cursorId = Number(cursor);
-        if (!isNaN(cursorId)) {
-          where['id'] = { gt: cursorId };
-        }
-      }
-
-      const requests = await prisma.leaveRequest.findMany({
+      // Cursor is the id of the last row from the previous page. We use
+      // Prisma's native cursor + skip:1 rather than a hand-rolled where
+      // filter — orderBy createdAt DESC does not align with id-based
+      // gt/lt comparisons (ids and createdAt aren't guaranteed to track
+      // each other), and the earlier `id: { gt: cursor }` filter actually
+      // re-served rows from the previous page.
+      const baseFindArgs = {
         where,
-        orderBy: { createdAt: 'desc' },
+        orderBy: [{ createdAt: 'desc' as const }, { id: 'desc' as const }],
         take: limit + 1,
         include: requestInclude,
-      });
+      };
+      const cursorId = cursor ? Number(cursor) : NaN;
+      const findArgs =
+        cursor && !isNaN(cursorId)
+          ? { ...baseFindArgs, cursor: { id: cursorId }, skip: 1 }
+          : baseFindArgs;
+
+      const [requests, total] = await Promise.all([
+        prisma.leaveRequest.findMany(findArgs),
+        prisma.leaveRequest.count({ where }),
+      ]);
 
       const hasMore = requests.length > limit;
       const page = hasMore ? requests.slice(0, limit) : requests;
@@ -956,6 +965,7 @@ leaveRouter.get(
       res.status(200).json({
         data: page.map((r) => formatRequest(r)),
         nextCursor,
+        total,
       });
     } catch (err: unknown) {
       logger.error({ err }, 'leave.list.error');
