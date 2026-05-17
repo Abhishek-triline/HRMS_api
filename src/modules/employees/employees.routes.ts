@@ -638,10 +638,17 @@ router.post(
         ].join(''),
       });
 
+      // Return the raw URL one-shot so an admin can copy + share it
+      // out-of-band when the mail transport is unavailable. The server
+      // only stores the hash of the token — once this response is
+      // dismissed the URL is unrecoverable by anyone (including admins).
+      // The audit log records expiresAt + ttlDays but NEVER the URL,
+      // so the link doesn't leak into ops dashboards or backups.
       res.status(200).json({
         data: {
           invitationSent: mailResult.ok,
           expiresAt: expiresAt.toISOString(),
+          inviteUrl,
           ...(mailResult.ok ? {} : { invitationError: mailResult.error }),
         },
       });
