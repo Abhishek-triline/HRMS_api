@@ -66,8 +66,14 @@ export function startScheduler(): void {
     '0 0 * * *',
     async () => {
       const jobId = 'attendance.midnight-generate';
-      // The cron fires at 00:00 IST — the date in India is "today" at midnight
-      const today = new Date();
+      // The cron fires at 00:00 IST = 18:30 UTC the previous day. new Date()
+      // returns the UTC instant, so a downstream setUTCHours(0,0,0,0) would
+      // floor to YESTERDAY's UTC midnight and stamp every generated row with
+      // the wrong (IST−1) date. Shifting by +5:30h lifts the UTC instant to
+      // the IST calendar date before the floor happens inside
+      // runMidnightGenerate.
+      const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+      const today = new Date(Date.now() + IST_OFFSET_MS);
       logger.info({ job: jobId, date: today.toISOString() }, 'Starting midnight attendance generate');
 
       try {

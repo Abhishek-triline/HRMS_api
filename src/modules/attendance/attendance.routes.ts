@@ -408,9 +408,28 @@ attendanceRouter.get(
       const items = await mergeRegularisationOverlays(systemItems, true);
       const nextCursor = hasMore ? String(systemItems[systemItems.length - 1]!.id) : null;
 
+      // The per-row late_month_count is a snapshot from check-in time, so
+      // employees who were absent or on-time today read 0 even when their
+      // running monthly total is higher. Overlay the live ledger so the
+      // "Late This Month" column reflects truth. We pull the ledger keyed
+      // by (employeeId, year, month) for whatever month the page is on.
+      const sampleDate = items[0]?.date ?? new Date();
+      const year = sampleDate.getUTCFullYear();
+      const month = sampleDate.getUTCMonth() + 1;
+      const empIds = Array.from(new Set(items.map((r) => r.employeeId)));
+      const ledger = empIds.length
+        ? await prisma.attendanceLateLedger.findMany({
+            where: { employeeId: { in: empIds }, year, month },
+            select: { employeeId: true, count: true },
+          })
+        : [];
+      const liveCount = new Map<number, number>(ledger.map((l) => [l.employeeId, l.count]));
+
       res.status(200).json({
         data: items.map((r) => ({
           ...formatAttendanceCalendarItem(r),
+          // Override the snapshot with the live ledger for this row's month.
+          lateMonthCount: liveCount.get(r.employeeId) ?? r.lateMonthCount,
           employeeId: r.employeeId,
           employeeName: r.employee?.name,
           employeeCode: r.employee?.code,
@@ -554,7 +573,18 @@ attendanceRouter.get(
         ...(q.departmentId ? { departmentId: q.departmentId } : {}),
       };
 
-      const [byStatus, lateCount, absentNoCheckIn, recordedTotal, activeEmployeeCount] =
+      // Pick the month/year to scan the ledger for. If the caller passed
+      // a single date, use that date's month; if they passed a range, use
+      // the `to` boundary (typically today); else default to "now".
+      const periodAnchor = q.date
+        ? new Date(`${q.date}T00:00:00.000Z`)
+        : q.to
+          ? new Date(`${q.to}T00:00:00.000Z`)
+          : new Date();
+      const ledgerYear = periodAnchor.getUTCFullYear();
+      const ledgerMonth = periodAnchor.getUTCMonth() + 1;
+
+      const [byStatus, lateCount, absentNoCheckIn, recordedTotal, activeEmployeeCount, lateThresholdBreaches] =
         await Promise.all([
           prisma.attendanceRecord.groupBy({
             by: ['status'],
@@ -567,6 +597,17 @@ attendanceRouter.get(
           }),
           prisma.attendanceRecord.count({ where }),
           prisma.employee.count({ where: activeEmployeeWhere }),
+          // BL-028 threshold: 3+ late marks in the month deducts 1 day from
+          // the Annual leave balance. We count distinct employees whose
+          // ledger has reached that threshold for the page's month/year.
+          prisma.attendanceLateLedger.count({
+            where: {
+              year: ledgerYear,
+              month: ledgerMonth,
+              count: { gte: 3 },
+              ...(q.departmentId ? { employee: { departmentId: q.departmentId } } : {}),
+            },
+          }),
         ]);
 
       const counts: Record<number, number> = {};
@@ -587,6 +628,8 @@ attendanceRouter.get(
           weeklyOff: counts[AttendanceStatus.WeeklyOff] ?? 0,
           holiday:   counts[AttendanceStatus.Holiday]   ?? 0,
           late: lateCount,
+          /** Employees whose late_ledger count for the anchor month is ≥ 3 (BL-028). */
+          lateThresholdBreaches,
           yetToCheckIn,
         },
       });
