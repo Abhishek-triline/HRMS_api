@@ -43,6 +43,7 @@ import {
   EmployeeStatus,
   LeaveTypeId,
   LedgerReason,
+  RoleId,
   type AuditActorRoleValue,
 } from '../../lib/statusInt.js';
 
@@ -814,12 +815,22 @@ export async function submitRegularisation(
     if (emp?.reportingManagerId) {
       const manager = await tx.employee.findUnique({
         where: { id: emp.reportingManagerId },
-        select: { id: true, status: true },
+        select: { id: true, status: true, roleId: true },
       });
 
       if (manager && manager.status !== EmployeeStatus.Exited) {
-        routedToId = RoutedTo.Manager;
-        approverId = manager.id;
+        // If the line manager is themselves an Admin, route straight to the
+        // Admin step with that Admin as the approver. Otherwise this would
+        // sit in the "manager queue" awaiting approval from an Admin who
+        // would then need a second admin-side action — see Option A in
+        // BL-015/017/022 alignment.
+        if (manager.roleId === RoleId.Admin) {
+          routedToId = RoutedTo.Admin;
+          approverId = manager.id;
+        } else {
+          routedToId = RoutedTo.Manager;
+          approverId = manager.id;
+        }
       }
     }
   }

@@ -105,15 +105,27 @@ export async function resolveRouting(
     return { routedToId: RoutedTo.Admin, approverId: admin.id };
   }
 
-  // Rule 3: check if the manager is Exited
+  // Rule 3: check the manager's status and role.
   const manager = await tx.employee.findUnique({
     where: { id: emp.reportingManagerId },
-    select: { id: true, status: true },
+    select: { id: true, status: true, roleId: true },
   });
 
+  // Rule 3a: missing or exited line manager → default Admin.
   if (!manager || manager.status === EmployeeStatus.Exited) {
     const admin = await findDefaultAdmin(tx);
     return { routedToId: RoutedTo.Admin, approverId: admin.id };
+  }
+
+  // Rule 3b: if the line manager is themselves an Admin, route straight to
+  // the admin-finalise step with that admin as the approver. This avoids the
+  // "Admin double-tap" (where an Admin sitting in the manager slot would
+  // otherwise have to approve as Manager and then finalise as Admin for the
+  // same request). The one-step admin-finalise path in encashment/leave
+  // accepts `Pending + routedToId=Admin` already, so this falls through
+  // cleanly.
+  if (manager.roleId === RoleId.Admin) {
+    return { routedToId: RoutedTo.Admin, approverId: manager.id };
   }
 
   return { routedToId: RoutedTo.Manager, approverId: manager.id };

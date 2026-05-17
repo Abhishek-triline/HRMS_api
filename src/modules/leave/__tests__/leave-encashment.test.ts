@@ -304,6 +304,66 @@ describe('submitEncashmentRequest — BL-LE-05 routing', () => {
   });
 });
 
+// ── TC-LE-05b: routing when the line manager is themselves an Admin ──────────
+
+describe('submitEncashmentRequest — BL-LE-05 routing (Admin line manager)', () => {
+  it('routes straight to Admin with that Admin as approver (no manager double-tap)', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2025-12-15'));
+
+    const tx = txWithConfig(DEFAULT_CFG);
+    const ADMIN_MGR_ID = 9001;
+
+    (tx.employee.findUnique as Mock)
+      .mockResolvedValueOnce({
+        id: EMP_ID,
+        status: EmployeeStatus.Active,
+        roleId: RoleId.Employee,
+        name: 'Alice',
+        code: 'EMP-2025-0002',
+        reportingManagerId: ADMIN_MGR_ID,
+      }) // employee check
+      .mockResolvedValueOnce({ id: EMP_ID, reportingManagerId: ADMIN_MGR_ID }) // resolveRouting emp
+      .mockResolvedValueOnce({
+        id: ADMIN_MGR_ID,
+        status: EmployeeStatus.Active,
+        roleId: RoleId.Admin,
+      }); // manager-is-Admin
+
+    (tx.leaveEncashment.findFirst as Mock).mockResolvedValue(null);
+    (tx.leaveType.findUnique as Mock).mockResolvedValue({ id: LT_ANNUAL_ID, name: 'Annual' });
+    (tx.leaveBalance.findUnique as Mock).mockResolvedValue({ id: BAL_ID, daysRemaining: 12 });
+    // The admin-routed notify fan-out reads active admins; return the line
+    // manager admin so notify resolves without hitting findDefaultAdmin.
+    (tx.employee.findMany as Mock).mockResolvedValue([{ id: ADMIN_MGR_ID }]);
+
+    (tx.leaveEncashment.create as Mock).mockResolvedValue({
+      id: ENC_ID,
+      code: 'LE-2025-0001',
+      employeeId: EMP_ID,
+      employee: { name: 'Alice', code: 'EMP-2025-0002' },
+      approver: { name: 'Admin Manager' },
+      year: 2025,
+      daysRequested: 5,
+      daysApproved: null,
+      ratePerDayPaise: null,
+      amountPaise: null,
+      status: LeaveEncashmentStatus.Pending,
+      routedToId: RoutedTo.Admin,
+      approverId: ADMIN_MGR_ID,
+      decidedAt: null, decidedBy: null, decisionNote: null, escalatedAt: null,
+      paidAt: null, cancelledAt: null, cancelledBy: null,
+      createdAt: new Date(), updatedAt: new Date(), version: 0,
+    });
+
+    const result = await submitEncashmentRequest(EMP_ID, 5, 2025, tx as never);
+    expect(result.routedToId).toBe(RoutedTo.Admin);
+    expect(result.approverId).toBe(ADMIN_MGR_ID);
+
+    vi.useRealTimers();
+  });
+});
+
 // ── TC-LE-13: exited employee cannot submit ───────────────────────────────────
 
 describe('submitEncashmentRequest — BL-LE-13 exited employee', () => {
