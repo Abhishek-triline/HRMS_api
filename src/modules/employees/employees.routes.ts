@@ -460,7 +460,7 @@ router.post(
       const safeName = escapeHtml(employee.name);
       const safeCode = escapeHtml(employee.code);
       const safeUrl = escapeHtml(inviteUrl);
-      await sendMail({
+      const mailResult = await sendMail({
         to: employee.email,
         subject: 'Welcome to Nexora HRMS — Activate your account',
         text: [
@@ -492,15 +492,162 @@ router.post(
         return;
       }
 
+      // Honest reporting: invitationSent reflects the actual mailer outcome
+      // (was previously hardcoded to true even when SMTP threw, leaving
+      // admins blind to delivery failures). The transaction has already
+      // committed so the employee record is intact either way — the admin
+      // just needs to use the new /resend-invite endpoint if !ok.
       res.status(201).json({
         data: {
           employee: toEmployeeDetail(detail, true),
-          invitationSent: true,
+          invitationSent: mailResult.ok,
+          ...(mailResult.ok ? {} : { invitationError: mailResult.error }),
         },
       });
     } catch (err: unknown) {
       logger.error({ err }, 'employees.create.error');
       res.status(500).json(errorEnvelope(ErrorCode.INTERNAL_ERROR, 'Failed to create employee.'));
+    }
+  },
+);
+
+// ── POST /:id/resend-invite ───────────────────────────────────────────────────
+// Resend the first-login email for an Inactive employee whose original
+// invitation never landed or has expired. Admin-only. Invalidates any prior
+// unused FirstLogin tokens for this employee, mints a fresh one, sends the
+// email, and audits the action. Refuses if the employee is already Active —
+// they should be using the password-reset flow instead.
+
+router.post(
+  '/:id/resend-invite',
+  requireSession(),
+  requireRole(RoleId.Admin),
+  async (req: Request, res: Response): Promise<void> => {
+    const id = Number(req.params['id']);
+    if (isNaN(id)) {
+      res.status(404).json(errorEnvelope(ErrorCode.NOT_FOUND, 'Employee not found.'));
+      return;
+    }
+    const actor = req.user!;
+    const ip = req.ip ?? null;
+
+    try {
+      const employee = await prisma.employee.findUnique({
+        where: { id },
+        select: { id: true, code: true, email: true, name: true, status: true, mustResetPassword: true },
+      });
+      if (!employee) {
+        res.status(404).json(errorEnvelope(ErrorCode.NOT_FOUND, 'Employee not found.'));
+        return;
+      }
+      if (employee.status !== EmployeeStatus.Inactive || !employee.mustResetPassword) {
+        res.status(409).json(
+          errorEnvelope(
+            ErrorCode.VALIDATION_FAILED,
+            'Employee has already activated their account. Use the password-reset flow instead.',
+          ),
+        );
+        return;
+      }
+
+      // Mint a fresh token outside the tx (raw value only used for the email
+      // body — only the hash is stored).
+      const { generateToken, hashToken } = await import('../auth/auth.service.js');
+      const rawToken = generateToken();
+      const tokenHash = hashToken(rawToken);
+      const now = new Date();
+      const expiresAt = new Date(now.getTime() + FIRST_LOGIN_TTL_DAYS * 24 * 60 * 60 * 1000);
+
+      await prisma.$transaction(async (tx) => {
+        // Mark every prior unused FirstLogin token used so the old links
+        // can't be used in parallel with the new one (audit-friendly — we
+        // keep the rows rather than deleting).
+        await tx.passwordResetToken.updateMany({
+          where: {
+            employeeId: id,
+            purposeId: TokenPurpose.FirstLogin,
+            usedAt: null,
+          },
+          data: { usedAt: now },
+        });
+
+        await tx.passwordResetToken.create({
+          data: {
+            employeeId: id,
+            tokenHash,
+            purposeId: TokenPurpose.FirstLogin,
+            expiresAt,
+          },
+        });
+
+        await audit({
+          tx,
+          actorId: actor.id,
+          actorRole: actor.roleId as RoleIdValue,
+          actorIp: ip,
+          action: 'employee.invite.resend',
+          targetType: 'Employee',
+          targetId: id,
+          module: 'employees',
+          before: null,
+          after: {
+            expiresAt: expiresAt.toISOString(),
+            ttlDays: FIRST_LOGIN_TTL_DAYS,
+          },
+        });
+      });
+
+      const inviteUrl = `${WEB_BASE_URL}/first-login?token=${rawToken}`;
+      const escapeHtml = (s: string): string =>
+        s.replace(/[&<>"']/g, (c) => {
+          const map: Record<string, string> = {
+            '&': '&amp;',
+            '<': '&lt;',
+            '>': '&gt;',
+            '"': '&quot;',
+            "'": '&#39;',
+          };
+          return map[c] ?? c;
+        });
+      const safeName = escapeHtml(employee.name);
+      const safeCode = escapeHtml(employee.code);
+      const safeUrl = escapeHtml(inviteUrl);
+
+      const mailResult = await sendMail({
+        to: employee.email,
+        subject: 'Nexora HRMS — your activation link (resent)',
+        text: [
+          `Hello ${employee.name},`,
+          '',
+          `Your Nexora HRMS account (employee code: ${employee.code}) is still pending activation.`,
+          '',
+          `Use the link below to set your password (valid for ${FIRST_LOGIN_TTL_DAYS} days):`,
+          '',
+          inviteUrl,
+          '',
+          'Any earlier invitation links for this account are now invalid.',
+          '',
+          'Nexora HRMS',
+        ].join('\n'),
+        html: [
+          `<p>Hello ${safeName},</p>`,
+          `<p>Your Nexora HRMS account (employee code: <strong>${safeCode}</strong>) is still pending activation.</p>`,
+          `<p>Use the link below to set your password (valid for ${FIRST_LOGIN_TTL_DAYS} days):</p>`,
+          `<p><a href="${safeUrl}">${safeUrl}</a></p>`,
+          `<p>Any earlier invitation links for this account are now invalid.</p>`,
+        ].join(''),
+      });
+
+      res.status(200).json({
+        data: {
+          invitationSent: mailResult.ok,
+          expiresAt: expiresAt.toISOString(),
+          ...(mailResult.ok ? {} : { invitationError: mailResult.error }),
+        },
+      });
+    } catch (err: unknown) {
+      logger.error({ err, employeeId: id }, 'employees.resend-invite.error');
+      res.status(500).json(errorEnvelope(ErrorCode.INTERNAL_ERROR, 'Failed to resend invitation.'));
     }
   },
 );

@@ -116,18 +116,34 @@ async function sendViaSmtp(payload: MailPayload): Promise<void> {
 }
 
 /**
+ * Outcome of a sendMail call. We don't throw because mail failures should
+ * never abort the underlying business transaction, but callers do need to
+ * know what happened so they can surface it (e.g. "invitation queued vs.
+ * actually delivered" on the employee-create response).
+ */
+export interface MailResult {
+  /** True if the configured transport accepted the message. */
+  ok: boolean;
+  /** Short human-readable reason on failure. Undefined on success. */
+  error?: string;
+}
+
+/**
  * Send an email through the configured transport.
  * In development (MAIL_TRANSPORT=filesystem) the mail is written to MAIL_DIR.
- * Never throws — logs the error and swallows so the caller's flow continues.
+ * Never throws — returns { ok, error } so the caller can react.
  */
-export async function sendMail(payload: MailPayload): Promise<void> {
+export async function sendMail(payload: MailPayload): Promise<MailResult> {
   try {
     if (MAIL_TRANSPORT === 'smtp') {
       await sendViaSmtp(payload);
     } else {
       await sendViaFilesystem(payload);
     }
+    return { ok: true };
   } catch (err: unknown) {
     logger.error({ err, to: payload.to, subject: payload.subject }, 'mail.error');
+    const error = err instanceof Error ? err.message : 'Unknown mail error';
+    return { ok: false, error };
   }
 }

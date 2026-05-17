@@ -198,6 +198,56 @@ export function startScheduler(): void {
     { timezone: 'Asia/Kolkata' },
   );
 
+  // ── password-reset-tokens.cleanup — daily 03:15 IST ───────────────────────
+  // Sweep PasswordResetToken rows whose expiresAt < (now − GRACE_DAYS). The
+  // grace window keeps recently-expired rows around briefly so debug / audit
+  // workflows can see what happened, then prunes them. FirstLogin tokens
+  // that have already been used (usedAt != null) are also collected after
+  // the same grace window — they're permanently spent and serve no audit
+  // purpose since the corresponding employee.activate / first-login audit
+  // entries are immutable.
+  const TOKEN_GRACE_DAYS = 30;
+  cron.schedule(
+    '15 3 * * *',
+    async () => {
+      const jobId = 'password-reset-tokens.cleanup';
+      logger.info({ job: jobId }, 'Starting password-reset-token cleanup');
+
+      try {
+        const cutoff = new Date(Date.now() - TOKEN_GRACE_DAYS * 24 * 60 * 60 * 1000);
+        const deleted = await prisma.passwordResetToken.deleteMany({
+          where: {
+            OR: [
+              { expiresAt: { lt: cutoff } },
+              { usedAt: { lt: cutoff } },
+            ],
+          },
+        });
+
+        await audit({
+          actorId: null,
+          actorRole: 'system',
+          action: 'password-reset-tokens.cleanup',
+          targetType: null,
+          targetId: null,
+          module: 'auth',
+          before: null,
+          after: { deletedCount: deleted.count, cutoff: cutoff.toISOString(), graceDays: TOKEN_GRACE_DAYS },
+        });
+
+        logger.info(
+          { job: jobId, deletedCount: deleted.count },
+          `Password-reset-token cleanup complete — ${deleted.count} rows deleted`,
+        );
+      } catch (err: unknown) {
+        logger.error({ job: jobId, err }, 'Password-reset-token cleanup failed — server continues normally');
+      }
+    },
+    {
+      timezone: 'Asia/Kolkata',
+    },
+  );
+
   // ── idempotency-key.cleanup — daily 03:00 IST ─────────────────────────────
   // Deletes IdempotencyKey rows older than 24h (TTL enforcement).
   // Audits the number of rows deleted so the cleanup can be traced.
@@ -404,6 +454,6 @@ export function startScheduler(): void {
   );
 
   logger.info(
-    'Scheduled jobs started: attendance.midnight-generate (daily 00:00 IST), leave.escalation-sweep (hourly), leave-encashment.escalation-sweep (hourly), leave-encashment.windowCheck (Dec 31 23:50 IST), leave.carry-forward (Jan 1 00:01 IST), idempotency-key.cleanup (daily 03:00 IST), notifications.archive-90d (daily 03:30 IST), performance.review-deadline-nudge (daily 09:00 IST)',
+    'Scheduled jobs started: attendance.midnight-generate (daily 00:00 IST), leave.escalation-sweep (hourly), leave-encashment.escalation-sweep (hourly), leave-encashment.windowCheck (Dec 31 23:50 IST), leave.carry-forward (Jan 1 00:01 IST), idempotency-key.cleanup (daily 03:00 IST), password-reset-tokens.cleanup (daily 03:15 IST), notifications.archive-90d (daily 03:30 IST), performance.review-deadline-nudge (daily 09:00 IST)',
   );
 }
