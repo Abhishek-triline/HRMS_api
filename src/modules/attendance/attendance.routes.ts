@@ -359,6 +359,7 @@ attendanceRouter.get(
       date?: string;
       cursor?: string;
       limit?: number;
+      q?: string;
     };
 
     try {
@@ -373,8 +374,20 @@ attendanceRouter.get(
         where['employeeId'] = q.employeeId;
       }
 
-      if (q.departmentId) {
-        where['employee'] = { departmentId: q.departmentId };
+      // Department + free-text employee search both filter on the related
+      // Employee row; compose into a single `employee` clause so they don't
+      // overwrite each other.
+      const employeeWhere: Record<string, unknown> = {};
+      if (q.departmentId) employeeWhere['departmentId'] = q.departmentId;
+      if (q.q) {
+        const term = q.q.trim();
+        employeeWhere['OR'] = [
+          { name: { contains: term } },
+          { code: { startsWith: term } },
+        ];
+      }
+      if (Object.keys(employeeWhere).length > 0) {
+        where['employee'] = employeeWhere;
       }
 
       if (dateFilter) {
