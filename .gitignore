@@ -1,0 +1,40 @@
+# dependencies
+node_modules/
+.pnpm-store/
+
+# build artefacts
+dist/
+build/
+*.tsbuildinfo
+coverage/
+
+# env / secrets
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# logs
+logs/
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+
+# tooling
+.eslintcache
+.turbo/
+
+# Prisma — generated / scratch
+prisma/migrations/.tmp/
+prisma/migrations.legacy_v1/
+
+# Dev mail stub
+/tmp/mail/
