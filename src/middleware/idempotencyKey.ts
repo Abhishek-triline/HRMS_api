@@ -7,7 +7,7 @@
  *   - responseSnapshot replaces responseBody.
  *   - No status column — replay always returns 200.
  *
- * Convention (docs/HRMS_API.md § 1):
+ * Convention (docs/api/reference.md § 1):
  *   - Mutation endpoints accept an optional `Idempotency-Key` header.
  *   - Duplicates within 24h (scoped to employeeId + key) return the original
  *     response without re-applying any side effects.

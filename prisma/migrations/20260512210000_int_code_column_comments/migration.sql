@@ -4,7 +4,7 @@
 -- DBeaver, MySQL Workbench, phpMyAdmin) — no need to grep the codebase to
 -- understand what status=4 means.
 --
--- These comments mirror the FROZEN code mappings in docs/HRMS_Schema_v2_Plan.md
+-- These comments mirror the FROZEN code mappings in docs/archive/schema-v2-plan.md
 -- §3. Never re-number an existing code — only append new ones.
 
 -- ── status columns on master tables (uniform 1=Active, 2=Deprecated) ────────

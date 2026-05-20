@@ -1,6 +1,6 @@
 // Nexora HRMS — Prisma schema (v2 — clean refactor)
 //
-// Per docs/HRMS_Schema_v2_Plan.md:
+// Per docs/archive/schema-v2-plan.md:
 //   • Every primary key is INT AUTO_INCREMENT (no cuids).
 //   • Every status/type/category column is plain INT — no Prisma enums.
 //   • Lookup data (roles, employment_types, departments, designations,
@@ -11,7 +11,7 @@
 //     integrity at the application layer; @relation directives drive
 //     Prisma's client-side joins only.
 //
-// INT-code mappings are frozen — see docs/HRMS_Schema_v2_Plan.md §3 and
+// INT-code mappings are frozen — see docs/archive/schema-v2-plan.md §3 and
 // apps/api/src/lib/statusInt.ts. Never re-number; only append.
 
 generator client {

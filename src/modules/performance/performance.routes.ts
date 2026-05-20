@@ -1,7 +1,7 @@
 /**
  * Performance Cycles & Reviews router — mounted at /api/v1/performance.
  *
- * Endpoints (docs/HRMS_API.md § 9):
+ * Endpoints (docs/api/reference.md § 9):
  *   POST   /cycles                               A-20   Admin
  *   GET    /cycles                               A-20 / M-09 / E-10  Any session
  *   GET    /cycles/:id                           A-21   Admin full; Mgr team; Emp own

@@ -1,7 +1,7 @@
 /**
  * Employees & Hierarchy router — mounted at /api/v1/employees.
  *
- * Endpoints (docs/HRMS_API.md § 5):
+ * Endpoints (docs/api/reference.md § 5):
  *   POST   /                      A-04 / D-02   Admin only
  *   GET    /                      A-03 / M-02   Admin / Manager (scoped to team)
  *   GET    /:id                   A-04, M-02    Admin / Manager-team / SELF

@@ -3,12 +3,12 @@
  * type, category, role, and module code used on the wire and in the DB.
  *
  * These constants mirror the FROZEN code mappings in
- * docs/HRMS_Schema_v2_Plan.md §3 and the MySQL column COMMENTs applied by
+ * docs/archive/schema-v2-plan.md §3 and the MySQL column COMMENTs applied by
  * migration 20260512210000_int_code_column_comments.
  *
  * **Never re-number an existing code — only append new ones.**
  * When appending, update all six locations listed in the checklist in
- * `docs/HRMS_Schema_v2_Plan.md` §3.
+ * `docs/archive/schema-v2-plan.md` §3.
  */
 
 // ── Master table IDs (FROZEN) ──────────────────────────────────────────────

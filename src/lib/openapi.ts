@@ -2102,7 +2102,7 @@ export const openApiSpec = generator.generateDocument({
       'REST API for the Nexora HRMS — Indian HR Management System (Triline). ' +
       'Phase 0 covers authentication and account access. Subsequent phases ' +
       'add Employees, Leave, Attendance, Payroll, Performance, Notifications, ' +
-      'Audit, and Configuration. See docs/HRMS_API.md for the canonical spec.',
+      'Audit, and Configuration. See docs/api/reference.md for the canonical spec.',
     contact: {
       name: 'Nexora HRMS Team',
       email: 'admin@triline.co.in',
